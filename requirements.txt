@@ -1,0 +1,9 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
+sse-starlette==3.4.8
+httpx==0.28.1
+yfinance==1.6.0
+python-multipart==0.0.32
+Jinja2==3.1.6
+websockets==17.0.1
+tzdata==2025.2

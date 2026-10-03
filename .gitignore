@@ -1,0 +1,25 @@
+env.secrets
+data/
+__pycache__/
+.pytest_cache/
+*.pyc
+# Analysis reports are runtime data (they arrived with the opentrade fold; the
+# pod mounts this dir read-write). Never a source artifact.
+results/
+
+# Personal runtime config (positions / cost basis): copy config/config.example.json to
+# config/config.json and edit. Never commit the real one.
+config/config.json
+config/*.lastgood.json
+# Local backups / editor / OS noise
+*.tar.zst
+*.bundle
+.venv/
+venv/
+.DS_Store
+*.swp
+.env
+.env.*
+
+# Legacy pre-consolidation tool scripts kept locally only
+retired/

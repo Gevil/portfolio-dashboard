@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Portfolio Watch</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="referrer" content="same-origin" />
+  <link rel="stylesheet" href="/static/css/tokens.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/base.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/shell.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/overview.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/charts.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/detail.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/settings.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/alerts.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/chat.css?v=20261002-1" />
+  <link rel="stylesheet" href="/static/css/views.css?v=20261002-1" />
+  <script src="/static/js/theme-boot.js?v=20261002-1"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <div id="app">
+    <header class="statusbar" id="statusbar">
+      <h1 class="brand">Portfolio<span class="brand-sub"> Watch</span></h1>
+
+      <div class="sb-chips" id="sb-chips">
+        <span class="chip sb-data" id="sb-data" role="status" aria-live="off">
+          <span class="dot" aria-hidden="true"></span><span class="sb-data-text">Data &hellip;</span>
+        </span>
+        <span class="chip sb-session" id="sb-session-eu" title="Euronext / Xetra 09:00-17:30 (local exchange time)">
+          <span class="dot" aria-hidden="true"></span><span class="sb-session-text">EU</span>
+        </span>
+        <span class="chip sb-session" id="sb-session-us" title="NYSE / Nasdaq 09:30-16:00 New York time">
+          <span class="dot" aria-hidden="true"></span><span class="sb-session-text">US</span>
+        </span>
+      </div>
+
+      <nav class="tabs" id="tabs" aria-label="Views">
+        <button type="button" class="tab" data-view="overview">Overview</button>
+        <button type="button" class="tab" data-view="digest">Digest</button>
+        <button type="button" class="tab" data-view="market">Market</button>
+        <button type="button" class="tab" data-view="aiops">AI Ops</button>
+      </nav>
+
+      <div class="sb-actions">
+        <button type="button" class="icon-btn" id="btn-lane" aria-label="AI lane status" title="AI lane">
+          <span class="dot" id="lane-dot" aria-hidden="true"></span>
+        </button>
+        <button type="button" class="icon-btn" id="btn-chat" aria-label="Ask the AI assistant" aria-expanded="false" aria-controls="chat-host" title="AI assistant">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.5-4.6A8 8 0 1 1 21 12z"/></svg>
+        </button>
+        <button type="button" class="icon-btn" id="btn-alerts" aria-label="Alerts" title="Alerts">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 7.5 2.5 7.5h-17S6 15 6 9z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>
+          <span class="badge sb-badge" id="alerts-badge" hidden></span>
+        </button>
+        <button type="button" class="icon-btn" id="btn-settings" aria-label="Settings" title="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main id="main" class="main" tabindex="-1">
+      <section id="view-overview" class="view" data-view="overview" aria-label="Overview"></section>
+      <section id="view-digest" class="view" data-view="digest" aria-label="Digest" hidden></section>
+      <section id="view-market" class="view" data-view="market" aria-label="Market" hidden></section>
+      <section id="view-aiops" class="view" data-view="aiops" aria-label="AI Ops" hidden></section>
+    </main>
+
+    <div id="chat-host" class="chat-host"></div>
+  </div>
+
+  <noscript><p class="noscript">This dashboard needs JavaScript.</p></noscript>
+
+  <!-- Sanitiser and parser first, then the app (an ES module: deferred, runs after both). -->
+  <script src="/static/dompurify.min.js?v=20261002-1"></script>
+  <script src="/static/marked.min.js?v=20261002-1"></script>
+  <script type="module" src="/static/js/main.js?v=20261002-1"></script>
+</body>
+</html>

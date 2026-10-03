@@ -1,0 +1,123 @@
+/* Holding detail pane (js/views/detail.js) + TradingView / report / news modals.
+   Prefix dt-. Inner layout is width-adaptive (flex-wrap, auto-fit grids), never viewport media
+   queries: the pane lives in a dock (>=1200px) or a drawer and may be moved between them. */
+
+.dt-pane { display: block; min-width: 0; max-width: 100%; }
+.dt-content { display: grid; gap: var(--space-3); min-width: 0; }
+.dt-content[hidden], .dt-empty[hidden] { display: none; }
+.dt-empty { min-height: 8rem; }
+
+/* ---- header ---- */
+.dt-head { display: grid; gap: var(--space-2); min-width: 0; }
+.dt-titlebar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-width: 0; }
+.dt-title { margin: 0; font-size: var(--fs-lg); line-height: 1.2; overflow-wrap: anywhere; }
+.dt-title:focus-visible { outline-offset: 4px; }
+.dt-pane[data-host="drawer"] .dt-titlebar { display: none; } /* the drawer's own header shows the label + X */
+.dt-price-box { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2) var(--space-3); min-width: 0; }
+.dt-price-box > .state { flex: 1 1 100%; }
+.dt-price { font-size: var(--fs-hero); font-weight: 600; line-height: 1.1; }
+.dt-day { font-size: var(--fs-md); white-space: nowrap; }
+.dt-price-box .chip { align-self: center; }
+.dt-us { font-size: var(--fs-sm); }
+.dt-head-foot { display: flex; justify-content: flex-start; }
+
+/* ---- generic card pieces ---- */
+.dt-card { display: block; }
+.dt-body { min-width: 0; }
+.dt-sub { margin: var(--space-4) 0 var(--space-2); }
+.dt-none { margin: 0; font-size: var(--fs-sm); }
+.dt-ext-link { font-size: var(--fs-sm); white-space: nowrap; }
+.dt-note { margin-top: var(--space-2); font-size: var(--fs-sm); }
+.dt-lane { font-size: var(--fs-xs); font-family: var(--font-mono); overflow-wrap: anywhere; }
+
+/* ---- chart ---- */
+.dt-chart-tools { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); margin-bottom: var(--space-3); }
+.dt-chart-tools .dt-ext-link { align-self: center; }
+.dt-chart-host { position: relative; width: 100%; min-width: 0; }
+
+/* ---- AI analysis ---- */
+.dt-ai-na { margin: 0; }
+.dt-ai-live { display: grid; gap: var(--space-3); min-width: 0; }
+.dt-ai-live[hidden], .dt-ai-na[hidden] { display: none; }
+.dt-ai-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
+.dt-ai-progress { display: grid; gap: var(--space-2); padding: var(--space-3); background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); }
+.dt-ai-line { display: flex; align-items: center; gap: var(--space-2); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.dt-spin {
+  flex: none; width: 0.9rem; height: 0.9rem; border-radius: 50%;
+  border: 2px solid var(--line-strong); border-top-color: var(--accent); animation: dt-spin 0.9s linear infinite;
+}
+.dt-bar { position: relative; height: 3px; overflow: hidden; border-radius: 2px; background: var(--line); }
+.dt-bar > span { position: absolute; inset: 0 auto 0 0; width: 35%; background: var(--accent); animation: dt-slide 1.6s var(--ease-out) infinite; }
+@keyframes dt-spin { to { transform: rotate(360deg); } }
+@keyframes dt-slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+@media (prefers-reduced-motion: reduce) {
+  .dt-spin, .dt-bar > span { animation: none; }
+  .dt-bar > span { width: 100%; opacity: 0.5; }
+}
+.dt-ai-result { display: grid; gap: var(--space-3); padding: var(--space-3); border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); min-width: 0; }
+.dt-ai-result[hidden] { display: none; }
+.dt-ai-msg { padding: var(--space-2); }
+.dt-decision-card { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
+.dt-decision-meta { font-size: var(--fs-sm); font-family: var(--font-mono); }
+.dt-sec-block h4 { margin: 0 0 var(--space-1); }
+.dt-ai-summary { margin: 0; font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.dt-result-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.dt-ai-hist-title { margin: var(--space-2) 0 calc(var(--space-1) * -1); }
+.dt-hist { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }
+.dt-hist-row {
+  display: grid; grid-template-columns: auto auto auto auto minmax(0, 1fr); align-items: center; gap: var(--space-1) var(--space-3);
+  width: 100%; min-height: 2.5rem; padding: var(--space-2) var(--space-3); text-align: left;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); color: var(--ink);
+}
+.dt-hist-row:hover { background: var(--panel-3); border-color: var(--line-strong); }
+.dt-hist-date { font-size: var(--fs-sm); white-space: nowrap; }
+.dt-hist-score, .dt-hist-mode { font-size: var(--fs-xs); font-family: var(--font-mono); color: var(--ink-2); white-space: nowrap; }
+.dt-hist-sum {
+  grid-column: 1 / -1; min-width: 0; color: var(--ink-2); font-size: var(--fs-sm);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere;
+}
+.dt-hist-more { margin-top: var(--space-2); }
+.dt-decision { font-weight: 700; letter-spacing: 0.04em; }
+
+/* ---- position + valuation ---- */
+.dt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr)); gap: var(--space-3); min-width: 0; }
+.dt-kv { grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr)); }
+.dt-kv dd .chip { min-height: 1.4rem; }
+.dt-signals { display: grid; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
+.dt-signal { display: flex; align-items: center; gap: var(--space-2); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.dt-signal .dot { margin-top: 1px; }
+
+/* ---- news ---- */
+.dt-news-list { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }
+.dt-news-item { display: grid; gap: 2px; padding: var(--space-1) 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.dt-news-item:last-child { border-bottom: 0; }
+.dt-news-main {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3); width: 100%; min-height: 2.25rem;
+  padding: var(--space-1) var(--space-2); text-align: left; background: transparent; border: 0; border-radius: var(--radius-sm); color: var(--ink);
+}
+.dt-news-main:hover { background: var(--panel-2); }
+.dt-news-time { font-size: var(--fs-xs); white-space: nowrap; }
+.dt-news-title { flex: 1 1 14rem; min-width: 0; font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.dt-news-foot { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3); padding: 0 var(--space-2); font-size: var(--fs-xs); }
+.dt-news-source { min-width: 0; overflow-wrap: anywhere; }
+.dt-news-text { margin: 0 0 var(--space-3); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.dt-news-meta { margin: 0 0 var(--space-2); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+
+/* ---- report viewer modal ---- */
+.dt-report { display: grid; gap: var(--space-3); min-width: 0; }
+.dt-report-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.dt-report-head:empty { display: none; }
+.dt-report-body { display: grid; gap: var(--space-3); min-width: 0; }
+.dt-sec { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); padding: 0 var(--space-3); }
+.dt-sec > summary { min-height: 2.25rem; display: flex; align-items: center; cursor: pointer; font-weight: 600; }
+.dt-sec[open] > summary { margin-bottom: var(--space-2); }
+.dt-sec > .md { padding-bottom: var(--space-3); }
+
+/* ---- TradingView modal ---- */
+.dt-tv { display: grid; gap: var(--space-2); min-width: 0; }
+.dt-tv-stage { position: relative; height: min(70vh, 40rem); min-height: 18rem; background: var(--panel-2); border-radius: var(--radius); overflow: hidden; }
+.dt-tv-holder { position: absolute; inset: 0; }
+.dt-tv-status { position: absolute; inset: 0; display: grid; align-content: center; justify-items: stretch; gap: var(--space-3); padding: var(--space-4); background: var(--panel); }
+.dt-tv-status[hidden] { display: none; }
+.dt-tv-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-2); }
+.dt-tv-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); font-family: var(--font-mono); font-size: var(--fs-xs); }

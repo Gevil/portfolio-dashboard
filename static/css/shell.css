@@ -1,0 +1,49 @@
+/* Shell: status bar, view tabs (top on desktop, bottom bar on phones), page frame. */
+
+.main { width: 100%; max-width: var(--content-max); margin: 0 auto; padding: var(--space-4) var(--space-4) var(--space-6); outline: none; }
+.view { min-width: 0; }
+.noscript { padding: var(--space-5); text-align: center; }
+
+.statusbar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: var(--space-3) var(--space-5);
+  min-height: var(--bar-h); padding: var(--space-2) var(--space-4);
+  background: var(--panel); /* no backdrop-filter: it would become the containing block of the fixed mobile tab bar */
+  border-bottom: 1px solid var(--line);
+}
+.brand { margin: 0; font-family: var(--font-mono); font-size: var(--fs-md); font-weight: 700; letter-spacing: 0.04em; white-space: nowrap; }
+.brand-sub { color: var(--accent); }
+.sb-chips { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); min-width: 0; }
+.sb-actions { margin-left: auto; display: flex; align-items: center; gap: var(--space-1); }
+.sb-badge { position: absolute; top: 2px; right: 1px; pointer-events: none; }
+.sb-session { color: var(--ink-3); }
+.sb-session.chip-ok { color: var(--ink-2); border-color: var(--line-strong); background: var(--panel-2); }
+.sb-session.chip-ok .dot { background: var(--accent); }
+
+.tabs { display: flex; align-items: stretch; gap: var(--space-1); align-self: stretch; }
+.tab {
+  position: relative; padding: 0 var(--space-4); background: none; border: 0; color: var(--ink-2);
+  font-size: var(--fs-sm); font-weight: 500; letter-spacing: 0.02em;
+}
+.tab:hover { color: var(--ink); }
+.tab[aria-current="page"] { color: var(--ink); font-weight: 700; }
+.tab[aria-current="page"]::after {
+  content: ""; position: absolute; left: var(--space-3); right: var(--space-3); bottom: -1px; height: 2px; background: var(--accent); border-radius: 2px;
+}
+.tab:focus-visible { outline-offset: -3px; }
+
+@media (max-width: 760px) {
+  .main { padding: var(--space-3) var(--space-3) calc(var(--tabbar-h) + var(--space-5) + env(safe-area-inset-bottom, 0px)); }
+  .statusbar { flex-wrap: wrap; gap: var(--space-1) var(--space-3); padding: var(--space-2) var(--space-3); }
+  .brand-sub { display: none; }
+  .sb-chips { order: 3; flex: 1 1 100%; }
+  .sb-actions { margin-left: auto; }
+  .tabs {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 60; align-self: auto;
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
+    height: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--panel); border-top: 1px solid var(--line-strong);
+  }
+  .tab { padding: 0; font-size: var(--fs-sm); }
+  .tab[aria-current="page"]::after { left: 20%; right: 20%; bottom: auto; top: -1px; }
+}

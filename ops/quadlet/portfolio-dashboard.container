@@ -1,0 +1,56 @@
+[Unit]
+Description=Portfolio Watch Dashboard
+After=aistock-network.service ollama.service ntfy.service open-webui.service
+Requires=aistock-network.service
+
+[Container]
+Image=localhost/portfolio-dashboard:latest
+ContainerName=portfolio-dashboard
+Network=aistock
+Network=podman
+PublishPort=8601:8601
+
+# Directory mount (not the single file): atomic os.replace of config.json keeps the inode the host sees.
+Volume=%h/Work/Personal/portfolio-dashboard/config:/app/config:z
+Environment=CONFIG_PATH=/app/config/config.json
+Volume=%h/Work/Personal/portfolio-dashboard/data:/app/data:z
+Volume=%h/Work/Personal/portfolio-dashboard/results:/app/results:rw,z
+# Whole directory, not the two files: lanes-status publishes lanes-enrich.json
+# with a temp+rename every 45 s, and a single-file bind mount keeps the inode it
+# saw at container start — the file goes frozen, lane_client's 120 s freshness
+# guard then drops the container path and the pod goes blind to the GPU lane.
+Volume=%h/.local/bin/gpu-lanes:/app/lanes:ro,z
+
+# Adjust the %h/... checkout path and the After=/Requires= units below to your host.
+Environment=OLLAMA_URL=http://ollama:11434
+Environment=OPEN_WEBUI_URL=http://open-webui:8080
+Environment=NTFY_URL=http://ntfy:80
+Environment=NTFY_TOPIC=stocks
+Environment=NTFY_USER=stockbot
+# Host-specific values (NTFY_CLICK_URL, SEC_USER_AGENT and FINRA_USER_AGENT with a real contact
+# email, ...) belong in a local drop-in OUTSIDE the repo:
+#   ~/.config/containers/systemd/portfolio-dashboard.container.d/10-local.conf
+# Quote values that contain spaces, or systemd truncates them at the first space.
+Environment=TZ=Europe/Prague
+EnvironmentFile=%h/Work/Personal/portfolio-dashboard/env.secrets
+Environment=LANES_CONF=/app/lanes/lanes.conf
+Environment=LANES_ENRICH=/app/lanes/lanes-enrich.json
+
+AutoUpdate=local
+
+# Self-healing: /health must answer; 3 failures in a row kill the container, systemd restarts it.
+HealthCmd=python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8601/health', timeout=3)"
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=180s
+HealthOnFailure=kill
+
+[Service]
+Restart=on-failure
+RestartSec=10
+MemoryMax=768M
+MemoryHigh=640M
+
+[Install]
+WantedBy=default.target

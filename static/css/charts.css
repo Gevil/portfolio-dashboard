@@ -1,0 +1,129 @@
+/* Charts: price / indexed canvases, tooltip, legend, state overlay, allocation donut.
+   Prefix ch-. Colours only via tokens; canvas colours are read from the same variables in JS. */
+
+.ch { display: grid; gap: var(--space-2); min-width: 0; }
+.ch [hidden] { display: none !important; }
+
+.ch-box { position: relative; min-width: 0; }
+
+.ch-stage {
+  position: relative; display: flex; flex-direction: column; min-width: 0;
+  border-radius: var(--radius); touch-action: pan-y; cursor: crosshair;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* canvases are CSS-sized so the layout never jumps while data loads */
+.ch-canvas { display: block; width: 100%; }
+.ch-canvas-price { height: 300px; }
+.ch-canvas-rsi { height: 70px; border-top: 1px solid var(--line); }
+.ch-canvas-indexed { height: 220px; }
+.ch-canvas.ch-cross { position: absolute; inset: 0; height: 100%; pointer-events: none; }
+@media (max-width: 640px) {
+  .ch-canvas-price { height: 240px; }
+}
+
+/* tooltip */
+.ch-tip {
+  position: absolute; top: var(--space-2); left: 0; z-index: 2; pointer-events: none;
+  min-width: 8.5rem; max-width: 15rem; padding: var(--space-2) var(--space-3);
+  background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: var(--radius);
+  box-shadow: var(--shadow); font-size: var(--fs-xs); color: var(--ink-2); white-space: nowrap;
+}
+.ch-tip-time { color: var(--ink-3); font-family: var(--font-mono); }
+.ch-tip-main { font-size: var(--fs-md); font-weight: 600; color: var(--ink); }
+.ch-tip-row { display: flex; justify-content: space-between; align-items: center; gap: var(--space-3); }
+.ch-tip-label { display: inline-flex; align-items: center; gap: 0.4rem; }
+.ch-tip-val { color: var(--ink); }
+.ch-tip-val.up { color: var(--up); }
+.ch-tip-val.down { color: var(--down); }
+.ch-tip-marker {
+  display: flex; align-items: center; gap: 0.4rem; margin-top: var(--space-1);
+  padding-top: var(--space-1); border-top: 1px solid var(--line); color: var(--ink);
+}
+
+/* legend */
+.ch-key {
+  display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-4); margin: 0; padding: 0; list-style: none;
+  font-size: var(--fs-xs); color: var(--ink-2);
+}
+.ch-key:empty { display: none; }
+.ch-key-item { display: inline-flex; align-items: center; gap: 0.4rem; }
+.ch-key-val { color: var(--ink); font-weight: 600; }
+.ch-key-val.up { color: var(--up); }
+.ch-key-val.down { color: var(--down); }
+
+.ch-glyph { flex: none; display: inline-block; width: 0.7rem; height: 0.7rem; background: var(--ink-3); }
+.ch-g-buy { background: var(--chart-buy); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.ch-g-sell { background: var(--chart-sell); clip-path: polygon(0 0, 100% 0, 50% 100%); }
+.ch-g-hold { background: var(--chart-hold); clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
+.ch-g-line { width: 1.1rem; height: 2px; border-radius: 1px; }
+.ch-g-ema20 { background: var(--chart-ema20); }
+.ch-g-ema50 { background: var(--chart-ema50); }
+.ch-g-rsi { background: var(--chart-rsi); }
+.ch-g-portfolio { background: var(--chart-line); height: 3px; }
+.ch-g-bench {
+  background: repeating-linear-gradient(90deg, var(--chart-benchmark) 0 4px, transparent 4px 7px);
+}
+
+/* state overlay (loading / error / empty) */
+.ch-state-layer {
+  position: absolute; inset: 0; z-index: 3; display: grid; place-items: center;
+  padding: var(--space-3); overflow: auto; background: var(--panel); border-radius: var(--radius);
+}
+.ch-state-layer .state { width: 100%; max-width: 30rem; }
+.ch-state-layer.is-soft {
+  background: transparent; pointer-events: none; place-items: start end; padding: var(--space-2); overflow: visible;
+}
+.ch-pill {
+  padding: 0.15rem var(--space-2); border-radius: 999px; border: 1px solid var(--line);
+  background: var(--panel-2); color: var(--ink-3); font-size: var(--fs-xs);
+}
+
+/* allocation donut */
+.ch-donut {
+  display: grid; grid-template-columns: minmax(0, 11rem) minmax(0, 1fr); gap: var(--space-4); align-items: center;
+}
+@media (max-width: 520px) {
+  .ch-donut { grid-template-columns: minmax(0, 1fr); justify-items: center; }
+  .ch-alloc { justify-self: stretch; }
+}
+.ch-donut-fig { width: 100%; max-width: 11rem; }
+.ch-donut-svg { display: block; width: 100%; height: auto; aspect-ratio: 1; }
+.ch-donut-track { fill: none; stroke: var(--panel-2); stroke-width: 5; }
+.ch-seg {
+  fill: none; stroke: var(--ch-c, var(--alloc-1)); stroke-width: 5; cursor: pointer;
+  transition: opacity var(--dur) var(--ease-out), stroke-width var(--dur) var(--ease-out);
+}
+.ch-seg.is-selected { stroke-width: 6.6; }
+.ch-donut.has-sel .ch-seg:not(.is-selected) { opacity: 0.4; }
+.ch-donut-main { font: 600 4.4px var(--font-sans); fill: var(--ink); text-anchor: middle; dominant-baseline: middle; }
+.ch-donut-sub { font: 3.2px var(--font-mono); fill: var(--ink-3); text-anchor: middle; dominant-baseline: middle; }
+
+.ch-a1 { --ch-c: var(--alloc-1); }
+.ch-a2 { --ch-c: var(--alloc-2); }
+.ch-a3 { --ch-c: var(--alloc-3); }
+.ch-a4 { --ch-c: var(--alloc-4); }
+.ch-a5 { --ch-c: var(--alloc-5); }
+.ch-a6 { --ch-c: var(--alloc-6); }
+
+.ch-alloc { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; min-width: 0; }
+.ch-alloc-btn {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: var(--space-2);
+  width: 100%; min-height: 2.25rem; padding: var(--space-1) var(--space-2);
+  background: transparent; border: 1px solid transparent; border-radius: var(--radius);
+  color: var(--ink); font: inherit; font-size: var(--fs-sm); text-align: left; cursor: pointer;
+}
+.ch-alloc-btn:hover { background: var(--panel-2); }
+.ch-alloc-btn[aria-pressed="true"] { background: var(--panel-2); border-color: var(--line-strong); }
+.ch-swatch { width: 0.7rem; height: 0.7rem; border-radius: 2px; background: var(--ch-c, var(--alloc-1)); }
+.ch-alloc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.ch-alloc-pct { color: var(--ink-2); }
+.ch-alloc-val { color: var(--ink-3); font-size: var(--fs-xs); min-width: 4.5rem; text-align: right; }
+@media (max-width: 380px) {
+  .ch-alloc-btn { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .ch-alloc-val { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ch-seg { transition: none; }
+}

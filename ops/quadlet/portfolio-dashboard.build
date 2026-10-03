@@ -1,0 +1,7 @@
+[Unit]
+Description=Build portfolio-dashboard image
+
+[Build]
+ImageTag=localhost/portfolio-dashboard:latest
+File=%h/Work/Personal/portfolio-dashboard/Dockerfile
+SetWorkingDirectory=%h/Work/Personal/portfolio-dashboard

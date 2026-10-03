@@ -1,0 +1,19 @@
+# Keep secrets, personal config and runtime state out of the image build context.
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.pytest_cache/
+env.secrets
+.env
+.env.*
+config/
+config.json
+data/
+results/
+tests/
+ops/
+skills/
+*.md
+*.bundle
+*.tar.zst

@@ -1,0 +1,62 @@
+/* Alert center drawer (prefix ac-). Severity is carried by icon + label chip, colour only reinforces it. */
+
+.ac { display: grid; gap: var(--space-3); min-width: 0; }
+
+.ac-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.ac-markall { margin-left: auto; }
+.ac-badge { flex: none; }
+
+.ac-statusrow {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--space-2);
+  font-size: var(--fs-xs);
+}
+.ac-summary { font-family: var(--font-mono); font-size: var(--fs-xs); }
+
+.ac-banner:empty, .ac-state:empty { display: none; }
+
+.ac-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-3); min-width: 0; }
+
+.ac-item {
+  display: grid; gap: var(--space-2); min-width: 0;
+  padding: var(--space-3);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+}
+.ac-sev-urgent { border-left-color: var(--red); }
+.ac-sev-warn { border-left-color: var(--amber); }
+.ac-sev-info { border-left-color: var(--blue); }
+
+/* acknowledged: calmer, but still readable */
+.ac-item.is-acked { background: transparent; border-left-color: var(--line-strong); }
+.ac-item.is-acked .ac-title { font-weight: 500; color: var(--ink-2); }
+.ac-item.is-acked .ac-msg { color: var(--ink-3); }
+.ac-item.is-acked .ac-sev-chip { background: transparent; color: var(--ink-3); border-color: var(--line-strong); }
+
+.ac-item-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; }
+.ac-sev-chip { min-height: 1.5rem; }
+.ac-ticker { min-height: 1.5rem; color: var(--ink); }
+button.ac-ticker { cursor: pointer; }
+button.ac-ticker:hover { border-color: var(--accent); background: var(--panel-3); }
+.ac-time { font-size: var(--fs-xs); }
+.ac-source { font-family: var(--font-mono); font-size: var(--fs-xs); }
+.ac-unread-dot { display: inline-flex; align-items: center; margin-left: auto; }
+
+.ac-title { font-size: var(--fs-base); font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.ac-msg {
+  margin: 0; font-size: var(--fs-sm); color: var(--ink-2); line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+.ac-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+.ac-actions:empty { display: none; }
+.ac-link { text-decoration: none; }
+
+.ac.is-busy .ac-ack, .ac.is-busy .ac-markall, .ac.is-busy .ac-ticker { opacity: 0.55; pointer-events: none; }
+
+@media (max-width: 640px) {
+  .ac-toolbar .btn, .ac-toolbar .seg > button { min-height: 2.25rem; }
+  .ac-actions .btn { min-height: 2.25rem; }
+  .ac-markall { margin-left: 0; }
+}

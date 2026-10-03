@@ -1,0 +1,178 @@
+/* Design tokens. Every colour, space, radius and type size used by the app comes from here.
+   Dark is the default; light follows prefers-color-scheme unless html[data-theme] is set
+   (js/theme-boot.js + js/main.js manage the attribute from the persisted preference). */
+
+:root {
+  color-scheme: dark;
+
+  /* surface */
+  --bg: #070c12;
+  --bg-grad-a: rgba(34, 197, 94, 0.06);
+  --bg-grad-b: rgba(56, 189, 248, 0.05);
+  --panel: #101a24;
+  --panel-2: #16232e;
+  --panel-3: #1c2c39;
+  --line: #22333f;
+  --line-strong: #31475a;
+  --overlay: rgba(3, 8, 13, 0.66);
+  --shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
+
+  /* ink */
+  --ink: #e8f1f7;
+  --ink-2: #a8bccc;
+  --ink-3: #8a9eb0;
+  --label: #c2d2de;
+
+  /* semantic colours (text-safe on --panel) */
+  --accent: #22c55e;
+  --accent-soft: rgba(34, 197, 94, 0.13);
+  --accent-ink: #04210e;       /* text on solid --accent */
+  --green: var(--accent);
+  --red: #f0605d;
+  --red-soft: rgba(240, 96, 93, 0.14);
+  --amber: #f5a524;
+  --amber-soft: rgba(245, 165, 36, 0.14);
+  --blue: #38bdf8;
+  --blue-soft: rgba(56, 189, 248, 0.13);
+  --up: var(--accent);
+  --down: var(--red);
+  --up-soft: var(--accent-soft);
+  --down-soft: var(--red-soft);
+
+  /* chart series (canvas code reads these via getComputedStyle) */
+  --chart-grid: rgba(138, 158, 176, 0.14);
+  --chart-axis: #8a9eb0;
+  --chart-line: var(--accent);
+  --chart-ema20: #f5a524;
+  --chart-ema50: #a78bfa;
+  --chart-rsi: #38bdf8;
+  --chart-benchmark: #8a9eb0;
+  --chart-buy: #22c55e;
+  --chart-sell: #f0605d;
+  --chart-hold: #f5a524;
+  --alloc-1: #38bdf8;
+  --alloc-2: #22c55e;
+  --alloc-3: #f5a524;
+  --alloc-4: #a78bfa;
+  --alloc-5: #f472b6;
+  --alloc-6: #2dd4bf;
+
+  /* typography */
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --fs-xs: 0.6875rem;   /* 11px: mono labels */
+  --fs-sm: 0.8125rem;   /* 13px */
+  --fs-base: 0.875rem;  /* 14px */
+  --fs-md: 1rem;
+  --fs-lg: 1.25rem;
+  --fs-xl: 1.75rem;
+  --fs-hero: clamp(1.75rem, 1.2rem + 2.2vw, 2.5rem);
+  --lh: 1.5;
+
+  /* space (4px grid), radii, motion */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --radius-sm: 3px;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur: 160ms;
+
+  /* layout */
+  --bar-h: 3.25rem;
+  --tabbar-h: 3.5rem;
+  --content-max: 1560px;
+  --focus: #7dd3fc;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f5f7;
+  --bg-grad-a: rgba(21, 128, 61, 0.05);
+  --bg-grad-b: rgba(3, 105, 161, 0.04);
+  --panel: #ffffff;
+  --panel-2: #f4f7f9;
+  --panel-3: #e9eef2;
+  --line: #d5dde4;
+  --line-strong: #b9c6d1;
+  --overlay: rgba(17, 29, 40, 0.45);
+  --shadow: 0 10px 30px rgba(17, 29, 40, 0.18);
+  --ink: #13202b;
+  --ink-2: #41546a;
+  --ink-3: #5a6c7e;
+  --label: #2d4256;
+  --accent: #15803d;
+  --accent-soft: rgba(21, 128, 61, 0.1);
+  --accent-ink: #ffffff;
+  --red: #b91c1c;
+  --red-soft: rgba(185, 28, 28, 0.09);
+  --amber: #a15c07;
+  --amber-soft: rgba(161, 92, 7, 0.11);
+  --blue: #0369a1;
+  --blue-soft: rgba(3, 105, 161, 0.09);
+  --chart-grid: rgba(65, 84, 106, 0.14);
+  --chart-axis: #5a6c7e;
+  --chart-ema20: #b45309;
+  --chart-ema50: #7c3aed;
+  --chart-rsi: #0369a1;
+  --chart-benchmark: #5a6c7e;
+  --chart-buy: #15803d;
+  --chart-sell: #b91c1c;
+  --chart-hold: #a15c07;
+  --alloc-1: #0369a1;
+  --alloc-2: #15803d;
+  --alloc-3: #b45309;
+  --alloc-4: #7c3aed;
+  --alloc-5: #be185d;
+  --alloc-6: #0f766e;
+  --focus: #0369a1;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --bg: #f3f5f7;
+    --bg-grad-a: rgba(21, 128, 61, 0.05);
+    --bg-grad-b: rgba(3, 105, 161, 0.04);
+    --panel: #ffffff;
+    --panel-2: #f4f7f9;
+    --panel-3: #e9eef2;
+    --line: #d5dde4;
+    --line-strong: #b9c6d1;
+    --overlay: rgba(17, 29, 40, 0.45);
+    --shadow: 0 10px 30px rgba(17, 29, 40, 0.18);
+    --ink: #13202b;
+    --ink-2: #41546a;
+    --ink-3: #5a6c7e;
+    --label: #2d4256;
+    --accent: #15803d;
+    --accent-soft: rgba(21, 128, 61, 0.1);
+    --accent-ink: #ffffff;
+    --red: #b91c1c;
+    --red-soft: rgba(185, 28, 28, 0.09);
+    --amber: #a15c07;
+    --amber-soft: rgba(161, 92, 7, 0.11);
+    --blue: #0369a1;
+    --blue-soft: rgba(3, 105, 161, 0.09);
+    --chart-grid: rgba(65, 84, 106, 0.14);
+    --chart-axis: #5a6c7e;
+    --chart-ema20: #b45309;
+    --chart-ema50: #7c3aed;
+    --chart-rsi: #0369a1;
+    --chart-benchmark: #5a6c7e;
+    --chart-buy: #15803d;
+    --chart-sell: #b91c1c;
+    --chart-hold: #a15c07;
+    --alloc-1: #0369a1;
+    --alloc-2: #15803d;
+    --alloc-3: #b45309;
+    --alloc-4: #7c3aed;
+    --alloc-5: #be185d;
+    --alloc-6: #0f766e;
+    --focus: #0369a1;
+  }
+}

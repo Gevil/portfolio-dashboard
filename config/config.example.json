@@ -1,0 +1,117 @@
+{
+  "watchlist": [
+    {
+      "id": "ASML",
+      "symbol": "ASML",
+      "label": "ASML",
+      "kind": "equity",
+      "role": "holding",
+      "quoteCurrency": "EUR",
+      "providers": {
+        "yahoo": "ASML.AS",
+        "twelvedata": "ASML",
+        "finnhub": "ASML"
+      },
+      "listing": {
+        "symbol": "ASML.AS",
+        "venue": "XAMS",
+        "currency": "EUR"
+      }
+    },
+    {
+      "id": "NVDA",
+      "symbol": "NVDA",
+      "label": "NVDA",
+      "kind": "equity",
+      "role": "holding",
+      "quoteCurrency": "EUR",
+      "providers": {
+        "yahoo": "NVD.DE",
+        "twelvedata": "NVDA",
+        "finnhub": "NVDA"
+      },
+      "listing": {
+        "symbol": "NVD.DE",
+        "venue": "XETR",
+        "currency": "EUR"
+      }
+    },
+    {
+      "id": "SXR8",
+      "symbol": "SXR8",
+      "label": "S&P 500 (iShares CSPX)",
+      "kind": "etf",
+      "role": "holding",
+      "quoteCurrency": "EUR",
+      "providers": {
+        "yahoo": "SXR8.DE",
+        "twelvedata": null,
+        "finnhub": null
+      },
+      "listing": {
+        "symbol": "SXR8.DE",
+        "venue": "XETR",
+        "currency": "EUR"
+      },
+      "analyzeable": false
+    },
+    {
+      "id": "GSPC",
+      "symbol": "GSPC",
+      "label": "GSPC",
+      "kind": "index",
+      "role": "benchmark",
+      "quoteCurrency": "USD",
+      "providers": {
+        "yahoo": "^GSPC",
+        "twelvedata": null,
+        "finnhub": null
+      }
+    }
+  ],
+  "aliases": {
+    "ASML": [
+      "asml",
+      "euv"
+    ],
+    "NVDA": [
+      "nvidia",
+      "nvm"
+    ],
+    "SXR8": [
+      "s&p 500",
+      "sp500",
+      "ishares core s&p"
+    ],
+    "GSPC": [
+      "s&p",
+      "sp500",
+      "sp 500"
+    ]
+  },
+  "chatModel": "lane",
+  "portfolio": {
+    "ASML": {
+      "shares": 2.5,
+      "investedAmount": 2500.0
+    },
+    "NVDA": {
+      "shares": 10.0,
+      "investedAmount": 1200.0
+    },
+    "SXR8": {
+      "shares": 3.0,
+      "investedAmount": null
+    }
+  },
+  "alertRules": {
+    "version": 2,
+    "default": {
+      "thresholdPct": 3.0,
+      "hotPct": 5.0,
+      "cooldownMin": 120,
+      "direction": "both"
+    },
+    "perTicker": {}
+  }
+}

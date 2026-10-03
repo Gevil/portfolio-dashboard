@@ -80,11 +80,17 @@ Project overview, features, configuration, deploy/backup/dev commands: [`README.
 10. **Never commit secrets or personal data**: `env.secrets`, `data/`, `results/` and the real
     `config/config.json` (share counts, cost basis) are gitignored; only `config/config.example.json` is tracked.
     Commit only when the owner asks.
+11. **Preserve the owner's config across deploys.** Tickers, positions and alert rules live in
+    `config/config.json` (gitignored, bind-mounted, never in the image). Deploy only with `ops/deploy.sh`
+    (it refuses to run on a missing/invalid config and proves the file is unchanged afterwards). Restore with
+    `ops/restore-config.sh`. **Never** run `git clean -x`/`-fdx`, `git stash --all`, or re-clone over the working
+    directory without first running `bash ops/backup.sh`: those delete or hide ignored files (`config/config.json`,
+    `env.secrets`, `data/`, `results/`). `git pull`, `checkout`, `reset --hard` and `git clean -fd` are safe.
 
 ## Quick commands
 ```bash
 cd ~/Work/Personal/portfolio-dashboard
-systemctl --user start portfolio-dashboard-build.service && systemctl --user restart portfolio-dashboard
+bash ops/deploy.sh          # snapshot -> preflight -> build -> restart -> verify config unchanged (use this, not loose commands)
 podman healthcheck run portfolio-dashboard && echo HEALTHY
 podman logs --since 5m portfolio-dashboard 2>&1 | grep -iE 'error|traceback'
 bash ops/backup.sh

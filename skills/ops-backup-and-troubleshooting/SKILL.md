@@ -21,10 +21,18 @@ description: Operate the portfolio-dashboard pod on Bazzite - quadlet/units, dai
   `~/backups/portfolio-dashboard/` and, if `DASHBOARD_BACKUP_DEST` is set in the service unit, a second location (e.g. a NAS share), keeps 21,
   integrity-tests the archive before keeping it. **`env.secrets` is excluded.** Run manually before risky changes.
   `systemctl --user list-timers | grep portfolio`; `journalctl --user -u portfolio-dashboard-backup -n 20`.
-- Restore: `systemctl --user stop portfolio-dashboard` → extract the archive into the repo dir
+- **Config safety**: `config/config.json` (watchlist, positions, alert rules) is gitignored and never baked into the
+  image; `.dockerignore` excludes `config/`. Deploy with `ops/deploy.sh` (refuses on missing/invalid config, snapshots
+  first, verifies unchanged). The app also keeps `data/config.lastgood.json` and serves it if the file is damaged.
+  Restore just the config: `bash ops/restore-config.sh [archive]` (keeps the current file as `config.json.before-restore-*`).
+- Destructive git commands: `git clean -fdx`, `git stash --all` and a fresh clone delete/hide ignored files
+  (`config/config.json`, `env.secrets`, `data/`, `results/`). Run `bash ops/backup.sh` first. Safe: `pull`, `checkout`,
+  `reset --hard`, `git clean -fd`.
+- New machine: clone, create `env.secrets`, `bash ops/deploy.sh --init` (seeds the fictional sample), then enter your
+  real tickers/positions in Settings (or restore with `ops/restore-config.sh`).
+- Full restore: `systemctl --user stop portfolio-dashboard` → extract the archive into the repo dir
   (`tar --zstd -xf pd-….tar.zst -C ~/Work/Personal/portfolio-dashboard`) → start → check `/api/portfolio`.
-  Restore only `config/` if only the portfolio was damaged (`config_store` also keeps `data/config.lastgood.json`).
-- Code rollback: `git revert`/checkout → build unit → restart. Data is untouched by code rollbacks.
+- Code rollback: `git revert`/checkout → `bash ops/deploy.sh`. Data is untouched by code rollbacks.
 - Config sanity: `GET /api/config` answers 503 only when the stored config is unreadable and no last-good exists;
   PUT never overwrites an unreadable config with defaults.
 

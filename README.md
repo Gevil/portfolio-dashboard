@@ -9,6 +9,24 @@ on Bazzite (Fedora Atomic) with an RTX 5090.
 - Example setup: EU-listed holdings (ASML `ASML.AS`, NVDA `NVD.DE`, iShares Core S&P 500 UCITS ETF
   `SXR8.DE`) valued in **EUR**; the S&P 500 index (`^GSPC`) is a **benchmark only**. Everything is configurable.
 - Agent/maintainer docs: [`AGENTS.md`](AGENTS.md) and [`skills/`](skills/).
+- **Documentation with screenshots and a walkthrough video: [`docs/`](docs/README.md).**
+
+![Portfolio Dashboard overview (demo data)](docs/media/screenshots/overview-dark.webp)
+
+<p align="center">
+  <img src="docs/media/video/walkthrough.gif" alt="Walkthrough: positions table, allocation, holding detail, chart ranges and indicator overlays" width="720"><br>
+  <sub>first 26 s · <a href="docs/media/video/walkthrough.mp4">full 60 s video (mp4)</a> also covers the alert center, digest, market, AI Ops and settings</sub>
+</p>
+
+| Holding detail | Alert center | Digest and scoreboard |
+|---|---|---|
+| [![Holding detail](docs/media/screenshots/holding-detail.webp)](docs/features/holding-detail.md) | [![Alert center](docs/media/screenshots/alert-center.webp)](docs/features/alerts.md) | [![Digest](docs/media/screenshots/digest.webp)](docs/features/digest-and-scoreboard.md) |
+
+*All media come from a demo instance with fictional positions – see [`docs/demo-data.md`](docs/demo-data.md).
+More: [overview](docs/features/overview.md) · [analysis and reports](docs/features/analysis-and-reports.md) ·
+[market](docs/features/market.md) · [AI Ops](docs/features/ai-ops.md) · [settings](docs/features/settings.md) ·
+[mobile and themes](docs/features/mobile-and-themes.md).*
+
 
 ## What it does
 | Area | Details |
@@ -88,8 +106,8 @@ The unit files live in `ops/quadlet/` and are symlinked into `~/.config/containe
 `app/` and `static/` are baked into the image, so **a code change is live only after a rebuild**:
 ```bash
 cd ~/Work/Personal/portfolio-dashboard
-systemctl --user start portfolio-dashboard-build.service     # podman build from this repo
-systemctl --user restart portfolio-dashboard                 # ~20–30 s to healthy
+bash ops/deploy.sh      # backup -> config preflight -> build -> restart -> verify your config is unchanged
+                        # (first run on a new machine: bash ops/deploy.sh --init, then edit config/config.json)
 podman healthcheck run portfolio-dashboard && echo HEALTHY
 ```
 Pod hardening: `Restart=on-failure`, `HealthCmd` on `/health` (3 failures → restart), `MemoryMax=768M`,
@@ -101,7 +119,10 @@ uvicorn `--no-access-log` (approval URLs carry a token). Mounts: `config/`, `dat
 `tar.zst` of `config/`, `data/`, `results/` to `~/backups/portfolio-dashboard/` (override with
 `DASHBOARD_BACKUP_LOCAL`), keeping 21. Set `DASHBOARD_BACKUP_DEST` (and optionally `DASHBOARD_NAS_MOUNT`) in the
 timer's service unit for a second copy. `env.secrets` is intentionally **not** backed up — keep it in a password
-manager. Restore = stop the pod, extract over the repo directory, start the pod.
+manager. **Your tickers/positions/alert rules** live only in `config/config.json` (gitignored, outside the image),
+so rebuilds and `git pull` never touch them; `ops/deploy.sh` refuses to deploy without a valid one. Restore the config
+alone with `bash ops/restore-config.sh [archive]`; restore everything = stop the pod, extract over the repo
+directory, start the pod. Avoid `git clean -x`, which deletes ignored files.
 
 ## Development
 ```bash

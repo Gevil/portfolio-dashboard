@@ -21,9 +21,9 @@ when any static file changed; ES-module sub-imports are revalidated by ETag (the
 
 ## 2. Build + restart
 ```bash
-systemctl --user start portfolio-dashboard-build.service      # podman build from this repo (~2 s with cached layers)
-systemctl --user restart portfolio-dashboard
-sleep 30; podman healthcheck run portfolio-dashboard && echo HEALTHY
+bash ops/deploy.sh      # snapshot (ops/backup.sh) -> config preflight -> build unit -> restart -> health wait -> config unchanged?
+                        # = systemctl --user start portfolio-dashboard-build.service + restart, with safety rails
+                        # `bash ops/deploy.sh --check` runs the preflight only
 podman inspect -f '{{.Image}}' portfolio-dashboard            # must equal:
 podman images -q --no-trunc localhost/portfolio-dashboard:latest
 ```
@@ -61,8 +61,8 @@ Also check `podman logs --since 3m portfolio-dashboard 2>&1 | grep -ciE 'error|t
   (~2 min, needs the pod up; reads creds from env or `env.secrets`).
 
 ## 5. Rollback
-`git revert`/checkout the previous commit → rebuild → restart. Data is untouched by code rollbacks; for
-data/config damage see `skills/ops-backup-and-troubleshooting`.
+`git revert`/checkout the previous commit → `bash ops/deploy.sh`. Data and `config/config.json` are untouched by code
+rollbacks; for config damage run `bash ops/restore-config.sh`, see `skills/ops-backup-and-troubleshooting`.
 
 ## Pitfalls
 - `httpx.Response` here has `.is_success` (no `.ok`).

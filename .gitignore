@@ -23,3 +23,4 @@ venv/
 
 # Legacy pre-consolidation tool scripts kept locally only
 retired/
+config/config.json.*

@@ -421,7 +421,8 @@ export function openAdvancedChart(id) {
       widget = new window.TradingView.widget({
         container_id: holder.id,
         symbol,
-        interval: '60',
+        // Free embed serves intraday only for US/index symbols; XETR/Euronext etc. are D/W/M only.
+        interval: /^(NASDAQ|NYSE|SP):/.test(symbol) ? '60' : 'D',
         theme: dark ? 'dark' : 'light',
         style: '1',
         locale: 'en',

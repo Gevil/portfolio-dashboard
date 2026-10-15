@@ -1,10 +1,7 @@
 """Market light: one daily green/yellow/red read on the whole tape.
 
-Three dimensions, each scored red=0 / yellow=50 / green=100:
+Two dimensions drive the light, each scored red=0 / yellow=50 / green=100:
 
-- ``breadth``  — share of ALERTABLE watchlist tickers above their 20-day MA
-  (>=60% green, 40-60% yellow, <40% red). Index tickers are excluded by
-  ``prices.is_alertable``: GSPC is the market itself, not a holding.
 - ``index``    — benchmark close vs its 200-day MA: above green, below red,
   with a +/-2% yellow band so a tape sitting *on* the average does not flip
   the light every day.
@@ -13,8 +10,16 @@ Three dimensions, each scored red=0 / yellow=50 / green=100:
 The top-level ``status`` is derived from the mean of the AVAILABLE dimensions:
 >=66.7 with no red dimension -> green, <=33.3 (or any red dimension while the
 mean is under 50) -> red, otherwise yellow. Fewer than two available
-dimensions sets ``data_quality: "limited"`` — the light stays advisory, and the
-consumer can tell a genuinely mixed tape from a starved one.
+dimensions (i.e. one of the two is missing) sets ``data_quality: "limited"`` —
+the light stays advisory, and the consumer can tell a genuinely mixed tape
+from a starved one.
+
+``holdingsTrend`` is informational only: the share of the owner's ALERTABLE
+watchlist tickers above their 20-day MA ("your holdings above MA20"; index
+tickers are excluded by ``prices.is_alertable``). It never enters ``status``,
+``score``, ``reasons`` or the drop alert — two held stocks dipping is not a
+market signal. Payload: ``dims.index`` / ``dims.momentum`` (also exposed
+under the legacy key ``dimensions``) and ``holdingsTrend``.
 
 One snapshot per day at 21:00 local (``TZ=Europe/Prague``) written to
 ``data/market_light.json``. A status DROP against the previous snapshot
@@ -125,9 +130,10 @@ def _unavailable(detail: str) -> dict:
             "detail": detail}
 
 
-async def _dim_breadth(symbols: list[str], c: dict) -> dict:
-    """% of alertable watchlist tickers above their MA."""
+async def _holdings_trend(symbols: list[str], c: dict) -> dict:
+    """Informational: % of the alertable watchlist tickers above their MA."""
     period = int(c["breadth_period"])
+    label = f"your holdings above MA{period}"
     above = total = 0
     for sym in symbols:
         closes = await _daily_closes(sym, c["breadth_range"])
@@ -140,13 +146,14 @@ async def _dim_breadth(symbols: list[str], c: dict) -> dict:
         if closes[-1] > ma:
             above += 1
     if total < int(c["min_symbols"]):
-        return _unavailable(f"only {total} of {len(symbols)} alertable tickers "
-                            f"have {period + 1}+ daily bars")
+        return {"available": False, "label": label, "period": period,
+                "above": above, "total": total,
+                "detail": f"only {total} of {len(symbols)} alertable tickers "
+                          f"have {period + 1}+ daily bars"}
     pct = 100.0 * above / total
-    status = GREEN if pct >= 60 else YELLOW if pct >= 40 else RED
-    return {"score": SCORE[status], "available": True, "status": status,
-            "detail": f"{above}/{total} alertable tickers above "
-                      f"MA{period} ({pct:.0f}%)"}
+    return {"available": True, "label": label, "period": period,
+            "above": above, "total": total, "pct": round(pct, 1),
+            "detail": f"{above}/{total} {label} ({pct:.0f}%)"}
 
 
 def _dim_index(closes: list[float], c: dict) -> dict:
@@ -210,7 +217,6 @@ async def snapshot() -> dict:
     # second dimension is free — but a cold cache must not fetch it twice).
     idx_closes = await _daily_closes(str(c["index"]), c["index_range"])
     dims = {
-        "breadth": await _dim_breadth(symbols, c),
         "index": _dim_index(idx_closes, c),
         "momentum": _dim_momentum(idx_closes, c),
     }
@@ -221,7 +227,9 @@ async def snapshot() -> dict:
         "status": status,
         "score": score,
         "reasons": reasons,
+        "dims": dims,
         "dimensions": dims,
+        "holdingsTrend": await _holdings_trend(symbols, c),
         "data_quality": "ok" if avail >= 2 else "limited",
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "ts": time.time(),
@@ -234,11 +242,9 @@ async def _announce(old: str, new: str, snap: dict) -> "notify.Delivery":
     if snap["data_quality"] == "limited":
         lines.append("• data quality: limited (<2 dimensions available)")
     body = "\n".join(lines)
-    delivery = await notify.push(title, body, severity="warning", priority=4,
-                                 tags=LIGHT_TAG[new])
-    if delivery:
-        notify.store("MARKET", "market_light", title, body, priority=4)
-    return delivery
+    return await notify.alert("MARKET", "market_light", title, body,
+                              priority=4, severity="warning",
+                              tags=LIGHT_TAG[new])
 
 
 async def run_once() -> dict:

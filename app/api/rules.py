@@ -1,14 +1,16 @@
-"""Alert-rule storage: per-ticker alert rules in config.json (v2).
+"""Alert-rule storage: per-ticker alert rules in config.json (v3).
 
-The ``alertRules`` block v2 holds a LIST of rules per ticker, each with a
+The ``alertRules`` block holds a LIST of rules per ticker, each with a
 ``kind``:
 
   "alertRules": {
-    "version": 2,
-    "default":   {"thresholdPct": 3.0, "hotPct": 5.0,
-                  "direction": "both", "cooldownMin": 120},
+    "version": 3,
+    "default":   {"mode": "sigma", "zAlert": 2.0, "zHot": 3.0, "rearmZ": 1.0,
+                  "minPct": 1.0, "gapWindowMin": 30, "cooldownMin": 120,
+                  "direction": "both",
+                  "thresholdPct": 3.0, "hotPct": 5.0},
     "perTicker": {"ASML": [
-       {"kind": "pct-move", "thresholdPct": 2.5, "direction": "down",
+       {"kind": "pct-move", "zAlert": 2.5, "direction": "down",
         "cooldownMin": 240},
        {"kind": "absolute", "condition": "ABOVE", "targetPrice": 1900,
         "oneShot": true, "expiresAt": "2026-12-31"},
@@ -23,21 +25,34 @@ The ``alertRules`` block v2 holds a LIST of rules per ticker, each with a
     ]}
   }
 
-v1 stored ONE dict per ticker (a pct-move rule with no ``kind``). Such a
-block stays valid: it is read as a single-element list, so nothing has to be
-migrated; the first save from the UI rewrites it in v2 shape.
+The pct-move rule has two modes. ``sigma`` (default): the session move is
+scaled by the ticker's EWMA daily volatility (``price_alerts``) - alert at
+|z| >= zAlert and |move| >= minPct, hot at |z| >= zHot, re-armed below
+rearmZ; the gap rule only runs inside ``gapWindowMin`` minutes after the
+open. ``pct``: the fixed thresholdPct / hotPct of v2 (those two fields are
+used only in this mode).
 
-``resolve()`` returns the LIST of effective rules for a ticker — the default
+Older blocks stay valid with no migration: v2 (a list per ticker, no sigma
+fields) is read as v3 with ``mode: "sigma"`` and every new field at its
+default, and v1 stored ONE dict per ticker (a pct-move rule with no
+``kind``), which is read as a single-element list. The stored block is never
+rewritten until the first save from the UI, which writes v3.
+
+``resolve()`` returns the LIST of effective rules for a ticker - the default
 block merged UNDER every entry, so any kind carries a threshold, a direction
 and a cooldown. pct-move delivery itself stays in price_alerts.py (it owns
 the live-quote baseline); it reads its single merged rule through
 ``pct_move()``, which answers None when a ticker's rule list has no pct-move
 entry (removing the rule in the UI must silence the pct alert).
 
+``load_public()`` also carries ``sigma: {id: {sigmaPct, asOf}}``: the daily
+volatility each alertable id is currently scaled by. price_alerts computes it
+(it needs the async price history) and publishes it through ``set_sigma()``.
+
 Env defaults (ALERT_THRESHOLD_PCT / ALERT_HOT_THRESHOLD_PCT /
 PRICE_ALERT_COOLDOWN_MIN) seed ``default`` when the block is absent, so the
-existing deployment keeps identical behaviour until rules are edited from
-the UI.
+existing deployment keeps identical cooldown/direction behaviour until rules
+are edited from the UI.
 """
 import datetime
 import logging
@@ -48,6 +63,7 @@ from app.api import config_store
 log = logging.getLogger("rules")
 
 DIRECTIONS = ("both", "up", "down")
+MODES = ("sigma", "pct")
 CROSS_DIRECTIONS = ("bullish_cross", "bearish_cross")
 LEVEL_CONDITIONS = ("ABOVE", "BELOW")
 RSI_CONDITIONS = ("above", "below")
@@ -58,7 +74,7 @@ KINDS = ("pct-move", "absolute", "ema_cross", "rsi_threshold",
          "volume-spike", "earnings-day", "short-ratio-spike",
          "market-light-drop")
 
-BLOCK_VERSION = 2
+BLOCK_VERSION = 3
 
 # key -> (low, high, integer). Bounds are per-field, not per-kind: a rule
 # outside them is a typo, and a typo silently dropped would leave the rule
@@ -75,13 +91,23 @@ _NUM_SPECS = {
     "fast": (2, 200, True),
     "slow": (3, 400, True),
     "leadDays": (0, 45, True),
+    "zAlert": (0.5, 10.0, False),
+    "zHot": (0.5, 20.0, False),
+    "rearmZ": (0.0, 10.0, False),
+    "minPct": (0.0, 50.0, False),
+    "gapWindowMin": (1, 240, True),
 }
+
+# The pct-move fields; the numeric ones are also the ``default`` block's.
+PCT_NUM = ("zAlert", "zHot", "rearmZ", "minPct", "gapWindowMin",
+           "thresholdPct", "hotPct", "cooldownMin")
+PCT_KEYS = ("mode",) + PCT_NUM + ("direction",)
 
 # kind -> (required keys, optional keys). Keys outside these two sets are
 # dropped. cooldownMin is accepted on EVERY kind: rule_eval throttles every
 # rule with it, so a per-rule override must be storable for all of them.
 _KIND_KEYS = {
-    "pct-move": ((), ("thresholdPct", "hotPct", "direction", "cooldownMin")),
+    "pct-move": ((), PCT_KEYS),
     "absolute": (("condition", "targetPrice"),
                  ("oneShot", "expiresAt", "cooldownMin")),
     "ema_cross": (("fast", "slow", "direction"), ("cooldownMin",)),
@@ -99,6 +125,12 @@ class RuleError(ValueError):
 
 def _defaults() -> dict:
     return {
+        "mode": "sigma",
+        "zAlert": 2.0,
+        "zHot": 3.0,
+        "rearmZ": 1.0,
+        "minPct": 1.0,
+        "gapWindowMin": 30,
         "thresholdPct": float(os.getenv("ALERT_THRESHOLD_PCT", "3.0")),
         "hotPct": float(os.getenv("ALERT_HOT_THRESHOLD_PCT", "5.0")),
         "direction": "both",
@@ -170,6 +202,8 @@ def _clean_rule(src, ctx: str) -> dict:
         elif key == "direction":
             allowed = CROSS_DIRECTIONS if kind == "ema_cross" else DIRECTIONS
             val = _choice(src, key, allowed, ctx, key in required)
+        elif key == "mode":
+            val = _choice(src, key, MODES, ctx)
         elif key == "condition":
             val = _choice(src, key,
                           LEVEL_CONDITIONS if kind == "absolute"
@@ -201,29 +235,55 @@ def _clean_default(src) -> dict:
     if not isinstance(src, dict):
         raise RuleError("default must be an object")
     out: dict = {}
-    for key in ("thresholdPct", "hotPct", "cooldownMin"):
+    for key in PCT_NUM:
         val = _num(src, key, "default")
         if val is not None:
             out[key] = val
+    mode = _choice(src, "mode", MODES, "default")
+    if mode:
+        out["mode"] = mode
     direction = _choice(src, "direction", DIRECTIONS, "default")
     if direction:
         out["direction"] = direction
     return out
 
 
+def _check_sigma(rule: dict, ctx: str) -> None:
+    """The sigma fields of one MERGED pct-move rule must be coherent."""
+    if rule["zHot"] < rule["zAlert"]:
+        raise RuleError(f"{ctx}: zHot must not be below zAlert")
+    if rule["rearmZ"] >= rule["zAlert"]:
+        raise RuleError(f"{ctx}: rearmZ must be below zAlert")
+
+
 # -------------------------------------------------------------------- merge
 
+def _coerce(key: str, raw):
+    """A stored number inside its field's bounds, else None (the inherited
+    default then applies)."""
+    lo, hi, is_int = _NUM_SPECS[key]
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not lo <= val <= hi:
+        return None
+    return int(round(val)) if is_int else val
+
+
 def _base_rule(block: dict) -> dict:
-    """Env defaults <- the stored default block (the v1 merge)."""
+    """Built-in/env defaults <- the stored default block. A v1/v2 block has
+    no sigma fields, so it reads as v3 with mode ``sigma`` and every new
+    field at its default."""
     rule = _defaults()
     src = block.get("default")
     if isinstance(src, dict):
-        for key in ("thresholdPct", "hotPct", "cooldownMin"):
-            try:
-                if src.get(key) is not None:
-                    rule[key] = float(src[key])
-            except (TypeError, ValueError):
-                pass
+        for key in PCT_NUM:
+            val = _coerce(key, src.get(key))
+            if val is not None:
+                rule[key] = val
+        if src.get("mode") in MODES:
+            rule["mode"] = src["mode"]
         d = src.get("direction")
         if d in DIRECTIONS:
             rule["direction"] = d
@@ -282,6 +342,9 @@ def _effective(src: dict, base: dict) -> dict:
             allowed = CROSS_DIRECTIONS if kind == "ema_cross" else DIRECTIONS
             if raw in allowed:
                 rule["direction"] = raw
+        elif key == "mode":
+            if raw in MODES:
+                rule["mode"] = raw
         elif key == "condition":
             allowed = LEVEL_CONDITIONS if kind == "absolute" else RSI_CONDITIONS
             val = str(raw).upper() if kind == "absolute" else str(raw)
@@ -323,17 +386,29 @@ def pct_move(ticker: str) -> dict | None:
     return None
 
 
+_sigma: dict[str, dict] = {}
+
+
+def set_sigma(snapshot: dict) -> None:
+    """Replace the published per-id volatility (``{id: {sigmaPct, asOf}}``).
+    price_alerts calls this once per pass with every alertable id it could
+    compute."""
+    global _sigma
+    _sigma = {str(k): dict(v) for k, v in snapshot.items()}
+
+
 def load_public() -> dict:
-    """Current rules for the UI, in v2 shape.
+    """Current rules for the UI, in v3 shape, plus ``sigma``.
 
     Entries are returned as STORED (kind-normalised, coerced), not merged
     with the default: the editor POSTs the whole block, so pre-filling every
     field with an inherited value would silently pin defaults the user never
-    chose. The default row carries the inherited values.
+    chose. The default row carries the inherited values. ``sigma`` is
+    read-only context (not part of what the editor POSTs back).
     """
     block = _block()
     out = {"version": BLOCK_VERSION, "default": _base_rule(block),
-           "perTicker": {}}
+           "perTicker": {}, "sigma": {k: dict(v) for k, v in _sigma.items()}}
     pt = block.get("perTicker")
     if isinstance(pt, dict):
         for tick, src in pt.items():
@@ -353,7 +428,8 @@ def load_public() -> dict:
 
 
 def save(block: dict) -> dict:
-    """Validate + persist the alertRules block, preserving other config keys.
+    """Validate + persist the alertRules block (written as v3), preserving
+    other config keys. ``sigma`` in the body is ignored (read-only).
 
     Raises RuleError (endpoint -> 400) on an unknown kind or a bad field.
     """
@@ -374,6 +450,16 @@ def save(block: dict) -> dict:
             clean["perTicker"][tick] = [
                 _clean_rule(e, f"{tick} rule {i + 1}")
                 for i, e in enumerate(entries)]
+
+    # The sigma fields only mean something once merged with the default.
+    base = _base_rule({"default": clean["default"]})
+    _check_sigma(base, "default")
+    for tick, rules in clean["perTicker"].items():
+        for rule in rules:
+            if rule["kind"] == "pct-move":
+                merged = {**base, **{k: v for k, v in rule.items()
+                                     if k != "kind"}}
+                _check_sigma(merged, f"{tick} (pct-move)")
 
     # config_store serialises the read-modify-write under its lock and keeps
     # the last-good copy; other config keys are preserved untouched.

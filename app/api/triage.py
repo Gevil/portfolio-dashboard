@@ -363,18 +363,16 @@ async def run_pass() -> dict:
                         f"source: {row['source']} · relevance "
                         f"{v['relevance']:.2f} · {row['kind']}")
                 title = f"{cand['ticker']}: {row['headline'][:70]}"
-                delivery = await notify.push(
-                    title, body, severity=v["severity"],
+                delivery = await notify.alert(
+                    cand["ticker"], "triage", title, body,
                     priority=SEVERITY_PRIORITY[v["severity"]],
+                    severity=v["severity"],
                     tags="warning" if v["severity"] != "info" else None,
                     actions=actions or None)
                 row["delivered"] = bool(delivery)
                 row["status"] = delivery.status
                 if delivery:
                     pushed += 1
-                    notify.store(cand["ticker"], "triage", title, body,
-                                 priority=SEVERITY_PRIORITY[v["severity"]],
-                                 severity=v["severity"])
                 elif delivery.consumed:
                     # filtered by NOTIFY_MIN_SEVERITY / duplicate: this item
                     # is decided - re-queueing it would burn a turn per pass.

@@ -247,13 +247,14 @@ async def _announce(old: str, new: str, snap: dict) -> "notify.Delivery":
                               tags=LIGHT_TAG[new])
 
 
-async def run_once() -> dict:
+async def run_once(announce: bool = True) -> dict:
     """Compute, announce a status drop, and publish. The snapshot is persisted
     only once the drop alert was accepted (sent, queued in the outbox, or
     deliberately filtered): the drop is detected by comparing against the
     PREVIOUS published snapshot, so publishing first would swallow an
     undelivered alert for good. ``_stats['unpublished']`` tells the loop to
-    retry."""
+    retry. ``announce=False`` publishes without any drop alert (startup
+    migration of a stale / old-schema snapshot)."""
     prev = current() or {}
     snap = await snapshot()
     _stats["last_run"] = time.time()
@@ -263,7 +264,7 @@ async def run_once() -> dict:
     old, new = prev.get("status"), snap["status"]
     log.info("market light: %s score=%s quality=%s (%s)", new, snap["score"],
              snap["data_quality"], "; ".join(snap["reasons"]))
-    if old in RANK and new in RANK and RANK[new] < RANK[old]:
+    if announce and old in RANK and new in RANK and RANK[new] < RANK[old]:
         delivery = await _announce(old, new, snap)
         if not delivery.consumed:
             _stats["unpublished"] = True
@@ -272,6 +273,31 @@ async def run_once() -> dict:
             return snap
     _stats["unpublished"] = not _save(SNAPSHOT_FILE, snap)
     return snap
+
+
+STALE_AFTER_S = 26 * 3600
+
+
+def _needs_refresh(snap: dict | None) -> bool:
+    """Old schema (no ``holdingsTrend``) or older than 26 h."""
+    if not isinstance(snap, dict):
+        return False            # nothing stored: warm_if_missing's job
+    if "holdingsTrend" not in snap:
+        return True
+    ts = snap.get("ts")
+    return not isinstance(ts, (int, float)) or time.time() - ts > STALE_AFTER_S
+
+
+async def refresh_stale_on_start() -> None:
+    """Once at worker start: replace an old-schema or >26 h snapshot with a
+    fresh one WITHOUT a drop alert (a schema change is not a market move)."""
+    if not _needs_refresh(current()):
+        return
+    try:
+        await run_once(announce=False)
+    except Exception:
+        _stats["errors"] += 1
+        log.exception("market_light startup refresh failed")
 
 
 async def warm_if_missing() -> None:
@@ -303,6 +329,7 @@ def _seconds_until_next(hour: int, minute: int) -> float:
 async def _loop() -> None:
     log.info("market_light loop started (daily %02d:%02d local)",
              int(cfg()["hour"]), int(cfg()["minute"]))
+    await refresh_stale_on_start()
     while True:
         conf = cfg()
         await asyncio.sleep(_seconds_until_next(int(conf["hour"]),

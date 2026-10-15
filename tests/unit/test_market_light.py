@@ -146,3 +146,59 @@ def test_a_consumed_delivery_publishes_the_new_snapshot(ml, status, reason):
     ml["delivery"] = notify.Delivery(status, reason)
     asyncio.run(market_light.run_once())
     assert market_light.current()["status"] == "red"
+
+
+# ------------------------------------------------- startup stale snapshot
+
+OLD_SCHEMA = {"status": "green", "ts": None,
+              "dimensions": {"breadth": {"score": 100}}}
+
+
+def test_old_schema_snapshot_is_refreshed_at_start_without_a_drop_alert(ml):
+    import time
+    market_light._save(market_light.SNAPSHOT_FILE,
+                       {**OLD_SCHEMA, "ts": time.time()})
+    ml["closes"]["GSPC"] = FALLING                  # green -> red would alert
+    asyncio.run(market_light.refresh_stale_on_start())
+    cur = market_light.current()
+    assert cur["status"] == "red" and "holdingsTrend" in cur
+    assert "breadth" not in cur["dimensions"]
+    assert ml["alerts"] == []
+
+
+def test_snapshot_older_than_26h_is_refreshed_at_start_without_alert(ml):
+    import time
+    market_light._save(market_light.SNAPSHOT_FILE, {
+        "status": "green", "holdingsTrend": {}, "ts": time.time() - 27 * 3600})
+    ml["closes"]["GSPC"] = FALLING
+    asyncio.run(market_light.refresh_stale_on_start())
+    assert market_light.current()["status"] == "red"
+    assert ml["alerts"] == []
+
+
+def test_fresh_current_schema_snapshot_is_left_alone_at_start(ml):
+    import time
+    market_light._save(market_light.SNAPSHOT_FILE, {
+        "status": "green", "holdingsTrend": {}, "ts": time.time() - 3600})
+    ml["closes"]["GSPC"] = FALLING
+    asyncio.run(market_light.refresh_stale_on_start())
+    assert market_light.current()["status"] == "green"
+
+
+def test_no_snapshot_at_start_is_not_this_hooks_job(ml):
+    asyncio.run(market_light.refresh_stale_on_start())
+    assert market_light.current() is None
+
+
+def test_loop_runs_the_startup_refresh_before_sleeping(ml, monkeypatch):
+    import time
+    market_light._save(market_light.SNAPSHOT_FILE,
+                       {**OLD_SCHEMA, "ts": time.time()})
+
+    async def stop_sleep(_s):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(market_light.asyncio, "sleep", stop_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(market_light._loop())
+    assert "holdingsTrend" in market_light.current()

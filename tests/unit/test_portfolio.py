@@ -68,6 +68,10 @@ def env(monkeypatch):
                         lambda: {"portfolio": state["portfolio"],
                                  **state["config"]})
     monkeypatch.setitem(portfolio._cache, "snap", None)
+    # Older tests use fixed bar dates (2025-01 .. 2027-01) that only fit the
+    # trim window of a clock this early; time-sensitive tests pin their own.
+    monkeypatch.setattr(portfolio.performance, "today",
+                        lambda: datetime.date(2026, 1, 10))
     return state
 
 
@@ -394,6 +398,38 @@ def test_all_range_reads_daily_closes_sized_by_the_oldest_lot(env, monkeypatch):
     assert calls["bars"] == []
     assert ("ASML", "5y") in calls["closes"]       # 944 days old + buffer
     assert calls["rates"] == [954]
+
+
+def test_no_lots_all_is_clamped_to_5y_and_every_series_is_trimmed(env, monkeypatch):
+    today = datetime.date(2026, 10, 14)
+    monkeypatch.setattr(portfolio.performance, "today", lambda: today)
+    periods = []
+    grid = [today - datetime.timedelta(days=7 * i) for i in range(900)][::-1]
+
+    async def daily_closes(ticker, period="2y"):
+        periods.append(period)
+        if ticker == "ASML":          # 'max'-like: ~17 years of history
+            return [(d.isoformat(), 10.0 + i * 0.01) for i, d in enumerate(grid)]
+        if ticker == "GSPC":          # USD benchmark, longer than its FX rates
+            return [(d.isoformat(), 100.0 + i * 0.1) for i, d in enumerate(grid)]
+        return []
+
+    monkeypatch.setattr(portfolio.prices, "daily_closes", daily_closes,
+                        raising=False)
+    fx_start = today - datetime.timedelta(days=4 * 365)
+    env["rates"] = {d.isoformat(): 0.9 for d in grid if d >= fx_start}
+    env["portfolio"] = {"ASML": {"shares": 2.0, "investedAmount": None}}
+    m = asyncio.run(portfolio.model("ALL"))
+    floor = (today - datetime.timedelta(days=5 * 365 + 10)).isoformat()
+    assert m["basis"] != "lots"
+    assert set(periods) == {"5y"}
+    assert min(m["series"]["ASML"]) >= floor       # 17y of history trimmed
+    assert min(m["axis"]) >= floor
+    assert min(m["bench"]["days"]) >= floor        # FX-limited, ~4y
+    h = hist("all")
+    ip, ib = h["indexed"]["portfolio"], h["indexed"]["benchmark"]
+    assert ip and ip[0]["t"] == ib[0]["t"]
+    assert ip[0]["pct"] == 0.0 and ib[0]["pct"] == 0.0
 
 
 def test_every_view_rejects_an_unknown_range(env):

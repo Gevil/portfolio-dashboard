@@ -425,6 +425,66 @@ def test_prev_close_failure_keeps_only_the_same_dates_value(fake_yf, monkeypatch
     assert run(prices._prev_close("ASML", "ASML.AS")) is None
 
 
+# prevClose intraday fallback: the daily series lacks the expected date's row.
+# 2026-10-15 10:00 CEST on XETR -> expected date 2026-10-14 (session ends 17:30 CEST = 15:30 UTC).
+
+def _sxr8_intraday(fake_yf, extra=()):
+    bars = [pt(ts(2026, 10, 14, 15, 0), 750.0), pt(ts(2026, 10, 14, 15, 15), 751.24)]
+    fake_yf.bars[("SXR8.DE", "15m")] = bars + list(extra)
+    fake_yf.daily["SXR8.DE"] = [("2026-10-13", 740.0), ("2026-10-15", 760.0)]   # no 10-14
+
+
+def test_prev_close_falls_back_to_the_last_intraday_bar_of_the_expected_date(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    _sxr8_intraday(fake_yf)
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.24
+    assert prices._prev_close_src["SXR8"] == "intraday"
+    assert prices._prev_close_cache[("SXR8", "2026-10-14")][0] == 751.24
+    q = {"price": 755.0, "asOf": NOW, "fetchedAt": NOW, "currency": "EUR", "prevClose": 751.24}
+    assert prices._quote_view("SXR8", q, True)["prevCloseSource"] == "intraday"
+
+
+def test_prev_close_never_uses_a_bar_dated_after_the_expected_date(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    _sxr8_intraday(fake_yf, extra=[pt(ts(2026, 10, 14, 15, 45), 790.0),   # after the 17:30 close
+                                   pt(ts(2026, 10, 15, 7, 0), 800.0)])   # next day
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.24
+    fake_yf.bars[("SXR8.DE", "15m")] = [pt(ts(2026, 10, 15, 7, 0), 800.0),
+                                       pt(ts(2026, 10, 13, 15, 15), 741.0)]
+    prices._prev_close_cache.clear()
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) is None
+    assert "SXR8" not in prices._prev_close_src
+
+
+def test_prev_close_prefers_the_stored_history_over_a_fetch(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    fake_yf.daily["SXR8.DE"] = [("2026-10-13", 740.0)]
+    prices.history_store["SXR8"] = [pt(ts(2026, 10, 14, 15, 29), 751.0),
+                                    pt(ts(2026, 10, 14, 15, 30), 751.24),
+                                    pt(ts(2026, 10, 15, 7, 1), 770.0)]
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.24
+    assert prices._prev_close_src["SXR8"] == "intraday"
+    assert not [c for c in fake_yf.calls if c[0] == "_yf_bars_blocking"]
+
+
+def test_prev_close_daily_row_wins_and_is_reported_as_daily(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    _sxr8_intraday(fake_yf)
+    fake_yf.daily["SXR8.DE"] = [("2026-10-14", 751.0)]
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.0
+    assert prices._prev_close_src["SXR8"] == "daily"
+    q = {"price": 755.0, "asOf": NOW, "fetchedAt": NOW, "currency": "EUR", "prevClose": 751.0}
+    assert prices._quote_view("SXR8", q, True)["prevCloseSource"] == "daily"
+
+
+def test_prev_close_none_when_daily_and_intraday_are_both_missing(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    fake_yf.daily["SXR8.DE"] = [("2026-10-13", 740.0)]
+    fake_yf.bars[("SXR8.DE", "15m")] = []
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) is None
+    assert "SXR8" not in prices._prev_close_src
+
+
 # ---------------------------------------------------------------- daily_closes (C2)
 
 def test_daily_closes_returns_the_listing_series_and_caches_per_ticker_and_period(fake_yf, monkeypatch):

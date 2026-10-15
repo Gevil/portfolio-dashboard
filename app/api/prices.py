@@ -123,6 +123,7 @@ _valuation_tasks: set = set()
 _quotes: dict[str, dict] = {}                 # id -> latest listing quote
 _quote_inflight: dict[str, asyncio.Task] = {}
 _prev_close_cache: dict[tuple[str, str], tuple] = {}  # (id, expected prev date) -> (value|None, ts)
+_prev_close_src: dict[str, str] = {}  # id -> 'daily'|'intraday': where its cached prevClose came from
 _daily_closes_cache: dict[tuple[str, str], tuple] = {}  # (id, period) -> (rows, ts)
 _empty_1d_logged: set[tuple[str, str]] = set()
 _seed_last: dict[str, float] = {}
@@ -752,15 +753,57 @@ def _exact_row(rows: list, day: str) -> float | None:
     return None
 
 
+def _last_bar_close(mic: str, day: datetime.date, bars) -> float | None:
+    """Close of the last bar dated ``day`` in the venue tz and not after the
+    session close; bars of other dates never count."""
+    bounds = calendars.session_bounds(mic, day)
+    if not bounds:
+        return None
+    close = bounds[1]
+    limit, tz = close.timestamp(), close.tzinfo
+    best = None
+    for b in bars or ():
+        t, c = b.get("t"), _finite(b.get("c"))
+        if not isinstance(t, (int, float)) or c is None or c <= 0 or t > limit:
+            continue
+        if datetime.datetime.fromtimestamp(t, tz).date() != day:
+            continue
+        if best is None or t > best[0]:
+            best = (t, c)
+    return best[1] if best else None
+
+
+async def _prev_close_intraday(ticker: str, sym: str, mic: str, expected: str,
+                               key: tuple) -> float | None:
+    """(b)/(c) of the prevClose chain: no daily row for ``expected``."""
+    day = datetime.date.fromisoformat(expected)
+    val = _last_bar_close(mic, day, history_store.get(ticker))
+    if val is None:
+        bars = await _yf(sym, _yf_bars_blocking, sym, "15m", "5d")
+        if bars is None:
+            ent = _prev_close_cache.get(key)
+            return ent[0] if ent else None   # failure/backoff: nothing cached
+        val = _last_bar_close(mic, day, bars)
+    if val is not None:
+        _prev_close_cache[key] = (val, time.time())
+        _prev_close_src[ticker] = "intraday"
+    else:
+        _prev_close_src.pop(ticker, None)
+    return val
+
+
 async def _prev_close(ticker: str, sym: str) -> float | None:
     """Close of the session before the one a quote belongs to NOW (F0).
 
     The expected date is ``previous_session(quote_session(now))`` from the clock
     and the venue calendar - never derived from the newest bar, which lags
     (09:00-09:15 the 1d fetch is empty and the 15m fallback ends yesterday).
-    Only that exact date's row counts (5d, then one retry with 1mo); a missing
-    row is None. The cache is keyed by (id, expected date), so a value is never
-    served for another date; a None is remembered for 300 s only.
+    Only that exact date counts. Chain: the daily row (5d, then one retry with
+    1mo); else the close of the LAST bar dated that day (venue-local, at or
+    before the session close) from the stored listing history, then from a
+    5d/15m fetch; else None. The source lands in ``_prev_close_src``. The
+    cache is keyed by (id, expected date), so a value is never served for
+    another date; a None is remembered for 300 s only.
     """
     now = time.time()
     mic = calendars.mic_for(ticker)
@@ -782,7 +825,10 @@ async def _prev_close(ticker: str, sym: str) -> float | None:
             break
     _prev_close_cache[key] = (val, time.time())
     _prune_cache(_prev_close_cache)
-    return val
+    if val is not None:
+        _prev_close_src[ticker] = "daily"
+        return val
+    return await _prev_close_intraday(ticker, sym, mic, expected, key)
 
 
 async def daily_closes(ticker: str, period: str = "2y") -> list[tuple[str, float]]:
@@ -884,6 +930,7 @@ def _quote_view(ticker: str, q: dict, refreshed_ok: bool) -> dict:
         "id": ticker,
         "price": price,
         "prevClose": prev,
+        "prevCloseSource": _prev_close_src.get(ticker) if prev is not None else None,
         "change": change,
         "changePct": pct,
         "currency": q["currency"],
@@ -1506,7 +1553,7 @@ def _reset_state():
     _load_failed = False
     for d in (_store_version, _history_cache, _quotes, _prev_close_cache, _seed_last,
               _backoff, _consecutive_429, _negative_cache, _valuation_cache,
-              _daily_closes_cache):
+              _daily_closes_cache, _prev_close_src):
         d.clear()
     _empty_1d_logged.clear()
     for w in (_history_writer, _valuation_writer):

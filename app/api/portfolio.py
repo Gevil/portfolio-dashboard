@@ -415,6 +415,13 @@ async def model(range_key: str = "3M") -> dict:
     else:
         days = performance.ALL_FALLBACK_DAYS + 10
     period = performance.period_for(days)
+    if rng == "ALL" and not first_lot:
+        period = "5y"                      # exactly 5 years, never 'max'
+    # Lots-based ALL starts at the first lot (no trim); every other window is
+    # cut to the same calendar floor so holdings and benchmarks agree.
+    cutoff = (None if rng == "ALL" and first_lot
+              else (performance.today()
+                    - datetime.timedelta(days=days)).isoformat())
 
     ids = list(dict.fromkeys([e["id"] for e in entries]
                              + [i for i in (bench_id, perf_id) if i]))
@@ -427,9 +434,12 @@ async def model(range_key: str = "3M") -> dict:
 
     def closes(pid: str) -> dict[str, float]:
         e = by_id.get(pid)
-        return (performance.to_days(rows_by_id.get(pid),
-                                    performance.factor_for(e, rates))
-                if e else {})
+        if not e:
+            return {}
+        pts = performance.to_days(rows_by_id.get(pid),
+                                  performance.factor_for(e, rates))
+        return ({d: c for d, c in pts.items() if d >= cutoff}
+                if cutoff else pts)
 
     included, series, missing = [], {}, []
     for e in entries:

@@ -8,6 +8,9 @@ live in tmp_path. No network, no sleeps (retry_delay_s is 0).
 import asyncio
 import datetime
 import json
+import sys
+import time
+import types
 
 import pytest
 
@@ -140,12 +143,25 @@ class Harness:
         monkeypatch.setattr(digest, "_price_context", self.price_context)
         monkeypatch.setattr(digest.notify, "push", self.push)
         monkeypatch.setattr(digest.notify, "store", lambda *a, **k: self.stores.append(a))
+        self.modes, self.can_start_calls, self.can_start_ok = [], [], True
+        monkeypatch.setattr(digest.lane_client, "can_start", self.can_start)
+        monkeypatch.setattr(digest, "deep_turns", lambda: 7)
+        monkeypatch.setattr(digest.config_store, "read", lambda: {})
+        monkeypatch.setattr(digest.macro, "EARNINGS_CACHE", tmp_path / "earnings.json")
+        monkeypatch.setattr(digest.filings, "recent", lambda sym, *a, **k: [])
+        monkeypatch.setattr(digest.edgar, "recent", lambda sym=None: [])
+        monkeypatch.setattr(digest.triage, "recent", lambda limit=50: [])
 
     async def gate(self):
         self.gate_calls += 1
         return self.gate_result
 
-    async def run_one(self, ticker, c):
+    def can_start(self, purpose, turns=1):
+        self.can_start_calls.append((purpose, turns))
+        return self.can_start_ok
+
+    async def run_one(self, ticker, c, mode="quick"):
+        self.modes.append(mode)
         self.attempts[ticker] = self.attempts.get(ticker, 0) + 1
         step = self.script[ticker].pop(0)
         if step != "ok":                                # anything else = failure reason
@@ -521,3 +537,273 @@ def test_final_unreachable_push_is_an_ops_warning(h, monkeypatch):
     asyncio.run(digest._run_with_gate_retries("scheduled", ["ASML"]))
     kw = h.pushes[-1][2]
     assert kw["priority"] == 3 and kw["tags"] == "warning" and kw["source"] == "ops"
+
+
+# ------------------------------------------ event-driven deep runs, tax tag
+
+REAL_RUN_ONE = digest.run_one
+
+
+def _today():
+    return datetime.date.today()
+
+
+def seed(tmp_path, age_s=3 * 3600, **extra):
+    """A previous digest run of ASML: published BUY 70, last run ``age_s`` ago."""
+    row = {"rating": "BUY", "action": "buy", "scale_tier": "buy", "score": 70,
+           "ts": time.time() - age_s, "date": "2026-01-01"}
+    row.update(extra)
+    (tmp_path / "advice_state.json").write_text(json.dumps({"ASML": row}))
+
+
+def earnings_on(tmp_path, day):
+    (tmp_path / "earnings.json").write_text(json.dumps(
+        {"ASML": {"symbol": "ASML", "date": day.isoformat()}, "_fetched": time.time()}))
+
+
+def scheduled(h, ticker="ASML"):
+    h.script = {ticker: ["ok"]}
+    return asyncio.run(digest.run_batch([ticker], event_driven=True))
+
+
+def log_rows(tmp_path):
+    return json.loads((tmp_path / "advice_log.json").read_text())
+
+
+@pytest.mark.parametrize("offset", [0, -1])
+def test_earnings_today_or_yesterday_runs_deep_and_records_the_trigger(h, tmp_path, offset):
+    seed(tmp_path)
+    earnings_on(tmp_path, _today() + datetime.timedelta(days=offset))
+    res = scheduled(h)
+    o = res["outcomes"]["ASML"]
+    assert h.modes == ["deep"] and o["mode"] == "deep" and o["trigger"] == "earnings"
+    row = state(tmp_path)["ASML"]
+    assert row["mode"] == "deep" and row["trigger"] == "earnings"
+    assert row["deepDate"] == _today().isoformat()
+    assert log_rows(tmp_path)[-1]["trigger"] == "earnings"
+    assert log_rows(tmp_path)[-1]["mode"] == "deep"
+    assert ("digest", 7) in h.can_start_calls            # charged to the digest purpose
+    assert "event: earnings -> deep run" in "\n".join(digest._ticker_lines(o))
+
+
+@pytest.mark.parametrize("offset", [1, -2])
+def test_earnings_on_other_days_stay_quick(h, tmp_path, offset):
+    seed(tmp_path)
+    earnings_on(tmp_path, _today() + datetime.timedelta(days=offset))
+    o = scheduled(h)["outcomes"]["ASML"]
+    assert h.modes == ["quick"] and o["trigger"] is None
+    assert state(tmp_path)["ASML"]["trigger"] is None
+    assert "event:" not in "\n".join(digest._ticker_lines(o))
+
+
+def test_yesterdays_earnings_survive_the_cache_dropping_them(h, tmp_path):
+    seed(tmp_path, earningsDate=(_today() - datetime.timedelta(days=1)).isoformat())
+    o = scheduled(h)["outcomes"]["ASML"]                 # earnings cache has no ASML row
+    assert o["trigger"] == "earnings" and h.modes == ["deep"]
+
+
+@pytest.mark.parametrize("source,form", [("filings", "8-K"), ("filings", "6-K"),
+                                         ("edgar", "8-K"), ("filings", "8-K/A")])
+def test_a_new_8k_or_6k_runs_deep(h, tmp_path, monkeypatch, source, form):
+    seed(tmp_path, age_s=3 * 86400)
+    rows = [{"form": form, "filed": _today().isoformat(), "ticker": "ASML"}]
+    monkeypatch.setattr(getattr(digest, source), "recent", lambda sym=None, *a, **k: rows)
+    o = scheduled(h)["outcomes"]["ASML"]
+    assert h.modes == ["deep"] and o["trigger"] == "filing"
+    assert state(tmp_path)["ASML"]["filingMark"] == _today().isoformat()
+
+
+def test_other_forms_and_old_or_already_seen_filings_do_not_trigger(h, tmp_path, monkeypatch):
+    today = _today().isoformat()
+    old = (_today() - datetime.timedelta(days=5)).isoformat()
+    seed(tmp_path, age_s=3 * 86400)
+    rows = [{"form": "10-Q", "filed": today, "ticker": "ASML"},
+            {"form": "8-K", "filed": old, "ticker": "ASML"}]
+    monkeypatch.setattr(digest.filings, "recent", lambda sym, *a, **k: rows)
+    assert scheduled(h)["outcomes"]["ASML"]["trigger"] is None
+    # an 8-K filed today that the previous run already accounted for (filingMark)
+    seed(tmp_path, age_s=3 * 86400, filingMark=today)
+    rows.append({"form": "8-K", "filed": today, "ticker": "ASML"})
+    assert scheduled(h)["outcomes"]["ASML"]["trigger"] is None
+    assert h.modes == ["quick", "quick"]
+
+
+def test_filing_and_triage_need_a_previous_run_to_be_new(h, tmp_path, monkeypatch):
+    monkeypatch.setattr(digest.filings, "recent", lambda sym, *a, **k: [
+        {"form": "8-K", "filed": _today().isoformat(), "ticker": "ASML"}])
+    monkeypatch.setattr(digest.triage, "recent", lambda limit=50: [
+        {"ticker": "ASML", "relevance": 0.99, "ts": time.time()}])
+    assert scheduled(h)["outcomes"]["ASML"]["trigger"] is None      # first ever run
+
+
+def test_a_high_relevance_triage_verdict_since_the_last_run_runs_deep(h, tmp_path, monkeypatch):
+    seed(tmp_path)
+    now = time.time()
+    monkeypatch.setattr(digest.triage, "recent", lambda limit=50: [
+        {"ticker": "ASML", "relevance": 0.85, "ts": now - 60},
+        {"ticker": "ASML", "relevance": 0.84, "ts": now - 30}])
+    o = scheduled(h)["outcomes"]["ASML"]
+    assert h.modes == ["deep"] and o["trigger"] == "triage"
+
+
+@pytest.mark.parametrize("ticker,relevance,age_s", [
+    ("ASML", 0.84, 60),                  # below 0.85
+    ("NVDA", 0.99, 60),                  # another ticker
+    ("ASML", 0.99, 4 * 3600),            # older than the last run (3 h ago)
+])
+def test_triage_rows_that_do_not_qualify_stay_quick(h, tmp_path, monkeypatch,
+                                                    ticker, relevance, age_s):
+    seed(tmp_path)                                           # last run 3 h ago
+    row = {"ticker": ticker, "relevance": relevance, "ts": time.time() - age_s}
+    monkeypatch.setattr(digest.triage, "recent", lambda limit=50: [row])
+    assert scheduled(h)["outcomes"]["ASML"]["trigger"] is None
+    assert h.modes == ["quick"]
+
+
+def test_manual_and_resumed_batches_never_go_deep(h, tmp_path):
+    seed(tmp_path)
+    earnings_on(tmp_path, _today())
+    h.script = {"ASML": ["ok"]}
+    o = asyncio.run(digest.run_batch(["ASML"]))["outcomes"]["ASML"]
+    assert h.modes == ["quick"] and o["trigger"] is None
+
+
+def test_at_most_one_deep_run_per_ticker_per_local_day(h, tmp_path):
+    earnings_on(tmp_path, _today())
+    first = scheduled(h)["outcomes"]["ASML"]
+    second = scheduled(h)["outcomes"]["ASML"]                # the 16:00 slot
+    assert h.modes == ["deep", "quick"]
+    assert first["mode"] == "deep"
+    assert second["mode"] == "quick" and second["trigger"] == "earnings"
+    assert second["deep_skipped"] == "daily cap"
+    assert state(tmp_path)["ASML"]["deepDate"] == _today().isoformat()   # carried
+    assert "deep skipped: daily cap" in "\n".join(digest._ticker_lines(second))
+
+
+def test_a_deep_run_from_yesterday_does_not_block_today(h, tmp_path):
+    seed(tmp_path, deepDate=(_today() - datetime.timedelta(days=1)).isoformat())
+    earnings_on(tmp_path, _today())
+    scheduled(h)
+    assert h.modes == ["deep"]
+
+
+def test_budget_without_room_for_a_deep_run_falls_back_to_quick(h, tmp_path):
+    seed(tmp_path)
+    earnings_on(tmp_path, _today())
+    h.can_start_ok = False
+    o = scheduled(h)["outcomes"]["ASML"]
+    assert ("digest", 7) in h.can_start_calls                # JOB_TURNS['deep'] was checked
+    assert h.modes == ["quick"] and o["mode"] == "quick"
+    assert o["trigger"] == "earnings" and o["deep_skipped"] == "budget"
+    assert state(tmp_path)["ASML"]["deepDate"] is None       # a quick run is no deep run
+    assert "quick run, deep skipped: budget" in "\n".join(digest._ticker_lines(o))
+
+
+def test_run_one_enqueues_the_deep_mode_for_the_digest_source(monkeypatch):
+    calls, spent = [], []
+    monkeypatch.setattr(digest, "run_one", REAL_RUN_ONE)
+    monkeypatch.setattr(digest, "deep_turns", lambda: 7)
+    monkeypatch.setattr(digest.lane_client, "can_start",
+                        lambda p, t=1: spent.append((p, t)) or True)
+    monkeypatch.setattr(digest.jobs, "enqueue", lambda t, m, source: (
+        calls.append((t, m, source)) or {"job_id": "j1", "deduped": False, "mode": m}))
+    monkeypatch.setattr(digest.jobs, "get", lambda jid: {"status": "done", "id": jid})
+    job, why = asyncio.run(digest.run_one("ASML", digest.DEFAULTS, "deep"))
+    assert why == "" and job["id"] == "j1"
+    assert calls == [("ASML", "deep", "digest")] and spent == [("digest", 7)]
+    spent.clear()
+    asyncio.run(digest.run_one("ASML", digest.DEFAULTS))
+    assert calls[-1][1] == "quick" and spent == [("digest", 1)]
+
+
+def test_run_one_reports_a_spent_budget_for_deep(monkeypatch):
+    monkeypatch.setattr(digest, "run_one", REAL_RUN_ONE)
+    monkeypatch.setattr(digest, "deep_turns", lambda: 7)
+    monkeypatch.setattr(digest.lane_client, "can_start", lambda p, t=1: False)
+    job, why = asyncio.run(digest.run_one("ASML", digest.DEFAULTS, "deep"))
+    assert job is None and why.startswith("budget")
+
+
+# --- tax tag
+
+SELL_NOW = {"rating": "SELL", "action": "sell", "scale_tier": "sell", "score": 10}
+
+
+def tax_world(monkeypatch, residency="CZ", status=None):
+    calls = []
+    monkeypatch.setattr(digest.config_store, "read", lambda: {"taxResidency": residency})
+
+    async def fake(ident):
+        calls.append(ident)
+        return status
+    monkeypatch.setattr(digest, "_tax_status", fake)
+    return calls
+
+
+TAXABLE = {"taxable": True, "youngestLotDate": "2025-04-01", "unlockDate": "2028-04-02",
+           "exemptShares": 0.0, "taxableShares": 1.0, "residency": "CZ", "lotsKnown": True}
+
+
+def test_tax_tag_on_a_confirmed_move_into_sell_for_a_cz_resident(h, tmp_path, monkeypatch):
+    calls = tax_world(monkeypatch, status=TAXABLE)
+    seed(tmp_path)
+    h.answer["ASML"] = SELL_NOW
+    h.script = {"ASML": ["ok"]}
+    res = asyncio.run(digest.run_batch(["ASML"]))
+    o = res["outcomes"]["ASML"]
+    tag = "taxable: lots < 3y (unlock 2028-04-02)"
+    assert o["state"] == "confirmed" and o["taxTag"] == tag and calls == ["ASML"]
+    assert tag in h.pushes[0][1]
+    assert state(tmp_path)["ASML"]["taxTag"] == tag
+    assert log_rows(tmp_path)[-1]["taxTag"] == tag
+
+
+@pytest.mark.parametrize("name,residency,status,prior,answer", [
+    ("residency not CZ", None, TAXABLE, {}, SELL_NOW),
+    ("other residency", "DE", TAXABLE, {}, SELL_NOW),
+    ("taxable False", "CZ", {**TAXABLE, "taxable": False}, {}, SELL_NOW),
+    ("taxable unknown", "CZ", {**TAXABLE, "taxable": None}, {}, SELL_NOW),
+    ("no status at all", "CZ", None, {}, SELL_NOW),
+    ("pending, not confirmed", "CZ", TAXABLE, {},
+     {"rating": "SELL", "action": "reduce", "scale_tier": "reduce", "score": 38}),
+    ("not a sell-family action", "CZ", TAXABLE, {},
+     {"rating": "HOLD", "action": "hold", "scale_tier": "watch", "score": 45}),
+    ("already in the sell family", "CZ", TAXABLE,
+     {"rating": "SELL", "action": "reduce", "scale_tier": "reduce", "score": 30}, SELL_NOW),
+    ("first sight", "CZ", TAXABLE, None, SELL_NOW),
+])
+def test_tax_tag_only_for_confirmed_change_into_sell_family_cz_taxable(
+        h, tmp_path, monkeypatch, name, residency, status, prior, answer):
+    tax_world(monkeypatch, residency=residency, status=status)
+    if prior is not None:
+        seed(tmp_path, **prior)
+    o = go(h, **answer)["outcomes"]["ASML"]
+    assert o["taxTag"] is None, name
+    assert state(tmp_path)["ASML"]["taxTag"] is None
+    assert "taxable:" not in "\n".join(digest._ticker_lines(o))
+
+
+def test_tax_status_is_not_even_asked_without_cz_residency(h, tmp_path, monkeypatch):
+    calls = tax_world(monkeypatch, residency=None, status=TAXABLE)
+    seed(tmp_path)
+    go(h, **SELL_NOW)
+    assert calls == []
+
+
+def test_tax_status_import_is_lazy_and_guarded(monkeypatch):
+    monkeypatch.setitem(sys.modules, "app.api.tax", None)            # module missing
+    assert asyncio.run(digest._tax_status("ASML")) is None
+    seen = []
+
+    def sell_tax_status(ident, shares=None):
+        seen.append(ident)
+        return {"taxable": True, "unlockDate": "2028-04-02"}
+    monkeypatch.setitem(sys.modules, "app.api.tax",
+                        types.SimpleNamespace(sell_tax_status=sell_tax_status))
+    assert asyncio.run(digest._tax_status("ASML"))["taxable"] is True and seen == ["ASML"]
+
+    def boom(ident, shares=None):
+        raise ValueError("bad lots")
+    monkeypatch.setitem(sys.modules, "app.api.tax",
+                        types.SimpleNamespace(sell_tax_status=boom))
+    assert asyncio.run(digest._tax_status("ASML")) is None

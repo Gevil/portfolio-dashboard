@@ -55,9 +55,29 @@ recorded ``deferred: no session today``. A batch interrupted by a restart is
 re-run for the tickers that did not finish (``_resume``). Enabled only when
 ``DIGEST_ENABLED=1``. Container-local time is used for the schedule: run with
 ``TZ=Europe/Prague``.
+
+Event-driven deep runs: at a scheduled slot (``run_batch(event_driven=True)``)
+a held ticker runs mode ``deep`` instead of ``quick`` when, since its last
+digest run (the state row ``ts``), (a) its earnings date is today or was
+yesterday (macro's cache, never a network scan), (b) a new 8-K / 6-K appears
+in ``filings.recent`` / ``edgar.recent`` (newer than the state row's
+``filingMark``), or (c) ``triage.recent`` holds a verdict with relevance >=
+``DEEP_TRIAGE_RELEVANCE`` for it. At most one deep run per ticker per local
+day (state ``deepDate``); it is charged as purpose ``digest`` and falls back to
+quick when ``lane_client.can_start('digest', ta_pipeline.JOB_TURNS['deep'])``
+is False. The fired trigger (``earnings`` | ``filing`` | ``triage`` | None) is
+recorded on the outcome, the state row, the advice-log row and the push line.
+``ta_pipeline._playbook_for`` picks ``deep_earnings`` itself for a deep run
+with an earnings date 0..10 days ahead; the digest passes only mode + source.
+
+Tax tag: a CONFIRMED move INTO the sell family of a ticker whose
+``tax.sell_tax_status`` is ``taxable is True`` (config ``taxResidency`` ==
+``CZ``) adds ``taxTag`` to the state/advice rows and a line to the push.
 """
 import asyncio
 import datetime
+import importlib
+import inspect
 import logging
 import math
 import os
@@ -65,9 +85,9 @@ import pathlib
 import re
 import time
 
-from app.api import (calendars, config_store, jobs, jsonstore, lane_client,
-                     notify, portfolio, prices, registry, reports, runlog,
-                     textsafe)
+from app.api import (calendars, config_store, edgar, filings, jobs, jsonstore,
+                     lane_client, macro, notify, portfolio, prices, registry,
+                     reports, runlog, textsafe, triage)
 
 log = logging.getLogger("digest")
 
@@ -108,6 +128,9 @@ SELL_FAMILY = ("sell", "reduce", "trim", "avoid")
 P20_MIN, P20_MAX = 0.01, 0.99
 # notify.store rows of an unpushed batch: only these states are worth a row.
 STORE_STATES = ("confirmed", "first", "pending", "draft")
+# Event-driven deep runs (see the module docstring).
+DEEP_FORMS = ("8-K", "6-K")
+DEEP_TRIAGE_RELEVANCE = 0.85
 
 _task: asyncio.Task | None = None
 _resume_task: asyncio.Task | None = None
@@ -438,6 +461,160 @@ def change_priority(o: dict) -> int:
 
 
 # --------------------------------------------------------------------------
+# event-driven deep runs and the tax tag
+# --------------------------------------------------------------------------
+
+def _iso_day(value) -> datetime.date | None:
+    try:
+        return datetime.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _cached_earnings_date(ticker: str) -> str | None:
+    """The ticker's date in macro's earnings cache (ISO), no network."""
+    cache = jsonstore.load(macro.EARNINGS_CACHE, {})
+    row = cache.get(ticker.upper()) if isinstance(cache, dict) else None
+    day = _iso_day(row.get("date")) if isinstance(row, dict) else None
+    return day.isoformat() if day else None
+
+
+def _filing_dates(ticker: str) -> list[str]:
+    """ISO dates of the ticker's known 8-K / 6-K filings (any source)."""
+    out: list[str] = []
+    for source in (filings.recent, edgar.recent):
+        try:
+            rows = source(ticker)
+        except Exception as e:
+            log.warning("%s: filing lookup failed: %s", ticker, e)
+            continue
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            form = str(row.get("form") or "").upper().split("/")[0]
+            day = _iso_day(row.get("filed") or row.get("date"))
+            if form in DEEP_FORMS and day:
+                out.append(day.isoformat())
+    return out
+
+
+def _triage_hit(ticker: str, since: float) -> bool:
+    try:
+        rows = triage.recent(triage.LOG_RING)
+    except Exception as e:
+        log.warning("%s: triage log lookup failed: %s", ticker, e)
+        return False
+    sym = ticker.upper()
+    for row in rows:
+        rel, ts = _num(row.get("relevance")), _num(row.get("ts"))
+        if (str(row.get("ticker") or "").upper() == sym and rel is not None
+                and rel >= DEEP_TRIAGE_RELEVANCE and ts is not None
+                and ts > since):
+            return True
+    return False
+
+
+def deep_trigger(ticker: str, prev_row: dict | None, now: float) -> dict:
+    """Which event, if any, calls for a deep run of ``ticker``.
+
+    -> ``{trigger, filing_mark, earnings_date}``: ``trigger`` is earnings |
+    filing | triage | None (checked in that order); ``filing_mark`` (newest
+    8-K/6-K date known now) and ``earnings_date`` are stored on the state row
+    so the next run compares against them. Filing and triage events need a
+    previous run to be "new since"; earnings is date-based."""
+    prev = prev_row if isinstance(prev_row, dict) else {}
+    today = datetime.date.fromtimestamp(now)
+    near = {today.isoformat(), (today - datetime.timedelta(days=1)).isoformat()}
+    since = _num(prev.get("ts")) if prev else None
+    cached = _cached_earnings_date(ticker)
+    known_earnings = {d for d in (cached, prev.get("earningsDate")) if d}
+    dates = _filing_dates(ticker)
+    mark = max(dates) if dates else None
+    trigger = None
+    if known_earnings & near:
+        trigger = "earnings"
+    elif since is not None and mark is not None:
+        floor = (_iso_day(prev.get("filingMark"))
+                 or datetime.date.fromtimestamp(since))
+        if any(d > floor.isoformat() for d in dates):
+            trigger = "filing"
+    if trigger is None and since is not None and _triage_hit(ticker, since):
+        trigger = "triage"
+    return {"trigger": trigger, "filing_mark": mark,
+            "earnings_date": cached or prev.get("earningsDate")}
+
+
+def deep_turns() -> int | None:
+    """Turns one deep job holds (``ta_pipeline.JOB_TURNS``); None when the
+    pipeline cannot be imported."""
+    try:
+        return int(importlib.import_module("app.api.ta_pipeline").JOB_TURNS["deep"])
+    except Exception as e:
+        log.warning("deep turns unavailable: %s", e)
+        return None
+
+
+def plan_run(ticker: str, prev_row: dict | None, now: float) -> dict:
+    """-> ``{mode, trigger, deep_skipped, filing_mark, earnings_date}`` for one
+    scheduled run. ``mode`` is ``deep`` only when a trigger fired, no deep run
+    of the ticker happened today and the digest budget has room for it;
+    otherwise quick, with ``deep_skipped`` = ``daily cap`` | ``budget``."""
+    plan = {"mode": "quick", "trigger": None, "deep_skipped": "",
+            "filing_mark": None, "earnings_date": None}
+    try:
+        plan.update(deep_trigger(ticker, prev_row, now))
+    except Exception:
+        log.exception("%s: deep trigger check failed", ticker)
+        return plan
+    if plan["trigger"] is None:
+        return plan
+    today = datetime.date.fromtimestamp(now).isoformat()
+    if isinstance(prev_row, dict) and prev_row.get("deepDate") == today:
+        plan["deep_skipped"] = "daily cap"
+        return plan
+    turns = deep_turns()
+    if turns is None or not lane_client.can_start("digest", turns):
+        plan["deep_skipped"] = "budget"
+        return plan
+    plan["mode"] = "deep"
+    return plan
+
+
+async def _tax_status(ident: str) -> dict | None:
+    """``tax.sell_tax_status(ident)``, imported lazily; None when the module
+    is missing or the call fails."""
+    try:
+        tax = importlib.import_module("app.api.tax")
+        res = tax.sell_tax_status(ident)
+        if inspect.isawaitable(res):
+            res = await res
+    except ImportError:
+        return None
+    except Exception as e:
+        log.warning("%s: tax status failed: %s", ident, e)
+        return None
+    return res if isinstance(res, dict) else None
+
+
+async def _tax_tag(ticker: str, cur: dict, r: dict) -> str | None:
+    """The push/state tag for a CONFIRMED move into the sell family of a
+    Czech tax resident's still-taxable lots, else None."""
+    if r.get("state") != "confirmed" or not _sells(cur.get("action"),
+                                                    cur.get("rating")):
+        return None
+    prev = r.get("prev") or {}
+    if _sells(prev.get("action"), prev.get("rating")):
+        return None
+    if config_store.read().get("taxResidency") != "CZ":
+        return None
+    st = await _tax_status(ticker)
+    if not st or st.get("taxable") is not True:
+        return None
+    unlock = textsafe.clean_text(st.get("unlockDate") or "", 10)
+    return "taxable: lots < 3y" + (f" (unlock {unlock})" if unlock else "")
+
+
+# --------------------------------------------------------------------------
 # push formatting
 # --------------------------------------------------------------------------
 
@@ -475,6 +652,10 @@ def _ticker_lines(o: dict) -> list[str]:
     if o.get("draft"):
         verdict.append("DRAFT")
     lines.append("  " + " \u00b7 ".join(verdict))
+    if o.get("trigger"):
+        how = ("deep run" if o.get("mode") == "deep"
+               else f"quick run, deep skipped: {o.get('deep_skipped') or 'n/a'}")
+        lines.append(f"  event: {o['trigger']} -> {how}")
     if o.get("p20") is not None:
         odds = f"  p(outperform 20d) {o['p20']:.0%}"
         if _num(o.get("expExcess20Pct")) is not None:
@@ -495,6 +676,8 @@ def _ticker_lines(o: dict) -> list[str]:
         lines.append(f"  {parts}")
     elif ch:
         lines.append("  changed: " + parts)
+    if o.get("taxTag"):
+        lines.append("  " + o["taxTag"])
     gaps = list(o.get("missing") or []) or list(o.get("gaps") or [])
     if gaps:
         lines.append(f"  gaps: {', '.join(gaps[:4])}"
@@ -617,6 +800,8 @@ def _advice_row(o: dict, now: float) -> dict:
         "p20": o.get("p20"), "expExcess20Pct": o.get("expExcess20Pct"),
         "benchmark": o.get("benchmark"), "draft": bool(o.get("draft")),
         "confirmed": bool(o.get("confirmed")), "state": o.get("state"),
+        "mode": o.get("mode") or "quick", "trigger": o.get("trigger"),
+        "taxTag": o.get("taxTag"),
     }
 
 
@@ -629,6 +814,8 @@ def _commit(outcomes: list[dict], now: float) -> None:
     rows = rows if isinstance(rows, list) else []
     date = datetime.date.fromtimestamp(now).isoformat()
     for o in outcomes:
+        prior = state.get(o["ticker"])
+        prior = prior if isinstance(prior, dict) else {}
         if o["status"] != "ok":
             continue
         if o.get("publish"):
@@ -649,6 +836,11 @@ def _commit(outcomes: list[dict], now: float) -> None:
             "draft": bool(o.get("draft")), "state": o.get("state"),
             "p20": o.get("p20"), "expExcess20Pct": o.get("expExcess20Pct"),
             "benchmark": o.get("benchmark"),
+            "mode": o.get("mode") or "quick", "trigger": o.get("trigger"),
+            "taxTag": o.get("taxTag"),
+            "deepDate": date if o.get("mode") == "deep" else prior.get("deepDate"),
+            "filingMark": o.get("filing_mark") or prior.get("filingMark"),
+            "earningsDate": o.get("earnings_date") or prior.get("earningsDate"),
         }
         rows.append(_advice_row(o, now))
     if not jsonstore.save(STATE_FILE, state, indent=2):
@@ -676,12 +868,13 @@ async def lane_gate() -> tuple[bool, str]:
     return True, ""
 
 
-async def run_one(ticker: str, c: dict) -> tuple[dict | None, str]:
-    """Enqueue one quick run and poll the in-process queue until it settles.
-    -> (job, "") on success, (None, reason) otherwise."""
-    if not lane_client.can_start("digest", 1):
+async def run_one(ticker: str, c: dict, mode: str = "quick") -> tuple[dict | None, str]:
+    """Enqueue one run of ``mode`` and poll the in-process queue until it
+    settles. -> (job, "") on success, (None, reason) otherwise."""
+    need = 1 if mode == "quick" else (deep_turns() or 1)
+    if not lane_client.can_start("digest", need):
         return None, "budget: digest allowance spent"
-    enq = jobs.enqueue(ticker, "quick", source="digest")
+    enq = jobs.enqueue(ticker, mode, source="digest")
     job_id = enq["job_id"]
     log.info("%s: job %s %s", ticker, job_id,
              f"deduped onto an in-flight {enq['mode']} run" if enq["deduped"]
@@ -746,11 +939,18 @@ async def _price_context(ticker: str, parsed: dict) -> tuple[dict, dict, str]:
     return display, advice, phase
 
 
-async def _attempt(ticker: str, c: dict, prev: dict | None) -> dict:
+async def _attempt(ticker: str, c: dict, prev: dict | None,
+                   plan: dict | None = None) -> dict:
     """One run of one ticker -> an outcome dict (never raises)."""
-    out = {"ticker": ticker, "status": "failed", "reason": "", "retryable": True}
+    plan = plan or {}
+    mode = plan.get("mode") or "quick"
+    out = {"ticker": ticker, "status": "failed", "reason": "", "retryable": True,
+           "mode": mode, "trigger": plan.get("trigger"),
+           "deep_skipped": plan.get("deep_skipped") or "",
+           "filing_mark": plan.get("filing_mark"),
+           "earnings_date": plan.get("earnings_date")}
     try:
-        job, reason = await run_one(ticker, c)
+        job, reason = await run_one(ticker, c, mode)
         if job is None:
             out["reason"] = reason
             out["retryable"] = not reason.startswith("budget")
@@ -771,6 +971,11 @@ async def _attempt(ticker: str, c: dict, prev: dict | None) -> dict:
     lane = job.get("lane") or parsed.get("lane")
     draft = bool(lane) and lane not in publish_lanes()
     r = resolve(prev, {**parsed, "lane": lane}, draft=draft, now=time.time())
+    try:
+        tax_tag = await _tax_tag(ticker, parsed, r)
+    except Exception:                              # the tag is garnish, never a failure
+        log.exception("%s: tax tag failed", ticker)
+        tax_tag = None
     out.update(parsed)
     out.update(status="ok", reason="", retryable=False, report=report,
                lane=lane,
@@ -778,21 +983,22 @@ async def _attempt(ticker: str, c: dict, prev: dict | None) -> dict:
                price=display, price_at_advice=advice_price, phase=phase,
                change=r["change"], state=r["state"], prev=r["prev"],
                confirmed=r["confirmed"], publish=r["publish"],
-               pending=r["pending"], why=r["why"], draft=draft)
+               pending=r["pending"], why=r["why"], draft=draft, taxTag=tax_tag)
     return out
 
 
-async def _run_ticker(ticker: str, c: dict, prev: dict | None) -> dict:
+async def _run_ticker(ticker: str, c: dict, prev: dict | None,
+                      plan: dict | None = None) -> dict:
     """``_attempt`` plus ONE retry after ``retry_delay_s`` for a failure that
     can plausibly heal (a lane blip, a truncated PM answer), not for a spent
     budget."""
-    out = await _attempt(ticker, c, prev)
+    out = await _attempt(ticker, c, prev, plan)
     if out["status"] == "ok" or not out["retryable"]:
         return out
     log.warning("%s: failed (%s) - retrying once in %ss", ticker, out["reason"],
                 c["retry_delay_s"])
     await asyncio.sleep(max(0, c["retry_delay_s"]))
-    again = await _attempt(ticker, c, prev)
+    again = await _attempt(ticker, c, prev, plan)
     again["retried"] = True
     if again["status"] != "ok":
         again["reason"] = again["reason"] or out["reason"]
@@ -810,7 +1016,8 @@ def _targets(tickers: list[str] | None) -> list[str]:
     return out
 
 
-async def run_batch(tickers: list[str] | None = None) -> dict:
+async def run_batch(tickers: list[str] | None = None, *,
+                    event_driven: bool = False) -> dict:
     """One digest batch -> ``{ok, deferred, reason, outcomes, pushed}``.
 
     ``outcomes`` is ``{ticker: outcome}`` (status ok|failed with its reason);
@@ -833,7 +1040,8 @@ async def run_batch(tickers: list[str] | None = None) -> dict:
     state = _load_state()
     outcomes: dict[str, dict] = {}
     for ticker in todo:
-        outcomes[ticker] = await _run_ticker(ticker, c, state.get(ticker))
+        plan = plan_run(ticker, state.get(ticker), time.time()) if event_driven else None
+        outcomes[ticker] = await _run_ticker(ticker, c, state.get(ticker), plan)
     ordered = [outcomes[t] for t in todo]
     now = time.time()
     msg = format_digest(ordered, datetime.datetime.fromtimestamp(now))
@@ -895,12 +1103,13 @@ def _note(result: dict, label: str) -> str:
     return note
 
 
-async def _batch_recorded(label: str, tickers: list[str] | None = None) -> dict:
+async def _batch_recorded(label: str, tickers: list[str] | None = None,
+                          event_driven: bool = False) -> dict:
     """``run_batch`` + its worker-run row: ok=False when any ticker failed,
     the batch was skipped, or the push was lost."""
     started = time.time()
     try:
-        result = await run_batch(tickers)
+        result = await run_batch(tickers, event_driven=event_driven)
     except Exception as e:
         _stats["errors"] += 1
         runlog.record("digest", False, time.time() - started,
@@ -937,13 +1146,14 @@ def _seconds_until_next(times: list[str]) -> float:
     return max(30.0, (best - now).total_seconds()) if best else 3600.0
 
 
-async def _run_with_gate_retries(label: str, tickers: list[str] | None) -> None:
+async def _run_with_gate_retries(label: str, tickers: list[str] | None,
+                                 event_driven: bool = False) -> None:
     """A lane that is mid-switch (another engine holds the VRAM) is the normal
     skip reason: retry a few times before giving up until the next slot, and
     say so ONCE when the last attempt is still deferred."""
     result: dict = {}
     for attempt in range(4):
-        result = await _batch_recorded(label, tickers)
+        result = await _batch_recorded(label, tickers, event_driven)
         if not result.get("deferred"):
             return
         log.info("digest: batch deferred, retry %d/4 in %ds", attempt + 1,
@@ -970,7 +1180,7 @@ async def _scheduled_slot(day: datetime.date) -> None:
         runlog.record("digest", True, 0.0,
                       "deferred: no session today (scheduled)")
         return
-    await _run_with_gate_retries("scheduled", None)
+    await _run_with_gate_retries("scheduled", None, event_driven=True)
 
 
 async def _loop() -> None:

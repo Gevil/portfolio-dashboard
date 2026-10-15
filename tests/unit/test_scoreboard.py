@@ -1,6 +1,9 @@
 """scoreboard v3: grading math on synthetic series (T+5 / T+20 separately), the
 verdict band, sign-adjusted excess, Wilson intervals, n semantics, the
-insufficient-sample rule, and the missing-benchmark path. tmp files only."""
+insufficient-sample rule, the missing-benchmark path, hold/watch without a
+directional verdict, the probabilistic block (Brier/BSS/log score/reliability/
+Spearman IC), the baselines, the v2 -> v3 regrade and the EUR benchmark path
+(no FX). tmp files only."""
 import asyncio
 import datetime as dt
 import json
@@ -61,6 +64,11 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(sb, "FEEDBACK", tmp_path / "feedback.json")
     monkeypatch.setattr(sb, "ADVICE_LOG", tmp_path / "advice_log.json")
     monkeypatch.setattr(sb.registry, "benchmark_id", lambda: "GSPC")
+    monkeypatch.setattr(sb.config_store, "read", lambda: {})
+
+    async def no_closes(ticker, period="2y"):
+        return []
+    monkeypatch.setattr(sb.prices, "daily_closes", no_closes, raising=False)
 
 
 def ctx_with(own, bench_fn=lambda d: 5000.0, bench_reason="", rate=0.9):
@@ -119,8 +127,9 @@ def test_verdicts():
     assert sb.verdict("buy", 0.5, 1.0) == "neutral"
     assert sb.verdict("sell", -5.0, 1.0) == "hit"          # fell vs benchmark: right
     assert sb.verdict("sell", 5.0, 1.0) == "miss"
-    assert sb.verdict("hold", 0.5, 1.0) == "hit"           # stayed inside the band
-    assert sb.verdict("watch", 5.0, 1.0) == "miss"
+    assert sb.verdict("hold", 0.5, 1.0) is None            # no direction: no hit/miss
+    assert sb.verdict("watch", 5.0, 1.0) is None
+    assert sb.verdict("trim", -5.0, 1.0) == "hit"
     assert sb.verdict("buy", None, 1.0) is None
 
 
@@ -162,11 +171,16 @@ def test_sell_advice_that_falls_is_a_hit():
     assert row["horizons"]["5"]["edge"] == pytest.approx(10.0, abs=0.01)
 
 
-def test_hold_inside_the_band_is_a_hit_outside_a_miss():
+def test_hold_rows_are_graded_probabilistically_with_no_directional_verdict():
     row = fresh(advice(action="hold", rating="HOLD"))
+    assert row["graded_as"] == "probabilistic_only"
     grade(row, ctx_with(series("ASML", own_fn(100.1, 110.0))))
-    assert row["horizons"]["5"]["verdict"] == "hit"
-    assert row["horizons"]["20"]["verdict"] == "miss"
+    for h in ("5", "20"):
+        assert row["horizons"][h]["verdict"] is None
+        assert row["horizons"][h]["edge"] is None
+        assert row["horizons"][h]["graded_as"] == "probabilistic_only"
+    assert row["horizons"]["20"]["excess"] == pytest.approx(10.0, abs=0.01)
+    assert row["eval_status"] == "completed"               # graded = excess stored
 
 
 def test_only_matured_horizons_are_graded_and_the_row_stays_pending():
@@ -350,3 +364,319 @@ def test_recent_lessons_stay_empty_until_there_is_a_sample():
                  for i in range(sb.MIN_SAMPLES + 5)])
     # rows older than LESSON_DAYS don't make lessons, but the gate itself passes
     assert isinstance(sb.recent_lessons("ASML", 5), list)
+
+
+# ------------------------------------------------- v3: probabilistic metrics
+
+PAIRS = [(0.8, 1), (0.6, 1), (0.3, 0), (0.2, 0)]
+
+
+def test_brier_bss_and_log_score_known_answer():
+    m = sb.prob_metrics(PAIRS)
+    assert m["n"] == 4
+    assert m["brier"] == pytest.approx((0.04 + 0.16 + 0.09 + 0.04) / 4, abs=1e-4)   # 0.0825
+    assert m["brierRef"] == pytest.approx(0.25, abs=1e-4)           # base rate 0.5
+    assert m["bss"] == pytest.approx(1 - 0.0825 / 0.25, abs=1e-4)   # 0.67
+    expected_ll = -(math.log(0.8) + math.log(0.6) + math.log(0.7) + math.log(0.8)) / 4
+    assert m["logScore"] == pytest.approx(expected_ll, abs=1e-4)
+
+
+def test_constant_base_rate_forecast_has_zero_skill_and_degenerate_rows_have_none():
+    m = sb.prob_metrics([(0.5, 1), (0.5, 0)])
+    assert m["bss"] == pytest.approx(0.0, abs=1e-6)
+    all_up = sb.prob_metrics([(0.6, 1), (0.7, 1)])                  # base rate 1 -> ref 0
+    assert all_up["brierRef"] == 0.0 and all_up["bss"] is None
+    empty = sb.prob_metrics([])
+    assert empty["n"] == 0 and empty["brier"] is None and len(empty["reliability"]) == 5
+
+
+def test_reliability_bins():
+    rel = sb.prob_metrics(PAIRS + [(0.99, 1), (0.0, 0)])["reliability"]
+    assert [(b["lo"], b["hi"]) for b in rel] == [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6),
+                                                 (0.6, 0.8), (0.8, 1.0)]
+    assert [b["n"] for b in rel] == [1, 2, 0, 1, 2]
+    assert rel[1]["meanP"] == pytest.approx(0.25) and rel[1]["observed"] == 0.0
+    assert rel[3]["meanP"] == pytest.approx(0.6) and rel[3]["observed"] == 1.0
+    assert rel[4]["meanP"] == pytest.approx(0.895) and rel[4]["observed"] == 1.0   # 0.8 and 0.99
+    assert rel[2]["meanP"] is None and rel[2]["observed"] is None
+
+
+def test_spearman_with_ties_uses_average_ranks():
+    # x ranks 1, 2.5, 2.5, 4 ; y ranks 1, 3, 2, 4 -> 4.5 / sqrt(4.5 * 5)
+    assert sb.spearman([1, 2, 2, 3], [1, 3, 2, 4]) == pytest.approx(0.9487, abs=1e-4)
+    assert sb.spearman([1, 2, 3, 4], [4, 3, 2, 1]) == -1.0
+    assert sb.spearman([1, 2, 3], [5, 5, 5]) is None               # constant side
+    assert sb.spearman([1, 2], [1, 2]) is None                     # too few pairs
+
+
+def prob_row(p, excess, score=None, exp=None, h="5"):
+    return {"p20": p, "score": score, "expExcess20Pct": exp,
+            "horizons": {h: {"excess": excess, "verdict": None}}}
+
+
+def test_probabilistic_block_excludes_rows_without_p_and_ic_falls_back_to_expected_excess():
+    rows = [prob_row(0.8, 2.0, score=70), prob_row(0.6, 1.0, score=60),
+            prob_row(0.3, -1.0, score=50), prob_row(0.2, -2.0, score=40),
+            prob_row(None, 3.0, score=80),                 # no p20: not in Brier ...
+            prob_row(None, -5.0, exp=-9.0)]                # ... IC uses expExcess20Pct
+    out = sb._probabilistic(rows, 5)
+    assert out["n"] == 4 and out["n_without_p"] == 2
+    assert out["brier"] == pytest.approx(0.0825, abs=1e-4)
+    assert out["ic"] == {"spearman": 1.0, "n": 6}
+    empty = sb._probabilistic(rows, 20)                    # nothing graded at T+20
+    assert empty["n"] == 0 and empty["n_without_p"] == 0 and empty["ic"]["n"] == 0
+
+
+def test_payload_probabilistic_block_per_horizon():
+    rows = []
+    for i, (p, v) in enumerate([(0.8, "hit"), (0.6, "hit"), (0.3, "miss"), (0.2, "miss"), (None, "hit")]):
+        r = graded_row(i, v)
+        r["p20"] = p
+        rows.append(r)
+    write_store(rows)
+    out = payload()
+    assert out["engine_version"] == "decision-signal-v3"
+    assert set(out["probabilistic"]) == {"5", "20"}
+    p5 = out["probabilistic"]["5"]
+    assert set(p5) == {"n", "n_without_p", "brier", "brierRef", "bss", "logScore",
+                       "reliability", "ic"}
+    assert p5["n"] == 4 and p5["n_without_p"] == 1
+    assert p5["brier"] == pytest.approx(0.0825, abs=1e-4) and p5["bss"] == pytest.approx(0.67, abs=1e-4)
+    assert out["probabilistic"]["20"]["n"] == 0 and out["probabilistic"]["20"]["brier"] is None
+
+
+# ------------------------------------------------------------------ baselines
+
+def cal_closes(values, start=dt.date(2025, 1, 1)):
+    return [((start + dt.timedelta(days=i)).isoformat(), float(v)) for i, v in enumerate(values)]
+
+
+def test_baseline_signals_on_synthetic_series():
+    rising = cal_closes([100 + i for i in range(300)])
+    assert sb.baseline_signals(rising, rising[299][0]) == {"trend_10m": "BUY", "momentum_12_1": "BUY"}
+    falling = cal_closes([500 - i for i in range(300)])
+    assert sb.baseline_signals(falling, falling[299][0]) == {"trend_10m": "SELL", "momentum_12_1": "SELL"}
+    # rally then a sharp drop: close below its 210-session SMA (SELL) while
+    # close[t-21] is still far above close[t-252] (momentum BUY)
+    vals = [100 + i for i in range(270)] + [369 - 8 * (i - 269) for i in range(270, 300)]
+    mixed = cal_closes(vals)
+    assert sb.baseline_signals(mixed, mixed[299][0]) == {"trend_10m": "SELL", "momentum_12_1": "BUY"}
+
+
+def test_baseline_signals_need_enough_history_and_a_bar_near_the_anchor():
+    rising = cal_closes([100 + i for i in range(300)])
+    assert sb.baseline_signals(rising, rising[208][0])["trend_10m"] is None
+    assert sb.baseline_signals(rising, rising[209][0])["trend_10m"] == "BUY"
+    assert sb.baseline_signals(rising, rising[251][0])["momentum_12_1"] is None
+    assert sb.baseline_signals(rising, rising[252][0])["momentum_12_1"] == "BUY"
+    assert sb.baseline_signals(rising, "2030-01-01") == {"trend_10m": None, "momentum_12_1": None}
+    assert sb.baseline_signals([], "2025-06-01") == {"trend_10m": None, "momentum_12_1": None}
+
+
+def test_baseline_cell_counts_hits_misses_brier_and_edge():
+    rows = [{"sig": "BUY", "horizons": {"20": {"excess": 5.0, "band": 1.0}}},
+            {"sig": "BUY", "horizons": {"20": {"excess": -5.0, "band": 1.0}}},
+            {"sig": "SELL", "horizons": {"20": {"excess": 0.5, "band": 1.0}}},     # neutral
+            {"sig": None, "horizons": {"20": {"excess": 9.0, "band": 1.0}}}]       # no signal: left out
+    b = sb._baseline_cell(rows, lambda r: r["sig"], 20)
+    assert (b["n"], b["hits"], b["misses"], b["neutral"]) == (3, 1, 1, 1)
+    assert b["hitRatePct"] == 50.0 and len(b["wilson95"]) == 2
+    assert b["brier"] == pytest.approx((0.45 ** 2 + 0.55 ** 2 + 0.55 ** 2) / 3, abs=1e-4)
+    assert b["avgExcessPct"] == pytest.approx((5.0 - 5.0 - 0.5) / 3, abs=0.01)
+
+
+def test_payload_baselines_on_the_same_anchor_rows(monkeypatch):
+    closes = cal_closes([100 + i for i in range(520)])            # to 2026-05-25, rising
+
+    async def daily(ticker, period="2y"):
+        assert period == "2y"
+        return closes
+    monkeypatch.setattr(sb.prices, "daily_closes", daily, raising=False)
+    rows = [graded_row(i, "hit", "hit") for i in range(3)]        # T+20: excess +3, band 1 -> buy hits
+    rows.append(graded_row(3, "hit", None))                       # not graded at T+20: not a baseline row
+    write_store(rows)
+    bl = payload()["baselines"]
+    assert set(bl) == {"always_hold", "trend_10m", "momentum_12_1"}
+    for name in ("trend_10m", "momentum_12_1"):
+        assert set(bl[name]) >= {"n", "hits", "misses", "hitRatePct", "wilson95", "brier", "avgExcessPct"}
+        assert (bl[name]["n"], bl[name]["hits"], bl[name]["misses"]) == (3, 3, 0)
+        assert bl[name]["hitRatePct"] == 100.0 and bl[name]["avgExcessPct"] == 3.0
+        assert bl[name]["brier"] == pytest.approx(0.45 ** 2, abs=1e-4)   # BUY p .55, outperformed
+    hold = bl["always_hold"]
+    assert hold["n"] == 3 and hold["hits"] == hold["misses"] == 0 and hold["hitRatePct"] is None
+    assert hold["brier"] == 0.25 and hold["avgExcessPct"] is None
+
+
+def test_baselines_are_empty_without_daily_closes():
+    write_store([graded_row(i, "hit", "hit") for i in range(3)])  # daily_closes -> []
+    bl = payload()["baselines"]
+    assert bl["trend_10m"]["n"] == 0 and bl["trend_10m"]["brier"] is None
+    assert bl["always_hold"]["n"] == 3
+
+
+# ------------------------------------------- hold rows and hit-rate scoping
+
+def test_hit_rates_cover_directional_actions_only():
+    buy = graded_row(0, "hit", "hit")
+    hold = graded_row(1, "hit", "hit")
+    hold["action"], hold["rating"], hold["graded_as"] = "hold", "HOLD", "probabilistic_only"
+    for h in hold["horizons"].values():
+        h["verdict"], h["edge"] = None, None
+    write_store([buy, hold])
+    out = payload()
+    assert out["summary"]["BUY"]["byHorizon"]["5"]["hits"] == 1
+    assert out["summary"]["HOLD"]["n"] == 0 and out["summary"]["HOLD"]["hitRatePct"] is None
+    assert out["summary"]["HOLD"]["graded_as"] == "probabilistic_only"
+    assert out["summary"]["BUY"]["graded_as"] == "directional"
+    assert "hold" not in out["calibration"]["by_action"]
+    assert out["summary"]["BASELINE"]["byHorizon"]["5"]["n"] == 1       # directional rows only
+    assert out["status"]["graded_rows"] == {"5": 2, "20": 2}            # hold still graded (probabilistic)
+    entry = [e for e in out["entries"] if e["action"] == "hold"][0]
+    assert entry["verdict"] is None and entry["graded_as"] == "probabilistic_only"
+
+
+# ------------------------------------------------------- v2 -> v3 regrade
+
+def patch_pass(monkeypatch, bench_series=lambda d: 5000.0):
+    async def load_bench(self):
+        self.bench_id, self.bench = "GSPC", series("GSPC", bench_series)
+        self.rates = {d.isoformat(): 0.9 for d in DAYS}
+
+    async def load_series(self, symbol):
+        self.series[symbol] = series(symbol, own_fn(110.0, 90.0))
+        return self.series[symbol]
+    monkeypatch.setattr(sb._Ctx, "load_benchmark", load_bench)
+    monkeypatch.setattr(sb._Ctx, "load_series", load_series)
+    monkeypatch.setattr(sb.dt, "datetime", type("D", (dt.datetime,), {
+        "now": classmethod(lambda cls, tz=None: dt.datetime(2026, 8, 1, tzinfo=tz))}))
+
+
+def v2_row(action="hold", rating="HOLD"):
+    row = fresh(advice(action=action, rating=rating))
+    row["engine_version"] = "decision-signal-v2"
+    row["horizons"] = {"5": {"verdict": "hit", "excess": 0.1, "edge": None, "band": 0.5},
+                       "20": {"verdict": "miss", "excess": 9.0, "edge": None, "band": 1.0}}
+    row["eval_status"] = "completed"
+    return row
+
+
+def test_run_pass_regrades_v2_rows_under_v3_and_keeps_v2_results(monkeypatch):
+    patch_pass(monkeypatch)
+    old = v2_row()
+    old_horizons = json.loads(json.dumps(old["horizons"]))
+    write_store([old])
+    res = asyncio.run(sb.run_pass())
+    row = json.loads(sb.OUTCOMES.read_text())["rows"][0]
+    assert res["graded"] == 2 and row["engine_version"] == "decision-signal-v3"
+    assert row["v2"]["horizons"] == old_horizons                       # nothing lost
+    assert row["v2"]["engine_version"] == "decision-signal-v2" and row["v2"]["eval_status"] == "completed"
+    assert row["horizons"]["5"]["verdict"] is None and row["horizons"]["5"]["graded_as"] == "probabilistic_only"
+    assert row["horizons"]["5"]["excess"] == pytest.approx(10.0, abs=0.01)      # fresh v3 numbers
+    assert row["anchor_price"] == 100.0 and row["anchor_date"] == old["anchor_date"]
+    # a second pass neither regrades nor overwrites the preserved v2 block
+    asyncio.run(sb.run_pass())
+    again = json.loads(sb.OUTCOMES.read_text())["rows"][0]
+    assert again["v2"] == row["v2"] and again["horizons"] == row["horizons"]
+
+
+def test_regrade_keeps_the_oldest_v2_block_and_copies_advice_fields(monkeypatch):
+    patch_pass(monkeypatch)
+    old = v2_row(action="buy", rating="BUY")
+    write_store([old])
+    sb.ADVICE_LOG.write_text(json.dumps([advice(p20=0.62, expExcess20Pct=1.5, draft=True)]))
+    asyncio.run(sb.run_pass())
+    row = json.loads(sb.OUTCOMES.read_text())["rows"][0]
+    assert (row["p20"], row["expExcess20Pct"], row["draft"]) == (0.62, 1.5, True)
+    assert row["v2"]["horizons"]["5"]["verdict"] == "hit"
+    assert row["horizons"]["5"]["verdict"] == "hit" and row["horizons"]["20"]["verdict"] == "miss"
+    assert row["graded_as"] == "directional"
+
+
+def test_fresh_rows_record_engine_version_and_advice_fields(monkeypatch):
+    row = fresh(advice(p20=0.62, expExcess20Pct=-0.7, draft=False))
+    assert row["engine_version"] == "decision-signal-v3"
+    assert (row["p20"], row["expExcess20Pct"], row["draft"]) == (0.62, -0.7, False)
+    bad = fresh(advice(p20=1.5))                                      # not a probability
+    assert bad["p20"] is None and bad["draft"] is False
+
+
+def test_payload_ignores_rows_not_yet_regraded_and_reports_them():
+    old = v2_row(action="buy", rating="BUY")
+    write_store([old, graded_row(5, "hit", "hit")])
+    out = payload()
+    assert out["status"]["regrade_pending"] == 1
+    assert out["summary"]["BUY"]["byHorizon"]["5"]["n"] == 1          # only the v3 row counts
+    assert len(out["entries"]) == 2
+
+
+# -------------------------------------------------- performance benchmark
+
+SXR8 = {"id": "SXR8", "kind": "etf", "quoteCurrency": "EUR", "listing": {"currency": "EUR"}}
+
+
+def no_fx(monkeypatch):
+    async def boom(days):
+        raise AssertionError("an EUR listing benchmark must not need FX")
+    monkeypatch.setattr(sb.forex, "daily_rates", boom)
+
+
+def test_eur_performance_benchmark_is_graded_without_any_fx_call(monkeypatch):
+    monkeypatch.setattr(sb.config_store, "read", lambda: {"performanceBenchmark": "sxr8"})
+    monkeypatch.setattr(sb.registry, "get", lambda ident: dict(SXR8) if ident.upper() == "SXR8" else None)
+    no_fx(monkeypatch)
+
+    async def load_series(self, symbol):
+        fn = (lambda d: 200.0 if d <= ANCHOR else 220.0) if symbol == "SXR8" else own_fn(110.0, 110.0)
+        self.series[symbol] = series(symbol, fn)
+        return self.series[symbol]
+    monkeypatch.setattr(sb._Ctx, "load_series", load_series)
+    ctx = sb._Ctx()
+    asyncio.run(ctx.load_benchmark())
+    assert (ctx.bench_id, ctx.bench_kind, ctx.bench_fx, ctx.bench_reason) == ("SXR8", "total_return", False, "")
+    assert ctx.rates == {}
+    row = fresh(advice())
+    grade(row, ctx)
+    h5 = row["horizons"]["5"]
+    assert h5["bench"] == pytest.approx(10.0, abs=0.01)               # 220/200 - 1, untouched by any rate
+    assert h5["excess"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_payload_names_the_performance_benchmark_and_its_kind(monkeypatch):
+    monkeypatch.setattr(sb.config_store, "read", lambda: {"performanceBenchmark": "SXR8"})
+    monkeypatch.setattr(sb.registry, "get", lambda ident: dict(SXR8))
+    out = payload()
+    assert out["benchmark"] == "SXR8" and out["benchmark_kind"] == "total_return"
+    assert "no FX" in out["benchmark_currency"]
+
+
+def test_unset_performance_benchmark_falls_back_to_the_role_benchmark_in_eur(monkeypatch):
+    spec = sb._benchmark_spec()
+    assert spec == {"id": "GSPC", "kind": "price", "fx": True, "reason": ""}
+    calls = []
+
+    async def rates(days):
+        calls.append(days)
+        return {d.isoformat(): 0.9 for d in DAYS}
+
+    async def load_series(self, symbol):
+        self.series[symbol] = series(symbol, lambda d: 5000.0)
+        return self.series[symbol]
+    monkeypatch.setattr(sb.forex, "daily_rates", rates)
+    monkeypatch.setattr(sb._Ctx, "load_series", load_series)
+    ctx = sb._Ctx()
+    asyncio.run(ctx.load_benchmark())
+    assert calls and ctx.bench_fx is True and ctx.bench_kind == "price" and not ctx.bench_reason
+    assert payload()["benchmark"] == "GSPC" and payload()["benchmark_kind"] == "price"
+
+
+def test_unknown_or_unsupported_performance_benchmark_is_a_reason_not_a_silent_fallback(monkeypatch):
+    monkeypatch.setattr(sb.config_store, "read", lambda: {"performanceBenchmark": "NOPE"})
+    monkeypatch.setattr(sb.registry, "get", lambda ident: None)
+    ctx = sb._Ctx()
+    asyncio.run(ctx.load_benchmark())
+    assert ctx.bench_reason == "unknown_performance_benchmark"
+    monkeypatch.setattr(sb.registry, "get", lambda ident: {
+        "id": "X", "kind": "etf", "quoteCurrency": "JPY", "listing": {"currency": "JPY"}})
+    ctx = sb._Ctx()
+    asyncio.run(ctx.load_benchmark())
+    assert ctx.bench_reason == "unsupported_benchmark_currency"

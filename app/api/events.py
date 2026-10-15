@@ -154,7 +154,8 @@ async def _dividend_dates(ident: str) -> dict:
 
 
 async def _dividend_events(start, end) -> tuple[list[dict], list[str]]:
-    ids = [i for i in registry.holdings() if registry.listing_symbol(i)]
+    ids = [i for i in registry.holdings()
+           if registry.listing_symbol(i) and registry.kind(i) == "equity"]
     results = await asyncio.gather(*(_dividend_dates(i) for i in ids),
                                    return_exceptions=True)
     out, warnings = [], []

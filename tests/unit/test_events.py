@@ -28,9 +28,11 @@ class Fakes:
         monkeypatch.setattr(events, "_cpi_cache", (0.0, None))
         monkeypatch.setattr(events.macro, "earnings", self.macro_earnings)
         monkeypatch.setattr(events.calendars, "closures", self.closures_for)
-        monkeypatch.setattr(events.registry, "holdings", lambda: ["ASML", "SAP"])
+        monkeypatch.setattr(events.registry, "holdings", lambda: ["ASML", "SAP", "SXR8"])
         monkeypatch.setattr(events.registry, "listing_symbol",
-                            lambda i: {"ASML": "ASML.AS", "SAP": "SAP.DE"}[i])
+                            lambda i: {"ASML": "ASML.AS", "SAP": "SAP.DE", "SXR8": "SXR8.DE"}[i])
+        monkeypatch.setattr(events.registry, "kind",
+                            lambda i: "etf" if i == "SXR8" else "equity")
         monkeypatch.setattr(events, "_yf_calendar_blocking", self.yf_calendar)
         monkeypatch.setattr(events, "_fetch_cpi_dates", self.fetch_cpi)
 
@@ -214,3 +216,8 @@ def test_a_failed_dividend_fetch_is_not_retried_within_the_hour(f):
     build(60)
     build(60)
     assert f.yf_calls.count("SAP.DE") == 1
+
+
+def test_etf_entries_are_never_queried_for_dividends(f):
+    build(60)
+    assert "SXR8.DE" not in f.yf_calls

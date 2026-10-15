@@ -151,7 +151,8 @@ subscribe('selectedId', id => {
 // Closing the alert drawer restores #overview (and the view that goes with it).
 subscribe('alertCenterOpen', open => {
   if (open || parseRoute().name !== 'alerts') return;
-  history.replaceState(null, '', '#overview');
+  const sel = get('selectedId');
+  history.replaceState(null, '', sel ? '#detail/' + sel : '#overview');
   applyRoute(parseRoute());
 });
 

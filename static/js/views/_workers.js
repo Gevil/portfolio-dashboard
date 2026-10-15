@@ -65,7 +65,7 @@ export function summarizeWorkers(bg, runs) {
     else if (st.running === false && isObj(bg) && name in bg) verdict = 'fail';
     else if (deferred) verdict = 'deferred';
     else if (age !== null && age > limit) verdict = 'stale';
-    else if (age === null && !disabled && isObj(bg) && name in bg && newestFirst.length === 0) verdict = 'stale';
+    else if (age === null && !disabled && isObj(bg) && name in bg && newestFirst.length === 0) verdict = toSec(st.next_run) !== null && toSec(st.next_run) > Date.now() / 1000 ? 'scheduled' : 'idle';
     const errors = num(st.errors);
     out.push({
       name, st, runs: newestFirst.slice(0, RING_LEN).reverse(), allRuns: newestFirst,
@@ -74,13 +74,13 @@ export function summarizeWorkers(bg, runs) {
       nextRun: toSec(st.next_run),
     });
   });
-  const rank = { fail: 0, stale: 1, deferred: 2, ok: 3, off: 4 };
+  const rank = { fail: 0, stale: 1, deferred: 2, scheduled: 3, idle: 3, ok: 3, off: 4 };
   out.sort((a, b) => rank[a.verdict] - rank[b.verdict] || a.name.localeCompare(b.name));
   return out;
 }
 
-export const VERDICT_LABEL = { ok: 'ok', fail: 'failing', stale: 'stale', deferred: 'deferred', off: 'disabled' };
-const VERDICT_CHIP = { ok: 'up', fail: 'down', stale: 'warn', deferred: 'flat', off: 'flat' };
+export const VERDICT_LABEL = { ok: 'ok', fail: 'failing', stale: 'stale', deferred: 'deferred', scheduled: 'scheduled', idle: 'idle', off: 'disabled' };
+const VERDICT_CHIP = { ok: 'up', fail: 'down', stale: 'warn', deferred: 'flat', scheduled: 'flat', idle: 'flat', off: 'flat' };
 
 export function verdictChip(kit, verdict) {
   return kit.chip(VERDICT_LABEL[verdict] || verdict, VERDICT_CHIP[verdict] || 'flat');
@@ -123,7 +123,8 @@ export function renderWorkerTable(kit, body, list) {
     h('th', { scope: 'row', class: 'v-mono' }, w.name),
     h('td', {}, verdictChip(kit, w.verdict)),
     h('td', {}, w.last ? fmtAgo(w.last) : 'never',
-      w.verdict === 'stale' && w.intervalS ? h('span', { class: 'v-muted' }, ' (expected every ' + fmtSpan(w.intervalS) + ')') : null),
+      w.verdict === 'stale' && w.intervalS ? h('span', { class: 'v-muted' }, ' (expected every ' + fmtSpan(w.intervalS) + ')') : null,
+      w.verdict === 'scheduled' ? h('span', { class: 'v-muted' }, ' (next ' + fmtIn(w.nextRun) + ')') : null),
     h('td', { class: 'v-num' }, str(w.st.runs, '–')),
     h('td', { class: 'v-num' + (w.errors ? ' v-down' : '') }, w.errors === null ? '–' : String(w.errors)),
     h('td', { class: 'v-muted v-note', title: w.note }, w.note.slice(0, 140) || '–')));

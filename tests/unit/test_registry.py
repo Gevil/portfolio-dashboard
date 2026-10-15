@@ -166,3 +166,34 @@ def test_session_window_latest_started_session(wl):
     assert registry.session_window("ASML", epoch(2026, 7, 13, 6, 0)) == (fri_open, fri_close)
     assert registry.session_window("ASML", epoch(2026, 7, 11, 12, 0)) == (fri_open, fri_close)
     assert registry.session_window("NOPE", epoch(2026, 7, 13, 12, 0)) is None
+
+
+def test_market_open_is_false_on_an_exchange_holiday(wl):
+    # Fri 2026-05-01 (Labour Day): Euronext and Xetra closed, NYSE trades
+    assert not registry.market_open("ASML", epoch(2026, 5, 1, 10, 0))    # 12:00 CEST
+    assert not registry.market_open("SXR8", epoch(2026, 5, 1, 10, 0))    # XETR
+    assert registry.market_open("GSPC", epoch(2026, 5, 1, 15, 0))        # 11:00 EDT
+    assert registry.market_open("ASML", epoch(2026, 4, 30, 10, 0))       # the day before is normal
+
+
+def test_session_window_on_a_holiday_is_the_last_session(wl):
+    thu_open = int(epoch(2026, 4, 30, 7, 0))
+    thu_close = int(epoch(2026, 4, 30, 15, 30))
+    assert registry.session_window("ASML", epoch(2026, 5, 1, 12, 0)) == (thu_open, thu_close)
+    mon_open = int(epoch(2026, 5, 4, 7, 0))
+    # the Monday after: before its open the window is still Thursday's (not Friday's holiday)
+    assert registry.session_window("ASML", epoch(2026, 5, 4, 6, 0)) == (thu_open, thu_close)
+    assert registry.session_window("ASML", epoch(2026, 5, 4, 8, 0))[0] == mon_open
+
+
+def test_early_close_ends_the_session_and_the_window(wl):
+    # Thu 2026-12-24: Amsterdam closes early, Xetra is closed all day (CET, UTC+1)
+    assert registry.market_open("ASML", epoch(2026, 12, 24, 10, 0))
+    assert not registry.market_open("ASML", epoch(2026, 12, 24, 16, 0))   # 17:00 local, after the early close
+    assert not registry.market_open("SXR8", epoch(2026, 12, 24, 10, 0))
+    start, end = registry.session_window("ASML", epoch(2026, 12, 24, 20, 0))
+    assert start == int(epoch(2026, 12, 24, 8, 0))
+    assert end < int(epoch(2026, 12, 24, 16, 30))                          # earlier than the regular 17:30
+    # Xetra: the window of the holiday is Wednesday's regular session
+    assert registry.session_window("SXR8", epoch(2026, 12, 24, 12, 0)) == (
+        int(epoch(2026, 12, 23, 8, 0)), int(epoch(2026, 12, 23, 16, 30)))

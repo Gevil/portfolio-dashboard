@@ -52,6 +52,11 @@ WATCHLIST_POLL_S = 15
 # A tick older than this is never accepted (providers replay cached payloads).
 STALE_TICK_MAX_AGE = 120
 
+# A feed whose every symbol was rejected is not restarted for this symbol set
+# until the park expires or the set changes: {provider: (signature, until_ts)}.
+FEED_PARK_S = 24 * 3600
+_parked: dict[str, tuple[frozenset, int]] = {}
+
 
 def _current_ts() -> int:
     return int(time.time())
@@ -157,7 +162,10 @@ async def _twelvedata_ws_loop(sub_map: dict[str, str]):
         connected_at = None
         active = {w: i for w, i in sub_map.items() if w not in bad}
         if not active:
-            log.warning("Twelve Data: no usable symbols left (rejected: %s)", sorted(bad))
+            parked_until = _current_ts() + FEED_PARK_S
+            _parked["twelvedata"] = (frozenset(sub_map.items()), parked_until)
+            log.warning("Twelve Data: no usable symbols left (rejected: %s); "
+                        "parking this symbol set for %d h", sorted(bad), FEED_PARK_S // 3600)
             return
         protocol_ok = False
         try:
@@ -355,6 +363,18 @@ async def _cancel(task: asyncio.Task | None):
         pass
 
 
+def _is_parked(provider: str, sig: frozenset) -> bool:
+    """True while ``provider`` is parked for exactly this symbol-set signature.
+    A changed signature or an expired park clears the entry."""
+    entry = _parked.get(provider)
+    if entry is None:
+        return False
+    if entry[0] != sig or _current_ts() >= entry[1]:
+        _parked.pop(provider, None)
+        return False
+    return True
+
+
 async def _sync_feeds_once():
     """Start/restart/stop each feed so it matches the registry's symbol set."""
     for provider, key, loop_fn in (
@@ -370,6 +390,8 @@ async def _sync_feeds_once():
             await _cancel(cur[1])
             _feed_tasks.pop(provider, None)
         if not desired:
+            continue
+        if _is_parked(provider, sig):
             continue
         if cur and cur[0] != sig:
             log.info("%s symbol set changed -> %s", provider, sorted(desired))

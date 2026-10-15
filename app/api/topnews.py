@@ -21,9 +21,14 @@ import datetime
 
 import httpx
 
+from app.api import registry
 from app.api.textsafe import clean_text
 
 log = logging.getLogger(__name__)
+
+# GDELT is a free-text name search: useless for index / ETF symbols.
+GDELT_SKIP_KINDS = ("index", "etf")
+WARN_INTERVAL_S = 3600
 
 DATA_DIR = os.getenv("HISTORY_DIR", "/app/data")
 CACHE_FILE = os.path.join(DATA_DIR, "topnews.json")
@@ -261,6 +266,19 @@ async def fetch_gdelt(client: httpx.AsyncClient,
     return _norm_gdelt_items(arts)
 
 
+_warn_last: dict[str, float] = {}
+
+
+def _warn_allowed(ticker: str) -> bool:
+    """True at most once per ticker per WARN_INTERVAL_S (keeps the log quiet
+    when a provider is down for hours)."""
+    now = time.time()
+    if now - _warn_last.get(ticker, -WARN_INTERVAL_S) < WARN_INTERVAL_S:
+        return False
+    _warn_last[ticker] = now
+    return True
+
+
 async def fetch_top_news(tickers: list[str]) -> dict:
     """Refresh the per-ticker top-news cache (finnhub, else GDELT).
 
@@ -277,7 +295,9 @@ async def fetch_top_news(tickers: list[str]) -> dict:
             try:
                 items = await _fetch_finnhub(client, ticker)
                 source = "finnhub"
-                if items is None:
+                if items is None and registry.kind(ticker) in GDELT_SKIP_KINDS:
+                    pass        # GDELT name search is noise for index/ETF symbols
+                elif items is None:
                     items = await fetch_gdelt(client, ticker)
                     source = "gdelt"
                 if items is None:
@@ -296,8 +316,9 @@ async def fetch_top_news(tickers: list[str]) -> dict:
                 continue
             if items is None:
                 # retain last-known-good
-                log.warning("topnews %s: fetch failed, keeping cache",
-                            ticker)
+                if _warn_allowed(ticker):
+                    log.warning("topnews %s: fetch failed, keeping cache",
+                                ticker)
                 failed.append(ticker)
                 continue
             cache[ticker] = {

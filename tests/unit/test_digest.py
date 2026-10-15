@@ -124,6 +124,9 @@ class Harness:
 
     def __init__(self, monkeypatch, tmp_path):
         self.pushes, self.stores, self.attempts = [], [], {}
+        self.lane, self.answer, self.gate_calls = "L", {}, 0
+        monkeypatch.setenv("DIGEST_PUBLISH_LANES", "L")
+        monkeypatch.delenv("DIGEST_PUSH_NO_CHANGE", raising=False)
         self.script = {}             # ticker -> list of results (consumed per attempt)
         self.push_status = "sent"
         monkeypatch.setattr(digest, "STATE_FILE", tmp_path / "advice_state.json")
@@ -139,6 +142,7 @@ class Harness:
         monkeypatch.setattr(digest.notify, "store", lambda *a, **k: self.stores.append(a))
 
     async def gate(self):
+        self.gate_calls += 1
         return self.gate_result
 
     async def run_one(self, ticker, c):
@@ -146,15 +150,18 @@ class Harness:
         step = self.script[ticker].pop(0)
         if step != "ok":                                # anything else = failure reason
             return None, step
-        return {"result_path": f"{ticker}@2026-10-03", "lane": "L", "model": "M"}, ""
+        return {"result_path": f"{ticker}@2026-10-03", "lane": self.lane, "model": "M"}, ""
 
     def parse_report(self, report_id, n):
         t = report_id.split("@")[0]
-        return {"rating": self.ratings.get(t, "BUY"), "rating_source": "decision_v2",
-                "excerpt": "e", "action": "buy", "score": 70, "confidence": "high",
-                "scale_tier": "buy", "scale_version": "ds-v1", "data_quality": "full",
-                "missing": [], "gaps": [], "stop": 90.0, "target": 120.0,
-                "lane": None, "model": None}
+        out = {"rating": self.ratings.get(t, "BUY"), "rating_source": "decision_v2",
+               "excerpt": "e", "action": "buy", "score": 70, "confidence": "high",
+               "scale_tier": "buy", "scale_version": "ds-v1", "data_quality": "full",
+               "missing": [], "gaps": [], "stop": 90.0, "target": 120.0,
+               "lane": None, "model": None, "p20": None, "expExcess20Pct": None,
+               "benchmark": None}
+        out.update(self.answer.get(t, {}))
+        return out
 
     ratings: dict = {}
 
@@ -213,18 +220,6 @@ def test_every_non_failed_delivery_consumes_state(h, tmp_path, status):
     assert "ASML" in state(tmp_path)
 
 
-def test_failed_ticker_is_retried_once_then_reported_in_one_incomplete_push(h, tmp_path):
-    h.script = {"ASML": ["ok"], "NVDA": ["lane blip", "lane blip again"]}
-    res = asyncio.run(digest.run_batch(["ASML", "NVDA"]))
-    assert h.attempts == {"ASML": 1, "NVDA": 2}             # exactly one retry
-    assert res["ok"] is False and res["outcomes"]["NVDA"]["status"] == "failed"
-    assert res["outcomes"]["NVDA"]["retried"] is True
-    assert len(h.pushes) == 1 and "digest incomplete" in h.pushes[0][0]
-    assert "NVDA" in h.pushes[0][0] and "lane blip again" in h.pushes[0][1]
-    assert "ASML" in h.pushes[0][1]                          # the good ticker is in it too
-    assert set(state(tmp_path)) == {"ASML"}                  # only the analysed one advances
-
-
 def test_retry_that_succeeds_makes_a_clean_batch(h):
     h.script = {"ASML": ["flaky", "ok"]}
     res = asyncio.run(digest.run_batch(["ASML"]))
@@ -254,25 +249,40 @@ def test_closed_gate_defers_without_pushing_or_spending(h):
     assert res["deferred"] is True and h.pushes == [] and h.attempts == {}
 
 
-def test_change_between_runs_is_reported_and_unchanged_is_quiet(h, tmp_path):
-    h.script = {"ASML": ["ok", "ok", "ok"]}
-    asyncio.run(digest.run_batch(["ASML"]))
-    h.ratings = {"ASML": "SELL"}
-    asyncio.run(digest.run_batch(["ASML"]))
+def test_change_between_runs_is_pending_then_confirmed_and_unchanged_is_quiet(h, tmp_path):
+    go(h, rating="BUY", action="buy", scale_tier="buy", score=70)
+    sell = {"rating": "SELL", "action": "sell", "scale_tier": "sell", "score": 10}
+    go(h, **sell)                                           # strong move: confirmed at once
     assert "rating BUY \u2192 SELL" in h.pushes[1][1]
-    assert h.pushes[1][2]["priority"] == 5
-    asyncio.run(digest.run_batch(["ASML"]))
-    assert h.pushes[2][2]["priority"] == 3 and "no change" in h.pushes[2][0]
+    assert h.pushes[1][2]["priority"] == 4
+    go(h, **sell)
+    assert len(h.pushes) == 2                               # unchanged batch: no push
+
+
+def test_failed_ticker_is_retried_once_then_reported_in_one_incomplete_push(h, tmp_path):
+    (tmp_path / "advice_state.json").write_text(json.dumps(
+        {"ASML": {"rating": "BUY", "action": "buy", "scale_tier": "buy", "score": 70}}))
+    h.script = {"ASML": ["ok"], "NVDA": ["lane blip", "lane blip again"]}
+    res = asyncio.run(digest.run_batch(["ASML", "NVDA"]))
+    assert h.attempts == {"ASML": 1, "NVDA": 2}             # exactly one retry
+    assert res["ok"] is False and res["outcomes"]["NVDA"]["status"] == "failed"
+    assert res["outcomes"]["NVDA"]["retried"] is True
+    assert len(h.pushes) == 1 and "digest incomplete" in h.pushes[0][0]
+    assert "NVDA" in h.pushes[0][0] and "lane blip again" in h.pushes[0][1]
+    assert "ASML" in h.pushes[0][1]                          # the good ticker is in it too
+    assert set(state(tmp_path)) == {"ASML"}                  # only the analysed one advances
 
 
 def test_format_digest_title_names_failures_and_never_carries_a_url():
-    outcomes = [{"ticker": "ASML", "status": "ok", "rating": "BUY", "change": {"kind": "none", "parts": ["no change"]},
+    outcomes = [{"ticker": "ASML", "status": "ok", "rating": "BUY", "state": "unchanged",
+                 "change": {"kind": "none", "parts": ["no change"]},
                  "price": {"price": 1.0, "day_pct": 0.5, "as_of": 1790000000}, "excerpt": "fine"},
                 {"ticker": "NVDA", "status": "failed", "reason": "lane_down", "retried": True}]
     msg = digest.format_digest(outcomes, datetime.datetime(2026, 10, 3, 8, 45))
     assert "digest incomplete: NVDA (lane_down)" in msg["title"]
     assert "NOT ANALYSED: lane_down (after retry)" in msg["body"]
-    assert msg["priority"] == 4 and len(msg["body"]) <= digest.PUSH_BODY_CHARS
+    assert msg["priority"] == 3 and msg["source"] == "ops" and msg["push"] is True
+    assert len(msg["body"]) <= digest.PUSH_BODY_CHARS
 
 
 # ----------------------------------------------------------------- resume/start
@@ -313,3 +323,201 @@ def test_start_without_interrupted_jobs_resumes_nothing(monkeypatch):
         assert digest._resume_task is None
         await digest.stop()
     asyncio.run(go())
+
+
+# ------------------------------------------- hysteresis, priorities, schedule
+
+HOLD = {"rating": "HOLD", "action": "hold", "scale_tier": "watch", "score": 50}
+BUY = {"rating": "BUY", "action": "buy", "scale_tier": "buy", "score": 62}
+
+
+def go(h, ticker="ASML", **answer):
+    h.answer[ticker] = answer
+    h.script = {ticker: ["ok"]}
+    return asyncio.run(digest.run_batch([ticker]))
+
+
+def test_a_b_a_never_pushes_after_the_first_and_clears_pending(h, tmp_path):
+    go(h, **HOLD)
+    assert len(h.pushes) == 1                               # first tracked advice
+    go(h, **BUY)
+    row = state(tmp_path)["ASML"]
+    assert row["pending"]["rating"] == "BUY" and row["published"]["rating"] == "HOLD"
+    go(h, **HOLD)
+    row = state(tmp_path)["ASML"]
+    assert len(h.pushes) == 1 and row["published"]["rating"] == "HOLD"
+    assert row["pending"] is None
+
+
+def test_a_b_b_pushes_once_and_publishes_on_the_third_run(h, tmp_path):
+    go(h, **HOLD)
+    go(h, **BUY)
+    assert len(h.pushes) == 1
+    assert state(tmp_path)["ASML"]["published"]["rating"] == "HOLD"
+    go(h, **BUY)
+    assert len(h.pushes) == 2
+    assert h.pushes[1][2]["priority"] == 3 and h.pushes[1][2]["source"] == "analysis"
+    row = state(tmp_path)["ASML"]
+    assert row["published"]["rating"] == "BUY" and row["pending"] is None
+
+
+def test_strong_band_crossing_confirms_on_first_sight(h, tmp_path):
+    go(h, **HOLD)
+    res = go(h, rating="BUY", action="buy", scale_tier="buy", score=70)
+    assert res["outcomes"]["ASML"]["state"] == "confirmed"
+    assert res["outcomes"]["ASML"]["why"] == "strong" and len(h.pushes) == 2
+    assert state(tmp_path)["ASML"]["published"]["rating"] == "BUY"
+
+
+def test_draft_lane_never_publishes_or_confirms_pending(h, tmp_path):
+    go(h, **HOLD)
+    go(h, **BUY)
+    h.lane = "X"                                            # not a publish lane
+    res = go(h, **BUY)
+    o = res["outcomes"]["ASML"]
+    assert o["draft"] is True and o["state"] == "draft" and o["confirmed"] is False
+    row = state(tmp_path)["ASML"]
+    assert row["published"]["rating"] == "HOLD" and row["pending"]["rating"] == "BUY"
+    assert len(h.pushes) == 1                               # nothing confirmed
+    log = json.loads((tmp_path / "advice_log.json").read_text())
+    assert log[-1]["draft"] is True and log[-1]["state"] == "draft"
+    assert "[draft]" in h.stores[-1][2]
+
+
+def test_draft_on_first_sight_writes_published_none(h, tmp_path):
+    h.lane = "X"
+    go(h, **HOLD)
+    row = state(tmp_path)["ASML"]
+    assert "published" in row and row["published"] is None and row["draft"] is True
+
+
+def test_every_written_row_has_published_and_no_row_is_dropped(h, tmp_path):
+    (tmp_path / "advice_state.json").write_text(json.dumps(
+        {"GSPC": {"rating": "HOLD"}, "NVDA": {"rating": "BUY"}}))
+    go(h, **HOLD)
+    st = state(tmp_path)
+    assert set(st) == {"GSPC", "NVDA", "ASML"}              # raw state kept
+    assert all("published" in row for row in st.values() if "state" in row)
+    assert st["ASML"]["published"]["rating"] == "HOLD"
+    assert digest.published_of(st["ASML"])["rating"] == "HOLD"
+
+
+def _outcome(prev, **cur):
+    base = {"ticker": "ASML", "status": "ok", "state": "confirmed", "rating": "HOLD",
+            "action": "hold", "score": 50, "prev": prev,
+            "change": {"kind": "rating", "parts": ["rating x"]},
+            "price": {}}
+    base.update(cur)
+    return base
+
+
+def test_priority_4_for_move_into_sell_family_and_for_big_score_delta():
+    into_sell = _outcome({"rating": "HOLD", "action": "hold", "score": 30},
+                         rating="SELL", action="reduce", score=25)
+    big = _outcome({"rating": "HOLD", "action": "hold", "score": 45},
+                   rating="BUY", action="buy", score=62)
+    small = _outcome({"rating": "HOLD", "action": "hold", "score": 50},
+                     rating="BUY", action="buy", score=62)
+    when = datetime.datetime(2026, 10, 14, 8, 45)
+    assert digest.format_digest([into_sell], when)["priority"] == 4
+    assert digest.format_digest([big], when)["priority"] == 4
+    assert digest.format_digest([small], when)["priority"] == 3
+
+
+@pytest.mark.parametrize("prev_action,action,prev_score,score", [
+    ("hold", "sell", 90, 0), ("sell", "buy", 0, 100), (None, "avoid", None, 5),
+    ("buy", "buy", 80, 80), ("hold", "trim", 55, 20)])
+@pytest.mark.parametrize("state_", ["confirmed", "first", "pending", "unchanged"])
+def test_priority_is_never_5(prev_action, action, prev_score, score, state_):
+    prev = {"rating": "HOLD", "action": prev_action, "score": prev_score}
+    o = _outcome(prev, state=state_, action=action, score=score)
+    bad = {"ticker": "N", "status": "failed", "reason": "x"}
+    msg = digest.format_digest([o, bad], datetime.datetime(2026, 10, 14, 8, 45))
+    assert msg["priority"] in (2, 3, 4)
+
+
+def test_quiet_batch_is_committed_not_pushed_and_stores_nothing(h, tmp_path):
+    go(h, **HOLD)
+    pushes = len(h.pushes)
+    stores = len(h.stores)
+    before = state(tmp_path)["ASML"]["ts"]
+    res = go(h, **HOLD)
+    assert res["pushed"] is None and res["ok"] is True
+    assert len(h.pushes) == pushes and len(h.stores) == stores
+    assert state(tmp_path)["ASML"]["ts"] >= before
+    assert len(json.loads((tmp_path / "advice_log.json").read_text())) == 2
+
+
+def test_quiet_batch_pushes_at_priority_2_when_enabled(h, monkeypatch):
+    monkeypatch.setenv("DIGEST_PUSH_NO_CHANGE", "1")
+    go(h, **HOLD)
+    go(h, **HOLD)
+    assert len(h.pushes) == 2 and h.pushes[1][2]["priority"] == 2
+    assert h.pushes[1][2]["source"] == "analysis"
+    assert h.stores[-1][2].startswith("ASML HOLD") and h.stores[-1] is not None
+
+
+def test_failure_only_batch_is_pushed_as_ops(h, tmp_path):
+    (tmp_path / "advice_state.json").write_text(json.dumps(
+        {"ASML": {"rating": "BUY", "action": "buy", "scale_tier": "buy", "score": 70}}))
+    h.script = {"ASML": ["ok"], "NVDA": ["blip", "blip"]}
+    asyncio.run(digest.run_batch(["ASML", "NVDA"]))
+    title, body, kw = h.pushes[0]
+    assert title.startswith("\u26a0\ufe0f digest incomplete: NVDA")
+    assert kw["source"] == "ops" and kw["priority"] == 3 and kw["tags"] == "warning"
+
+
+def _mics(monkeypatch):
+    monkeypatch.setattr(digest.calendars, "mic_for",
+                        lambda t: {"ASML": "XAMS", "SAP": "XETR", "AAPL": "XNYS"}[t])
+
+
+def test_slot_has_session(monkeypatch):
+    _mics(monkeypatch)
+    assert digest.slot_has_session(["ASML"], datetime.date(2026, 10, 17)) is False
+    assert digest.slot_has_session(["ASML", "SAP"], datetime.date(2026, 5, 1)) is False
+    assert digest.slot_has_session(["ASML"], datetime.date(2026, 10, 14)) is True
+
+
+def test_scheduled_slot_without_session_is_deferred_and_silent(h, monkeypatch):
+    _mics(monkeypatch)
+    monkeypatch.setattr(digest.registry, "holdings", lambda: ["ASML", "SAP"])
+    rec = []
+    monkeypatch.setattr(digest.runlog, "record", lambda *a, **k: rec.append(a))
+    asyncio.run(digest._scheduled_slot(datetime.date(2026, 5, 1)))
+    assert rec == [("digest", True, 0.0, "deferred: no session today (scheduled)")]
+    assert h.pushes == [] and h.attempts == {} and h.gate_calls == 0
+    assert digest._stats["skip_reason"]
+
+
+def test_closed_gate_is_recorded_ok_with_a_deferred_note(h, monkeypatch):
+    rec = []
+    monkeypatch.setattr(digest.runlog, "record", lambda *a, **k: rec.append(a))
+    h.gate_result = (False, "no lane is serving its configured analysis model")
+    res = asyncio.run(digest._batch_recorded("scheduled", ["ASML"]))
+    assert res["deferred"] is True and h.pushes == []
+    assert rec[0][1] is True and rec[0][3].startswith("deferred:")
+
+
+def test_advice_history_drops_benchmark_and_derives_published(h, tmp_path, monkeypatch):
+    monkeypatch.setattr(digest.registry, "is_analyzable", lambda i: i != "GSPC")
+    (tmp_path / "advice_state.json").write_text(json.dumps({
+        "GSPC": {"rating": "HOLD"},
+        "ASML": {"rating": "BUY", "action": "buy", "score": 66, "date": "2026-10-01"}}))
+    hist = digest.advice_history()
+    assert set(hist) == {"ASML"}
+    v = hist["ASML"]
+    assert v["published"] == {"rating": "BUY", "action": "buy", "score": 66,
+                              "date": "2026-10-01"}
+    assert v["pending"] is None and v["p20"] is None
+    assert v["expExcess20Pct"] is None and v["draft"] is False
+
+
+def test_final_unreachable_push_is_an_ops_warning(h, monkeypatch):
+    async def nosleep(_):
+        return None
+    monkeypatch.setattr(digest.asyncio, "sleep", nosleep)
+    h.gate_result = (False, "no lane")
+    asyncio.run(digest._run_with_gate_retries("scheduled", ["ASML"]))
+    kw = h.pushes[-1][2]
+    assert kw["priority"] == 3 and kw["tags"] == "warning" and kw["source"] == "ops"

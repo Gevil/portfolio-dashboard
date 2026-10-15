@@ -21,7 +21,7 @@ Rules:
 - Honour `registry`: only `is_alertable` symbols alert; benchmarks and non-alertable entries are skipped.
 
 ## Sending notifications: the Delivery contract
-`await notify.push(title, body, severity, *, priority=None, tags=None, actions=None, dedupe_key=None, …)`
+`await notify.push(title, body, severity, *, priority=None, tags=None, actions=None, dedupe_key=None, dedupe_s=3600, source="", click=None)`
 returns a `Delivery` (truthy iff accepted) with `.status` ∈ `sent | queued | filtered | duplicate | failed`.
 - The durable outbox (`data/ntfy_outbox.json`, drained every `NTFY_OUTBOX_POLL_S`, backoff, max age) retries
   failed sends, so a down ntfy produces `queued`, not loss. `failed` happens only if even the outbox write failed.
@@ -29,11 +29,26 @@ returns a `Delivery` (truthy iff accepted) with `.status` ∈ `sent | queued | f
   seen *before* the push result; never pop a pending queue on `failed`. (Past bugs: edgar marked filings seen
   before processing; flush_pending popped undelivered alerts; market-light/digest saved state regardless.)
 - Severity: `info | warn | urgent`; `NOTIFY_MIN_SEVERITY` filters (→ `filtered`, which is a consumed outcome —
-  do not re-queue and re-classify filtered items, that burns LLM turns). Quiet hours hold non-urgent pushes.
+  do not re-queue and re-classify filtered items, that burns LLM turns). Quiet hours and caps: see "Notify policy".
 - Keep push bodies short, one grouped push per ticker/batch (no per-trade or per-headline bursts), no URLs
   taken from model output, text through `textsafe`.
 - Each push is also stored in `data/notifications.json` (id, source, ticker, severity, url) — this store feeds
   the alert center, **not** the live ntfy stream.
+
+## Notify policy (`notify.py`)
+Always pass `source=` so the policy can apply. `notify.alert(ticker, source, title, body, *, priority, ...)` allocates the
+store row id first, sets `X-Click` to `<DASHBOARD_PUBLIC_URL or NTFY_CLICK_URL>#alerts/<id>`, pushes, and stores the row
+under that id when accepted. `notify.policy_status()` (also merged into `status()`) reports the window, caps and 24 h counts.
+- **Quiet hours** `NOTIFY_QUIET_HOURS` (default `22-7`, container-local; `off`/`none`/empty disables; a malformed value
+  falls back to the default). In the window a push is queued in the durable outbox with `not_before` = the window end and
+  returns `Delivery(QUEUED, "quiet hours")` (a consumed outcome). **Bypass:** priority 5 from source `price` or `policy`,
+  and any push with approval `actions`.
+- **Per-source caps** `NOTIFY_SOURCE_CAPS` (default `ops_watch=3,ops=3,triage=6,news=6,analysis=4,price=8,insider=6,policy=3,market_light=2`
+  per rolling 24 h, persisted in `data/notify_caps.json`). Over the cap: no ntfy push, the `alert()` row is still stored,
+  the call returns `Delivery(FILTERED, "cap")`. Approval pushes are never capped. A new source needs an entry or it is uncapped.
+- **Ops topic**: sources `ops_watch` and `ops` publish to `NTFY_TOPIC_OPS` (default `<NTFY_TOPIC>-ops`, i.e. `stocks-ops`) with
+  priority capped at 3. The owner must subscribe the phone to that topic to receive infra alerts.
+- `news_alerts` still has its own `quiet_hours` ([0, 7]) in the `newsMonitor` block on top of the global window.
 
 ## Alert center API
 `GET /api/alerts?limit=` → `{items:[{id,time,title,message,priority,severity,source,ticker,url,acked}], unread}`;
@@ -42,12 +57,25 @@ event only for alerts created **after** the hub started (no backlog replay — r
 backlog on every page load).
 
 ## Rules and detectors
-- `price_alerts`: session-move rule and **gap-vs-previous-close** rule, separate cooldown keys; reads
-  `prices.listing_quote`; saves state only per accepted push; ignores stale quotes.
-- `rule_eval` (rules v2, 8 kinds): closed-bar `ema_cross`/`rsi`/`volume_spike`, absolute level (edge-detected,
+- `price_alerts` (rules v3): **σ-scaled** session move and **opening gap**. σ = EWMA (λ 0.94) daily volatility of log returns
+  from `prices.daily_closes(id, "1y")`, excluding today. Alert at `|z| >= zAlert` and `|move| >= minPct`, hot (priority 5) at
+  `|z| >= zHot`; the same direction re-alerts only at a higher integer `|z|` level or on reaching hot (persisted ladder in
+  `data/price_alerts_state.json`), re-arming below `rearmZ` or next session. The gap rule only runs within `gapWindowMin`
+  minutes after `calendars.session_bounds` open, once per session per ticker, and never when `prevClose` is None.
+  `mode: "pct"` keeps the fixed `thresholdPct`/`hotPct`. No sigma (short history) → falls back to the pct thresholds. A move
+  beyond `SANITY_BAND_PCT` must repeat on two passes. Saves state only per accepted push; ignores stale quotes.
+- `rule_eval` (alertRules **v3**, 8 kinds; v2 blocks are read as v3 with `mode: "sigma"` and are never rewritten until a UI
+  save; v1 single dicts are read as one pct-move rule): closed-bar `ema_cross`/`rsi`/`volume_spike`, absolute level (edge-detected,
   oneShot + expiry), earnings-day lead, short-ratio sigma spike, market-light drop. State pruning must never drop
   fired one-shot entries or live edge baselines (refresh `touch` each pass while the rule exists).
   Rules are edited through `POST /api/alert-rules` (400 on invalid body) and stored via `config_store.update`.
+- `market_light`: **index (benchmark vs MA200) + momentum (5-day return) only**. `holdingsTrend` (share of alertable holdings
+  above MA20) is informational: it never enters `status`, `score`, `reasons` or the drop alert. A drop pushes at priority 4.
+- `ops_watch`: findings dedupe on a stable key and **re-alert every 24 h** (`OPS_WATCH_REALERT_S`, 86400) at priority 3 via
+  source `ops_watch` (ops topic); a cleared finding writes an info "Resolved" row to the store only.
+- `policy` worker (`POLICY_WATCH_ENABLED`, default on): daily 18:00 local, only when XETR or XAMS had a session; priority-3
+  `notify.alert("POLICY", "policy", ...)` on edges (band breach entered/left, single-stock breach entered/left, monthly trend
+  flip, 7-day reminder while out of band). State in `data/policy_state.json`, advanced per edge only when the Delivery is consumed.
 - `news_alerts` + `topnews` + `triage`: consume the topnews cache (GDELT only as fallback; it 429s and backs off);
   one title-hash dedupe store (`data/news_dedupe.json`); hot keywords go to triage unless they match the short
   high-precision list, else priority ≤ 4; triage candidates expire (~6 h); triage spends only the `triage` budget.

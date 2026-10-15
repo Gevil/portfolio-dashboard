@@ -38,16 +38,25 @@ spaces **must be quoted** or systemd truncates them at the first space.
 Read credentials **inside the shell/python process** (see `skills/secrets-handling`), never echo them:
 ```bash
 set -a; . ./env.secrets; set +a
-for p in /health /api/portfolio /api/portfolio/history?range=1M /api/prices /api/history/ASML?range=1D \
+for p in /health /api/portfolio /api/portfolio/history?range=1M /api/portfolio/history?range=ALL \
+         /api/portfolio/performance?range=3M /api/portfolio/attribution?range=3M /api/portfolio/risk \
+         /api/policy /api/tax /api/events?days=60 \
+         /api/prices /api/history/ASML?range=1D \
          /api/config /api/alerts /api/lane-status /api/background /api/market-light /api/macro \
          /api/alert-rules /api/advice /api/scoreboard /api/jobs /api/worker-runs /api/forex/USD/EUR; do
-  printf '%-34s %s\n' "$p" "$(curl -s -o /dev/null -w '%{http_code}' -u "$DASHBOARD_USER:$DASHBOARD_PASS" "http://127.0.0.1:8601$p")"
+  printf '%-40s %s\n' "$p" "$(curl -s -o /dev/null -w '%{http_code}' -u "$DASHBOARD_USER:$DASHBOARD_PASS" "http://127.0.0.1:8601$p")"
 done
 curl -s -u "$DASHBOARD_USER:$DASHBOARD_PASS" http://127.0.0.1:8601/api/background | jq -r 'to_entries[]|"\(.key): running=\(.value.running) err=\(.value.errors)"'
 ```
 Payload shapes that health checks get wrong: `/api/lane-status` → `lane, serving_model, model, base_url,
-role, preference, candidates, budget`; `/api/background` values have no `ok` key (`running`/`errors`);
-`/api/portfolio` → `totals, positions[], benchmark, warnings[], fx`.
+role, preference, candidates (each with probedAt), probedAt, refreshing, budget` (served from cached probes);
+`/api/background` values have no `ok` key (`running`/`errors`); `/api/portfolio` → `totals, positions[], benchmark, warnings[], fx`;
+`/api/portfolio/history` → also `basis, perfBenchmark, indexed.perfBenchmark` (+ `invested, twr` with basis `lots`);
+`/api/portfolio/performance` → `range, basis, twrPct, xirrPct, perfBenchmarkId, perfBenchmarkPct, excessPct, startValueEur, endValueEur, netFlowsEur, asOf, warnings`;
+`/api/portfolio/attribution` → `range, positions[], fx`; `/api/portfolio/risk` → `asOf, exposures, volatility, beta, drawdown, correlation, concentration`;
+`/api/policy` → `configured, targets, current, drift[], maxSingleStock, contribution, trend[], asOf` (`configured: false` without `investmentPolicy`);
+`/api/tax` → `residency, lots[], ytd, warnings[]` (empty for a non-CZ residency); `/api/events` → `asOf, events[], warnings[]`.
+`/api/policy` and `/api/tax` answer 200 on a config without `investmentPolicy` or `taxResidency` (`configured: false` / empty `lots`).
 Also check `podman logs --since 3m portfolio-dashboard 2>&1 | grep -ciE 'error|traceback'` is 0.
 
 ## 4. Browser verification (UI changes)

@@ -21,8 +21,10 @@ Select a row on the Overview to open the detail pane next to the table.
 | Card | Content |
 |---|---|
 | **Position** | Shares, value, EUR cost basis, average cost per share, P/L (EUR and %), weight, day P/L, max drawdown. |
+| **Return attribution** | The holding's EUR return over a selectable range (1M … ALL) split into the local-currency return, the FX effect (against the holding's `exposureCurrency`) and the cross term; see [Overview](overview.md#performance-attribution-and-risk). Hidden when the holding has no attribution row. |
+| **Lots** | Shown for holdings with dated lots: each lot with its remaining shares, age and, for a `taxResidency: "CZ"` setup, the unlock date of the 3-year time test (purchase date + 3 years + 1 day) and whether it is exempt today. From `/api/tax`; see [Settings](settings.md#portfolio-policy-and-tax). |
 | **Valuation & signals** | P/E, forward P/E, dividend yield, ROE, sector/industry, analyst target and recommendation from the provider/fundamentals caches, with plain-language signals (e.g. "P/E very high", "Analysts target +24 % upside"). Data that cannot be sourced is shown as missing rather than guessed. |
 | **News & alerts** | Recent alerts and news for this ticker, with the rule that fired. |
-| **AI analysis** | *Quick / Standard / Deep* mode selector, **Analyse** button and the analysis history (rating, score, mode, one-line summary, price target). See [AI analysis and reports](analysis-and-reports.md). |
+| **AI analysis** | *Quick / Standard / Deep* mode selector, **Analyse** button and the analysis history (rating, score, mode, one-line summary, price target, the 20-day outperformance probability and expected excess when present, the event trigger of a deep digest run, and a tax note on a confirmed sell-family change). See [AI analysis and reports](analysis-and-reports.md). |
 
 On a phone the same content opens as a full-height drawer – see [Mobile and themes](mobile-and-themes.md).

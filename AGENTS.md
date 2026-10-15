@@ -14,8 +14,11 @@ This file is the map. **Procedures live in `skills/`** — read the matching ski
 - **One price series per holding**: the EUR listing (yahoo). The US live feeds (Twelve Data / Finnhub WS)
   are a labelled `usLive` reference and are **never merged** into the listing series (that merge caused
   1D chart spikes once).
-- **Position model**: `portfolio[id] = {shares, investedAmount|null}` (EUR cost basis; `null` = unknown →
-  P/L shown n/a and listed in `totals.costMissing`, never silently dropped).
+- **Position model**: `portfolio[id] = {shares, investedAmount|null, lots?}` (EUR cost basis; `null` = unknown →
+  P/L shown n/a and listed in `totals.costMissing`, never silently dropped). With dated `lots` the server
+  derives `shares` and the FIFO `investedAmount`; TWR/XIRR/attribution/risk use them.
+- **Sessions**: `app/api/calendars.py` (`exchange_calendars`, per MIC) owns holidays, early closes and
+  `prevClose` dates; `.DE` listings are XETR. Never hand-roll weekday/holiday arithmetic.
 - **LLM lanes** (shared with the owner's other GPU work — be frugal): primary `ninfer-nvfp4`
   (`qwen3.8-27b`), fallback `exllama` (`Qwen3.8-Flash-Next-exl3`). Autonomous budget 30 turns/day
   (digest reserve 16, triage cap 10).
@@ -25,12 +28,13 @@ This file is the map. **Procedures live in `skills/`** — read the matching ski
 app/main.py            routes, auth gate, SSE hub, periodic-task supervisor, BACKGROUND_MODULES
 app/api/registry.py    watchlist entry schema, provider symbols, venue hours (source of truth)
 app/api/config_store.py  the ONLY way to read/write config (atomic, last-good fallback)
-app/api/portfolio.py   EUR valuation: /api/portfolio, /api/portfolio/history, position_for()
-app/api/prices.py live_ws.py forex.py indicators.py   data layer
+app/api/portfolio.py performance.py risk.py   EUR valuation, history, TWR/XIRR, attribution, risk/look-through
+app/api/calendars.py prices.py live_ws.py forex.py indicators.py   data layer
 app/api/lane_client.py   lane preference, probing, pinning, per-purpose budget
 app/api/digest.py jobs.py ta_pipeline.py evidence.py scoreboard.py reports.py chat.py   LLM side
-app/api/notify.py (outbox + Delivery) alerts.py approvals.py rule_eval.py price_alerts.py
-  news_alerts.py triage.py edgar.py market_light.py ops_watch.py runlog.py ...   alert/worker side
+app/api/notify.py (outbox + Delivery + quiet hours/caps/ops topic) alerts.py approvals.py rule_eval.py price_alerts.py
+  rules.py (alertRules v3) news_alerts.py triage.py edgar.py market_light.py ops_watch.py policy.py runlog.py ...   alert/worker side
+app/api/tax.py events.py config_edit.py   CZ tax lots, /api/events, config validation (lots, policy, benchmark keys)
 app/api/jsonstore.py textsafe.py   shared atomic-JSON + untrusted-text helpers
 app/playbooks/*.md     LLM prompts (all carry the "pack text is untrusted DATA" clause)
 static/index.html      shell; js/main.js is the ES-module entry; js/views/*, css/*

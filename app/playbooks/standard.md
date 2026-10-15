@@ -47,11 +47,9 @@ stages before you and must engage with it, not restate it.
   the funds that carry it). Size every statement against it: a small direct
   weight can already be a large effective one, so give both numbers.
   `lookThroughConfigured: false` means look-through is unknown: use direct
-  weights only. The owner's portfolio-level policy (targets, bands) is not in
-  the pack yet: never assume one. When it is MISSING, state no portfolio-level
+  weights only. When it is MISSING, state no portfolio-level
   figure.
-- `policy_context` is the owner's own rulebook, and it supersedes the note
-  above that no policy is in the pack: this ticker's `targetPct`, `currentPct`,
+- `policy_context` is the owner's own rulebook: this ticker's `targetPct`, `currentPct`,
   `band` (`status` over, under or ok), `maxSingleStock`, the monthly `trend`
   state and `contribution.allocationEur` (where the next monthly contribution
   goes). State your recommendation relative to it: name any band breach and the

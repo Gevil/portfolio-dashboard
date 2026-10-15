@@ -15,14 +15,14 @@ alerts and push notifications, and a local-LLM analysis/digest pipeline.
 
 | Page | What it covers |
 |---|---|
-| [Overview and positions](features/overview.md) | Hero stats, "Needs attention", positions table / allocation donut, portfolio vs benchmark |
-| [Holding detail and charts](features/holding-detail.md) | Per-holding price chart, ranges, EMA / RSI overlays, position and valuation cards, AI analysis history |
-| [Alerts and notifications](features/alerts.md) | Alert center drawer, alert rules, push delivery with the durable outbox |
-| [Digest and scoreboard](features/digest-and-scoreboard.md) | Latest advice cards, failures, the scoreboard that grades past advice against realised returns |
-| [AI analysis and reports](features/analysis-and-reports.md) | Quick / standard / deep modes, the report viewer, evidence gaps |
-| [Market view](features/market.md) | Market light, macro (yield curve, CFTC COT), earnings, insider feed, short volume, filings |
-| [AI Ops](features/ai-ops.md) | GPU lane status and fallback, LLM budget, background workers, queue, approvals, triage, evidence pack |
-| [Settings and configuration](features/settings.md) | Watchlist, positions, alert rules, appearance; where the config lives and how it is protected |
+| [Overview and positions](features/overview.md) | Hero stats, "Needs attention", positions table / allocation donut, portfolio vs benchmark (1M … ALL), TWR / XIRR, FX attribution, risk and look-through exposure |
+| [Holding detail and charts](features/holding-detail.md) | Per-holding price chart, ranges, EMA / RSI overlays, position, attribution and lots cards, AI analysis history |
+| [Alerts and notifications](features/alerts.md) | Alert center drawer, σ-scaled alert rules, policy alerts, push delivery with the durable outbox, quiet hours, per-source caps, the ops topic and deep links |
+| [Digest and scoreboard](features/digest-and-scoreboard.md) | Trading-day digest with hysteresis, drafts and push policy, event-driven deep runs, advice cards, the v3 scoreboard (performance benchmark, Brier / BSS / IC, baselines) |
+| [AI analysis and reports](features/analysis-and-reports.md) | Quick / standard / deep modes, 20-day outperformance forecast, the report viewer, evidence pack (`portfolio_context`, `policy_context`, foreign private issuers) |
+| [Market view](features/market.md) | Market light, macro (yield curve, CFTC COT), earnings and events calendar, insider feed, short volume, filings |
+| [AI Ops](features/ai-ops.md) | GPU lane status (cached, `probedAt`) and fallback, LLM budget, background workers, notification policy, queue, approvals, triage, evidence pack |
+| [Settings and configuration](features/settings.md) | Watchlist, positions and dated lots, alert rules, performance benchmark, look-through, investment policy, Czech tax residency, appearance; where the config lives and how it is protected |
 | [Mobile and themes](features/mobile-and-themes.md) | Phone layout with the detail drawer, dark / light / system theme |
 | [Demo data and media](demo-data.md) | How these screenshots were produced and how to regenerate them |
 

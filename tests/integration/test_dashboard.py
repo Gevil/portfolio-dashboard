@@ -364,3 +364,190 @@ def test_mobile_no_overflow_and_hero_in_first_viewport(browser):
     page.wait_for_selector("[role=dialog] .dt-pane", timeout=15000)
     assert page.evaluate("document.documentElement.scrollWidth") <= MOBILE[0], "drawer causes overflow"
     page.close()
+
+
+# ---------------------------------------------------------------- wave 2: routes, status chip, panels
+#
+# DOM contract (static/js): #since-strip (#since-toggle aria-expanded, #since-dismiss, #since-body),
+# #attn-card > #attn-list > .attn-card (.attn-sev chip, .attn-open button, #attn-more), #perf-card
+# (#perf-range, #perf-bench-toggle, #perf-kpis, #perf-basis-warning + #perf-basis-fix), #risk-card
+# (#risk-toggle aria-expanded, #risk-body, .rk-correlation), #policy-card (.pl-drift | #policy-set-targets),
+# status bar #sb-data (quote-age chip) + #sb-sse (stream dot), detail cards .dt-advice / .dt-attr / .dt-lots.
+# Routes: #overview #digest #market #aiops #detail/<ID> #alerts #alerts/<id>; unknown -> #overview.
+
+def first_symbol(page):
+    return page.locator(".pos-row .pos-btn").first.get_attribute("data-symbol")
+
+
+def test_detail_route_opens_pane_and_close_restores_overview(browser):
+    page = open_overview(browser, DESKTOP)
+    sym = first_symbol(page)
+    page.goto(f"{BASE}/#detail/{sym}", wait_until="networkidle")
+    page.wait_for_selector(".ov-dock:not([hidden]) .dt-pane .dt-title", timeout=20000)
+    assert page.locator(f'.pos-row.is-selected[data-symbol="{sym}"]').count() == 1
+    page.click(".dt-close")
+    wait_js(page, "() => location.hash === '#overview'")
+    wait_js(page, "() => document.querySelector('.ov-dock').hidden")
+    page.close()
+
+
+def test_selecting_a_holding_writes_hash_and_back_closes_it(browser):
+    page = open_overview(browser, DESKTOP)
+    sym = first_symbol(page)
+    page.locator(".pos-row .pos-btn").first.click()
+    wait_js(page, f"() => location.hash === '#detail/{sym}'")
+    page.wait_for_selector(".ov-dock:not([hidden])", timeout=10000)
+    page.go_back()
+    wait_js(page, "() => !location.hash.startsWith('#detail/')")
+    wait_js(page, "() => document.querySelector('.ov-dock').hidden")
+    page.close()
+
+
+def test_unknown_hash_falls_back_to_overview(browser):
+    page = open_overview(browser, LAPTOP)
+    page.goto(f"{BASE}/#no-such-route", wait_until="networkidle")
+    page.wait_for_selector(".pos-row", timeout=30000)
+    wait_js(page, "() => location.hash === '#overview'")
+    assert page.evaluate("!document.getElementById('view-overview').hidden")
+    page.close()
+
+
+def test_alerts_route_opens_drawer_and_closing_restores_overview(browser):
+    page = open_overview(browser, LAPTOP)
+    page.goto(f"{BASE}/#alerts", wait_until="networkidle")
+    page.wait_for_selector("[role=dialog]:visible", timeout=15000)
+    page.keyboard.press("Escape")
+    wait_js(page, "() => location.hash === '#overview'")
+    assert not page.collector.errors, page.collector.errors
+    page.close()
+
+
+def test_quote_age_chip_states_and_separate_stream_dot(browser):
+    page = open_overview(browser, LAPTOP)
+    wait_js(page, "() => !/Data|Loading/.test(document.querySelector('#sb-data .sb-data-text').textContent)", timeout=20)
+    text = page.inner_text("#sb-data .sb-data-text")
+    assert re.fullmatch(r"Live · \d+s|Delayed ~15 min \(Yahoo EU\)|Stale · \d+ min|Closed · last .+|"
+                        r"Refresh failing · .+|No quotes yet", text), text
+    assert "\n" in (page.get_attribute("#sb-data", "title") or ""), "tooltip should list each holding"
+    assert (page.get_attribute("#sb-sse", "aria-label") or "").startswith("Live stream"), "stream dot missing"
+    page.close()
+
+
+def test_since_strip_collapses_and_dismisses(browser):
+    page = open_overview(browser, LAPTOP)
+    page.wait_for_selector("#since-strip", timeout=20000)
+    assert page.get_attribute("#since-toggle", "aria-expanded") == "true"
+    page.click("#since-toggle")
+    wait_js(page, "() => document.getElementById('since-body').hidden")
+    assert page.get_attribute("#since-toggle", "aria-expanded") == "false"
+    page.click("#since-toggle")
+    wait_js(page, "() => !document.getElementById('since-body').hidden")
+    page.click("#since-dismiss")
+    wait_js(page, "() => !document.getElementById('since-strip')")
+    page.close()
+
+
+def test_attention_cards_are_structured_and_capped_at_three(browser):
+    page = open_overview(browser, LAPTOP)
+    page.wait_for_selector("#attn-card", timeout=20000)
+    cards = page.locator("#attn-list .attn-card")
+    n = cards.count()
+    if n == 0:
+        assert "Nothing needs attention" in page.inner_text("#attn-card") or "Waiting" in page.inner_text("#attn-card")
+    else:
+        assert n <= 3 or page.locator("#attn-more").count() == 1
+        for i in range(n):
+            c = cards.nth(i)
+            assert c.locator(".attn-sev").count() == 1 and c.locator(".attn-open").count() == 1
+        if page.locator("#attn-more").count():
+            assert n == 3 and page.get_attribute("#attn-more", "aria-expanded") == "false"
+            page.click("#attn-more")
+            wait_js(page, "() => document.getElementById('attn-more').getAttribute('aria-expanded') === 'true'")
+            assert page.locator("#attn-list .attn-card").count() > 3
+    page.close()
+
+
+def test_performance_card_ranges_twr_xirr_and_basis_warning(browser):
+    _, perf = api("/api/portfolio/performance?range=ALL")
+    page = open_overview(browser, DESKTOP)
+    page.wait_for_selector("#perf-card", timeout=20000)
+    labels = page.locator("#perf-range button").all_inner_texts()
+    assert labels == ["1M", "3M", "6M", "1Y", "ALL"], labels
+    page.click('#perf-range button[data-range="ALL"]')
+    page.wait_for_selector("#perf-kpis", timeout=30000)
+    wait_js(page, "() => document.querySelector('#perf-range button[data-range=\"ALL\"]').getAttribute('aria-pressed') === 'true'")
+    kpis = page.inner_text("#perf-kpis")
+    assert "TWR" in kpis
+    assert ("XIRR" in kpis) == (perf.get("xirrPct") is not None), kpis
+    warn = page.locator("#perf-basis-warning")
+    if perf.get("basis") == "current_shares":
+        assert warn.count() == 1
+        assert "History applies today's share counts to the whole window" in warn.inner_text()
+        page.click("#perf-basis-fix")
+        page.wait_for_selector("[role=dialog]:visible", timeout=10000)
+    else:
+        assert warn.count() == 0
+    page.close()
+
+
+def test_risk_panel_collapses_and_policy_card_renders(browser):
+    _, policy = api("/api/policy")
+    page = open_overview(browser, DESKTOP)
+    page.wait_for_selector("#risk-card .rk-correlation, #risk-card .state", timeout=30000)
+    assert page.get_attribute("#risk-toggle", "aria-expanded") == "true"
+    page.click("#risk-toggle")
+    wait_js(page, "() => document.getElementById('risk-body').hidden")
+    assert page.get_attribute("#risk-toggle", "aria-expanded") == "false"
+    page.wait_for_selector("#policy-card .pl-drift, #policy-card #policy-set-targets", timeout=30000)
+    assert (page.locator("#policy-set-targets").count() == 1) == (not policy.get("configured")), policy.get("configured")
+    if not policy.get("configured"):
+        page.click("#policy-set-targets")
+        page.wait_for_selector("[role=dialog]:visible", timeout=10000)
+    page.close()
+
+
+def test_detail_attribution_lots_and_advice_blocks(browser):
+    page = open_overview(browser, DESKTOP)
+    sym = first_symbol(page)
+    _, cfg = api("/api/config")
+    _, advice = api("/api/advice")
+    page.locator(".pos-row .pos-btn").first.click()
+    page.wait_for_selector(".dt-pane .dt-attr:not([hidden]) .dt-body", timeout=20000)
+    wait_js(page, "() => !document.querySelector('.dt-attr .state-loading')", timeout=30)
+    attr_text = page.inner_text(".dt-attr")
+    _, attr = api("/api/portfolio/attribution?range=3M")
+    row = next(p for p in attr["positions"] if p["id"] == sym)
+    if row["exposureCurrency"] == "EUR":
+        assert "EUR asset, no FX effect" in attr_text
+    else:
+        assert "+ FX" in attr_text
+    has_lots = bool((cfg.get("portfolio", {}).get(sym) or {}).get("lots"))
+    assert (page.locator(".dt-lots:not([hidden])").count() == 1) == has_lots
+    if sym in advice:
+        pub = (advice[sym].get("published") or {}).get("rating") or advice[sym].get("rating")
+        assert pub in page.inner_text(".dt-advice")
+    else:
+        assert page.locator(".dt-advice:not([hidden])").count() == 0
+    page.close()
+
+
+def test_mobile_no_overflow_with_strip_cards_and_panels(browser):
+    page = open_overview(browser, MOBILE)
+    page.wait_for_selector("#risk-card", timeout=30000)
+    page.wait_for_selector("#policy-card", timeout=30000)
+    page.wait_for_timeout(1500)
+    assert page.evaluate("document.documentElement.scrollWidth") <= MOBILE[0], "horizontal overflow with new panels"
+    page.close()
+
+
+def test_alerts_id_route_focuses_the_row(browser):
+    _, alerts = api("/api/alerts?limit=200")
+    if not alerts["items"]:
+        pytest.skip("no alerts stored")
+    aid = alerts["items"][0]["id"]
+    page = open_overview(browser, LAPTOP)
+    page.goto(f"{BASE}/#alerts/{aid}", wait_until="networkidle")
+    page.wait_for_selector(f'li.ac-item[data-id="{aid}"].is-focus', timeout=15000)
+    page.keyboard.press("Escape")
+    wait_js(page, "() => location.hash === '#overview'")
+    page.close()

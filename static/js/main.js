@@ -7,6 +7,7 @@ import { markdown } from './markdown.js';
 import * as data from './data.js';
 import { initStatusBar } from './statusbar.js';
 import { mountOverview } from './views/overview.js';
+import { trackVisit } from './views/_since.js';
 
 const VIEWS = ['overview', 'digest', 'market', 'aiops'];
 const TITLES = { overview: 'Overview', digest: 'Digest', market: 'Market', aiops: 'AI Ops' };
@@ -87,18 +88,72 @@ async function applyView(view) {
   if (view !== 'overview') await mountSecondary(view);
 }
 
-function viewFromHash() {
-  const h = location.hash.replace(/^#\/?/, '');
-  return VIEWS.includes(h) ? h : 'overview';
+// ------------------------------------------------------------------ routes (C10)
+//   #overview | #digest | #market | #aiops      views
+//   #detail/<ID>                               overview with that holding selected
+//   #alerts | #alerts/<id>                     alert center drawer (optionally focused on a row)
+//   anything else                              overview
+// Selecting a holding writes #detail/<ID> (push when opening, replace when switching); closing restores
+// #overview (replace); browser Back from a pushed detail entry closes it via hashchange.
+
+function parseRoute(hash = location.hash) {
+  const raw = hash.replace(/^#\/?/, '');
+  if (VIEWS.includes(raw)) return { name: raw, view: raw };
+  const slash = raw.indexOf('/');
+  const head = slash < 0 ? raw : raw.slice(0, slash);
+  let arg = slash < 0 ? '' : raw.slice(slash + 1);
+  try { arg = decodeURIComponent(arg); } catch (_) { /* malformed escape: use the raw text */ }
+  if (head === 'detail' && arg) return { name: 'detail', view: 'overview', id: arg };
+  if (head === 'alerts') return { name: 'alerts', view: null, focusId: arg || null };
+  return { name: 'unknown', view: 'overview' };
 }
 
-function goView(view) {
-  if (location.hash.replace(/^#\/?/, '') !== view) location.hash = view; // hashchange applies it
-  else applyView(view);
+let routing = false; // true while a route is being applied: the selectedId subscriber must not write the hash back
+function setSelected(id) {
+  routing = true;
+  try { set('selectedId', id); } finally { routing = false; }
 }
 
-window.addEventListener('hashchange', () => applyView(viewFromHash()));
-subscribe('selectedId', id => { if (id && get('view') !== 'overview') goView('overview'); });
+async function applyRoute(route) {
+  if (route.name === 'alerts') {
+    if (!get('view')) await applyView('overview');
+    openAlerts(route.focusId);
+    return;
+  }
+  await applyView(route.view);
+  setSelected(route.name === 'detail' ? route.id : null);
+  if (route.name === 'unknown' && location.hash && location.hash !== '#overview') history.replaceState(null, '', '#overview');
+}
+
+function goHash(hash) {
+  if (location.hash.replace(/^#\/?/, '') !== hash) location.hash = hash; // hashchange applies it
+  else applyRoute(parseRoute());
+}
+const goView = goHash;
+
+window.addEventListener('hashchange', () => applyRoute(parseRoute()));
+
+subscribe('selectedId', id => {
+  if (routing) return;
+  const cur = parseRoute();
+  if (id) {
+    const target = '#detail/' + encodeURIComponent(id);
+    if (location.hash !== target) {
+      if (cur.name === 'detail') history.replaceState(null, '', target);
+      else history.pushState(null, '', target);
+    }
+    if (get('view') !== 'overview') applyView('overview');
+  } else if (cur.name === 'detail') {
+    history.replaceState(null, '', '#overview');
+  }
+});
+
+// Closing the alert drawer restores #overview (and the view that goes with it).
+subscribe('alertCenterOpen', open => {
+  if (open || parseRoute().name !== 'alerts') return;
+  history.replaceState(null, '', '#overview');
+  applyRoute(parseRoute());
+});
 
 // ------------------------------------------------------------------ lazy shell modules
 
@@ -120,10 +175,10 @@ async function ensureChat() {
   return chatLoading;
 }
 
-async function lazyCall(path, fn, what) {
+async function lazyCall(path, fn, what, ...args) {
   try {
     const mod = await import(path);
-    return mod[fn]();
+    return mod[fn](...args);
   } catch (e) {
     console.error(what + ' failed', e);
     toast(`${what} could not be opened: ${e.message || e}`, { type: 'error' });
@@ -131,18 +186,23 @@ async function lazyCall(path, fn, what) {
   }
 }
 
+function openAlerts(focusId) {
+  return lazyCall('./views/alertcenter.js', 'openAlertCenter', 'Alert center', { focusId: focusId || null });
+}
+
 initStatusBar({
   onView: goView,
   onSettings: () => lazyCall('./views/settings.js', 'openSettings', 'Settings'),
-  onAlerts: () => lazyCall('./views/alertcenter.js', 'openAlertCenter', 'Alert center'),
+  onAlerts: () => goHash('alerts'),
   onChat: async () => { const c = await ensureChat(); if (c) c.toggle(); },
   onLane: () => goView('aiops'),
 });
 
 // ------------------------------------------------------------------ data
 
+set('lastVisit', trackVisit()); // previous visit; the new one is written after 5 s of visible time
 mountOverview(sections.overview);
-applyView(viewFromHash());
+applyRoute(parseRoute());
 data.refreshAll();
 
 usePolling(data.refreshPortfolio, 30000);
@@ -150,6 +210,11 @@ usePolling(data.refreshPrices, 60000);
 usePolling(data.refreshAlerts, 60000);
 usePolling(data.refreshLane, 60000);
 usePolling(data.refreshMarketLight, 300000);
+usePolling(data.refreshAdvice, 300000);
+usePolling(data.refreshPolicy, 300000);
+usePolling(data.refreshEvents, 300000);
+usePolling(data.refreshAlertRules, 300000);
+usePolling(data.refreshRisk, 600000);
 
 // Live price events re-derive the portfolio server-side; throttle so a burst of ticks costs one request.
 let lastTickSeen = 0;

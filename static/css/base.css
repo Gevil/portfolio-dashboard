@@ -150,6 +150,13 @@ input[aria-invalid="true"], select[aria-invalid="true"] { border-color: var(--re
 .kv dt { font-family: var(--font-mono); font-size: var(--fs-xs); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
 .kv dd { margin: 2px 0 0; color: var(--ink); overflow-wrap: anywhere; }
 
+/* tables that may be wider than their card scroll inside it, never the page */
+.tbl-wrap { max-width: 100%; overflow-x: auto; }
+/* percentage bar; the fill width is set through CSSOM (strict CSP forbids style attributes) */
+.bar { display: block; min-width: 3rem; height: 0.4rem; margin-top: 2px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.bar-fill { display: block; height: 100%; background: var(--blue); }
+.bar-look .bar-fill { background: var(--accent); }
+
 /* panel states */
 .state { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3); border-radius: var(--radius); color: var(--ink-2); }
 .state-error { background: var(--red-soft); border: 1px solid var(--red); color: var(--ink); }

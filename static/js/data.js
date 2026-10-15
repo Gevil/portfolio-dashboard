@@ -30,12 +30,23 @@ export const refreshAlerts = loader('alerts', '/api/alerts?limit=100');
 export const refreshLane = loader('lane', '/api/lane-status');
 /** GET /api/market-light -> slot 'marketLight' */
 export const refreshMarketLight = loader('marketLight', '/api/market-light');
+/** GET /api/advice -> slot 'advice' ({ID: {published, pending, draft, p20, expExcess20Pct, benchmark, excerpt, ...}}) */
+export const refreshAdvice = loader('advice', '/api/advice');
+/** GET /api/policy -> slot 'policy' (C9: configured, targets, drift, maxSingleStock, contribution, trend) */
+export const refreshPolicy = loader('policy', '/api/policy');
+/** GET /api/events?days=30 -> slot 'events' ({events:[{date, kind, ticker, title, ...}]}) */
+export const refreshEvents = loader('events', '/api/events?days=30');
+/** GET /api/alert-rules -> slot 'alertRules' (effective v3 rules + sigma {id: {sigmaPct}}) */
+export const refreshAlertRules = loader('alertRules', '/api/alert-rules');
+/** GET /api/portfolio/risk -> slot 'risk' (C4: exposures, volatility, beta, drawdown, correlation, concentration) */
+export const refreshRisk = loader('risk', '/api/portfolio/risk', { timeoutMs: 30000 });
 
 /** Reload everything the shell shows (after a settings save, on manual refresh). */
 export function refreshAll() {
   return Promise.all([
     refreshPortfolio(), refreshPrices(), refreshConfig(), refreshWatchlist(),
     refreshAlerts(), refreshLane(), refreshMarketLight(),
+    refreshAdvice(), refreshPolicy(), refreshEvents(), refreshAlertRules(), refreshRisk(),
   ]);
 }
 

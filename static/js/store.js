@@ -1,10 +1,12 @@
 // Tiny pub/sub store. Keys used by the app:
-//   portfolio, prices, watchlist, config, alerts, lane, marketLight, history:
+//   portfolio, prices, watchlist, config, alerts, lane, marketLight, history,
+//   advice, policy, events, alertRules, risk:
 //        resource slots {data, error, status, ts, loading, stale}
 //        - data: last good payload (kept while a refresh fails; error then set too)
 //        - ts:   ms epoch of last successful load (null if never)
 //        - error: string|null of the LAST attempt
-//   selectedId  string|null   selected holding id (never auto-selected)
+//   selectedId  string|null   selected holding id (never auto-selected; main.js mirrors it to #detail/<ID>)
+//   lastVisit   number|null   ms epoch of the PREVIOUS visit (localStorage pd.lastVisit, read on load)
 //   view        'overview'|'digest'|'market'|'aiops'
 //   theme       'light'|'dark' effective; themePref 'system'|'light'|'dark'
 //   sse         {state:'connecting'|'live'|'down', lastTickTs:ms|null, lastEventTs:ms|null}

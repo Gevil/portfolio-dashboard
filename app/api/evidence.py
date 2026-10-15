@@ -1,13 +1,16 @@
 """Evidence pack: the only numbers the analysis spine is allowed to cite.
 
-``build_pack()`` assembles nine sections from the caches the shipped modules
+``build_pack()`` assembles ten sections from the caches the shipped modules
 already maintain — no new fetchers, no per-pack fan-out to the internet. That
 is the whole anti-fabrication argument in one object: the model is told that
 this pack is the extent of its knowledge, and every section either carries an
 ``as_of`` + ``source`` or is the literal string ``"MISSING"``. A section whose
 read fails degrades to ``"MISSING"`` and is named in the pack's top-level
 ``missing`` list, so the prompt (and the report's ``evidence_gaps``) can see
-exactly what was not known.
+exactly what was not known. Two things are NOT gaps and say so in words: a
+foreign private issuer has no Form 4 / 10-Q (``NOT_APPLICABLE (foreign private
+issuer)``), and a symbol whose FINRA volume is below the feed's floor reads
+``"insufficient volume"``; neither is listed in ``missing``.
 
 One deliberate exception to "caches only": the FRED liquidity series
 (``WALCL``/``WTREGEN``/``RRPONTSYD``/``SOFR``/``EFFR``/``DFEDTARU``). No shipped
@@ -22,14 +25,15 @@ import logging
 import math
 import time
 
-from app.api import (edgar, filings, fundamentals, indicators, jsonstore, macro,
-                     portfolio, prices, registry, shortvolume, textsafe, topnews)
+from app.api import (config_store, edgar, filings, fundamentals, indicators,
+                     jsonstore, macro, portfolio, prices, registry, shortvolume,
+                     textsafe, topnews)
 
 log = logging.getLogger("evidence")
 
 MISSING = "MISSING"
 SECTIONS = ("identity", "quote", "technicals", "news", "filings", "macro",
-            "fundamentals", "shortvolume", "position")
+            "fundamentals", "shortvolume", "position", "portfolio_context")
 
 NEWS_ITEMS = 12
 NEWS_HEADLINE_CHARS = 200
@@ -38,6 +42,13 @@ NEWS_CLOSE = "NEWS>>>"
 FILINGS_EVENTS = 15
 INSIDER_FILINGS = 10
 SHORT_ROWS = 10
+# Deliberate, explicit literals (see the module docstring): not data gaps.
+NOT_APPLICABLE_FPI = "NOT_APPLICABLE (foreign private issuer)"
+INSUFFICIENT_VOLUME = "insufficient volume"
+# Filing rows scanned per ticker; the newest FILINGS_EVENTS are shown, but the
+# scan is wider so a yearly 20-F / 10-K is not pushed out by weekly 6-Ks.
+FILINGS_SCAN = 200
+PERIODIC_FORMS = ("20-F", "40-F", "10-K", "10-Q")
 # See module docstring: the liquidity series the digest playbook needs.
 # ``DFEDTARU`` is the Fed funds target-range UPPER LIMIT — the reference the
 # playbook's repo-strain rule compares SOFR against. (The old id ``DFHT30`` was
@@ -205,10 +216,33 @@ async def _news(sym: str) -> dict | None:
     }
 
 
+def _filer_type(sym: str) -> str | None:
+    """``"fpi"`` / ``"domestic"`` / None: edgar's classification of the issuer's
+    submissions, else the newest annual form in the companyfacts cache
+    (a 20-F/40-F annual report = foreign private issuer). Cache-only."""
+    kind = edgar.filer_type(sym)
+    if kind is None:
+        data = fundamentals.cached(sym)
+        kind = data.get("filer") if isinstance(data, dict) else None
+    return kind if kind in ("fpi", "domestic") else None
+
+
 async def _filings(sym: str) -> dict | None:
-    insider = edgar.recent(sym) or []          # parsed Form 4 rows
-    events = filings.recent(sym, FILINGS_EVENTS) or []   # daily-index events
-    if not insider and not events:
+    kind = _filer_type(sym)
+    fpi = kind == "fpi"
+    # A foreign private issuer files no Form 4: not a gap, so not MISSING.
+    insider = [] if fpi else (edgar.recent(sym) or [])      # parsed Form 4 rows
+    scanned = filings.recent(sym, FILINGS_SCAN, include_evidence_only=True) or []
+    # Periodic reports edgar saw in the SEC submissions that the daily index
+    # did not carry (e.g. the latest 20-F / 10-K, filed before this app ran).
+    have = {(e.get("form"), e.get("filed")) for e in scanned}
+    extra = [{"form": p.get("form"), "filed": p.get("filed"),
+              "company": "", "source": "edgar-submissions"}
+             for p in edgar.periodic(sym) or []
+             if (p.get("form"), p.get("filed")) not in have]
+    every = sorted(scanned + extra, key=lambda e: str(e.get("filed") or ""),
+                   reverse=True)
+    if not insider and not every and not fpi:
         return None
     insider_rows = []
     for r in insider[:INSIDER_FILINGS]:
@@ -223,26 +257,42 @@ async def _filings(sym: str) -> dict | None:
                              "isOfficer": bool(r.get("isOfficer")),
                              "isDirector": bool(r.get("isDirector")),
                              "trades": trades})
-    # Filing metadata is third-party text too: cleaned, and no URLs forwarded.
-    event_rows = [{"form": textsafe.clean_text(e.get("form"), 20),
-                   "filed": e.get("filed"),
-                   "company": textsafe.clean_text(e.get("company"), 80),
-                   "source": textsafe.clean_text(e.get("source"), 40)}
-                  for e in events]
+
+    def event_row(e: dict) -> dict:
+        # Filing metadata is third-party text too: cleaned, no URLs forwarded.
+        return {"form": textsafe.clean_text(e.get("form"), 20),
+                "filed": e.get("filed"),
+                "company": textsafe.clean_text(e.get("company"), 80),
+                "source": textsafe.clean_text(e.get("source"), 40)}
+    event_rows = [event_row(e) for e in every[:FILINGS_EVENTS]]
+    latest_periodic = []
+    for form in PERIODIC_FORMS:                  # newest of each periodic report
+        row = next((e for e in every if e.get("form") == form), None)
+        if row is not None:
+            latest_periodic.append(event_row(row))
     buys = sum(1 for r in insider_rows for t in r["trades"] if t["code"] == "P")
     sells = sum(1 for r in insider_rows for t in r["trades"] if t["code"] == "S")
     newest = max([str(r.get("filed") or "") for r in insider_rows] +
                  [str(e.get("filed") or "") for e in event_rows] or [""])
     return {
-        "insiderFilings": len(insider_rows),
-        "openMarketBuys": buys,
-        "openMarketSells": sells,
-        "form4": insider_rows,
+        "filerType": ({"fpi": "foreign_private_issuer",
+                       "domestic": "domestic"}.get(kind, "unknown")),
+        "insiderFilings": None if fpi else len(insider_rows),
+        "openMarketBuys": None if fpi else buys,
+        "openMarketSells": None if fpi else sells,
+        "form4": NOT_APPLICABLE_FPI if fpi else insider_rows,
         "events": event_rows,
+        "latestPeriodic": latest_periodic,
+        "note": ("foreign private issuer: it files no Form 4 and no 10-Q, so "
+                 "insider-trade and quarterly statements are NOT_APPLICABLE; "
+                 "its 6-K / 20-F rows are filing metadata only (no text)"
+                 if fpi else ""),
         "as_of": newest or _iso_now(),
         "asOfBasis": "newest filing date in the retained windows",
-        "source": "edgar.recent (Form 4 primary documents) + filings.recent "
-                  "(SEC daily-index events)",
+        "source": "edgar.recent (Form 4 primary documents; none for foreign "
+                  "private issuers) + filings.recent (SEC daily-index events "
+                  "incl. 6-K/20-F/10-Q/10-K) + edgar.periodic (SEC submissions "
+                  "metadata)",
     }
 
 
@@ -308,23 +358,33 @@ async def _fundamentals(sym: str) -> dict | None:
     data = fundamentals.cached(sym)            # cache-only by design
     if not isinstance(data, dict) or not (data.get("annual") or []):
         return None
+
+    def present(value):
+        # A list/dict with content, or an explicit NOT_APPLICABLE literal.
+        return value if isinstance(value, str) or value else MISSING
     return {
         "cik": data.get("cik"),
         "currency": data.get("currency"),
+        "filer": data.get("filer"),
         "annual": data.get("annual") or [],
         "roe": data.get("roe") or [],
         "fcfNi": data.get("fcfNi") or [],
+        "quarterly": present(data.get("quarterly")),
+        "ttm": present(data.get("ttm")),
         "fetched": data.get("fetched"),
         "as_of": data.get("fetched") or _iso_now(),
         "source": "fundamentals.cached — SEC XBRL companyfacts cache "
-                  "(annual rows are FY period ends, not TTM)",
+                  "(annual rows are FY period ends; quarterly 10-Q rows and "
+                  "ttm = FY + YTD - prior YTD exist for US filers only, a "
+                  "foreign private issuer's are NOT_APPLICABLE)",
     }
 
 
-async def _shortvolume(sym: str) -> dict | None:
+async def _shortvolume(sym: str) -> dict | str | None:
     rows = shortvolume.series(sym)
     if not rows:
-        return None
+        # FINRA printed the symbol, but below the feed's volume floor: say so.
+        return INSUFFICIENT_VOLUME if shortvolume.insufficient(sym) else None
     latest = shortvolume.latest(sym) or {}
     return {
         "latest": {"date": latest.get("date"),
@@ -374,6 +434,124 @@ async def _position(sym: str) -> dict | None:
     }
 
 
+def performance_benchmark() -> dict:
+    """The benchmark the 20-day outperformance question is asked against:
+    config ``performanceBenchmark`` (a watchlist id), else the role benchmark.
+    -> ``{id, label, kind: total_return|price, configured}`` (``id`` None when
+    nothing resolves). Config is read raw via ``config_store``."""
+    raw = config_store.read().get("performanceBenchmark")
+    ident = str(raw or "").strip().upper()
+    entry = registry.get(ident) if ident else None
+    configured = entry is not None
+    if entry is None:
+        bid = registry.benchmark_id()
+        entry = registry.get(bid) if bid else None
+    if entry is None:
+        return {"id": None, "label": None, "kind": None, "configured": False}
+    return {"id": entry["id"], "label": entry.get("label") or entry["id"],
+            "kind": "price" if entry.get("kind") == "index" else "total_return",
+            "configured": configured}
+
+
+def _finite(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _exposure_currency(cfg: dict, ident: str) -> str:
+    """Underlying currency of an id: config ``exposureCurrency``, else the
+    listing currency, else EUR."""
+    raw = cfg.get("exposureCurrency")
+    val = raw.get(ident) if isinstance(raw, dict) else None
+    if isinstance(val, str) and val.strip():
+        return val.strip().upper()
+    return (registry.listing_currency(ident) or registry.quote_currency(ident)
+            or "EUR")
+
+
+async def _portfolio_context(sym: str) -> dict | None:
+    """How big this ticker is in the WHOLE portfolio: every priced holding's
+    weight, direct and look-through exposure, currency exposure, top-2
+    concentration. Look-through of an id = its direct weight + sum over held
+    funds of (fund weight x the fund's % in that id) / 100, from the owner's
+    config ``lookThrough`` (read raw: this module does not import risk.py)."""
+    snap = await portfolio.snapshot()
+    rows = [r for r in ((snap or {}).get("positions") or [])
+            if _finite(r.get("weightPct")) is not None]
+    if not rows:
+        return None
+    cfg = config_store.read()
+    direct = {str(r["id"]).upper(): _finite(r["weightPct"]) for r in rows}
+
+    funds: dict[str, dict] = {}
+    raw_lt = cfg.get("lookThrough")
+    for fund, block in (raw_lt.items() if isinstance(raw_lt, dict) else []):
+        weights = block.get("weights") if isinstance(block, dict) else None
+        clean = {str(k).upper(): w for k, v in (weights or {}).items()
+                 if (w := _finite(v)) is not None and w >= 0
+                 and str(k).upper() != str(fund).upper()}
+        if clean:
+            funds[str(fund).upper()] = {"weights": clean,
+                                        "asOf": block.get("asOf"),
+                                        "source": block.get("source")}
+    look = dict(direct)
+    for fund, f in funds.items():
+        held = direct.get(fund, 0.0)
+        for ident, pct in f["weights"].items():
+            if held:
+                look[ident] = look.get(ident, 0.0) + held * pct / 100.0
+
+    by_ccy: dict[str, float] = {}
+    for ident, weight in direct.items():
+        ccy = _exposure_currency(cfg, ident)
+        by_ccy[ccy] = by_ccy.get(ccy, 0.0) + weight
+    ranked = sorted(direct.items(), key=lambda kv: kv[1], reverse=True)
+    top2 = ranked[:2]
+    via = [{"fund": fund, "fundWeightPct": round(direct[fund], 2),
+            "holdsPct": f["weights"][sym],
+            "contributionPct": round(direct[fund] * f["weights"][sym] / 100.0, 2)}
+           for fund, f in funds.items() if fund in direct and sym in f["weights"]]
+    stamps = [r.get("priceAsOf") for r in rows if r.get("priceAsOf")]
+    return {
+        "performanceBenchmark": performance_benchmark(),
+        "weightsPct": {i: round(w, 2) for i, w in ranked},
+        "exposure": {
+            "lookThroughPct": {i: round(w, 2) for i, w in
+                               sorted(look.items(), key=lambda kv: kv[1],
+                                      reverse=True)},
+            "byCurrencyPct": {c: round(w, 2) for c, w in
+                              sorted(by_ccy.items(), key=lambda kv: kv[1],
+                                     reverse=True)},
+        },
+        "concentration": {"top2Pct": round(sum(w for _, w in top2), 2),
+                          "top2Ids": [i for i, _ in top2],
+                          "largestId": ranked[0][0],
+                          "largestPct": round(ranked[0][1], 2)},
+        "subject": {"id": sym,
+                    "directPct": round(direct.get(sym, 0.0), 2),
+                    "lookThroughPct": round(look.get(sym, 0.0), 2),
+                    "viaFunds": via},
+        "lookThroughConfigured": bool(funds),
+        "lookThroughSources": {f: {"asOf": v["asOf"], "source": v["source"]}
+                               for f, v in funds.items()},
+        "notes": ["weights are shares of the PRICED portfolio value; size "
+                  "statements are made against them",
+                  "look-through exposure comes from the owner's own fund "
+                  "holdings table (config lookThrough) as of its asOf date",
+                  "the owner's portfolio-level policy, if configured, comes "
+                  "in wave 2"],
+        "as_of": _iso(max(stamps)) if stamps else _iso_now(),
+        "source": "portfolio.snapshot (EUR weights of priced holdings) + "
+                  "config lookThrough / exposureCurrency / performanceBenchmark "
+                  "(read raw via config_store)",
+    }
+
+
 _BUILDERS = {
     "identity": _identity,
     "quote": _quote,
@@ -384,6 +562,7 @@ _BUILDERS = {
     "fundamentals": _fundamentals,
     "shortvolume": _shortvolume,
     "position": _position,
+    "portfolio_context": _portfolio_context,
 }
 
 
@@ -391,8 +570,11 @@ async def build_pack(symbol: str) -> dict:
     """Assemble the evidence pack for one ticker. NEVER raises.
 
     Sections are exactly ``SECTIONS``; each is an object carrying ``as_of`` +
-    ``source``, or the literal ``"MISSING"``. ``missing`` names the latter so a
-    prompt can state the gaps instead of papering over them.
+    ``source``, or the literal ``"MISSING"`` (``missing`` names those so a
+    prompt can state the gaps instead of papering over them), or - only for
+    ``filings.form4``/``fundamentals`` quarterly+ttm/``shortvolume`` - the
+    explicit not-applicable / ``insufficient volume`` literals. The pack also
+    carries ``performance_benchmark`` ({id, label, kind, configured}).
     """
     sym = (symbol or "").upper().strip()
     pack: dict = {"symbol": sym, "generated_at": _iso_now()}
@@ -408,4 +590,12 @@ async def build_pack(symbol: str) -> dict:
             missing.append(name)
         pack[name] = value
     pack["missing"] = missing
+    # Named at the top level too: the section above is MISSING for an empty
+    # portfolio, but the 20-day probability question still needs its benchmark.
+    try:
+        pack["performance_benchmark"] = performance_benchmark()
+    except Exception as e:
+        log.warning("%s: performance benchmark unresolved: %s", sym, e)
+        pack["performance_benchmark"] = {"id": None, "label": None, "kind": None,
+                                         "configured": False}
     return pack

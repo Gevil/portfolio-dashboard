@@ -17,8 +17,11 @@ TotalVolume|Market`` and carry fractional share volumes (weighted averages).
 short-exempt volume is reported separately and is not added.
 
 Only watchlist symbols are kept, newest ``max_series`` trading days each.
-Rows whose total volume is under ``min_total`` are dropped as noise: ASML's
-US-listed ADR prints ~0.3M shares/day and is therefore absent by design.
+Rows whose total volume is under ``min_total`` are dropped from the series as
+noise (ASML's US-listed ADR prints ~0.3M shares/day), but the newest dropped
+row is remembered per symbol (``low_volume``) so the evidence pack can say
+"insufficient volume" instead of reporting a feed that never existed
+(``insufficient``).
 
 Daily pass at 22:30 local (``TZ=Europe/Prague``). FINRA stamps the day's file
 around 21:18 UTC = 23:18 CET, so a pass ingests the newest *published* file;
@@ -174,12 +177,15 @@ async def _day_rows(day: datetime.date,
 
 
 def _merge(have: dict[str, list], rows: dict[str, dict],
-           min_total: float, cap: int) -> int:
-    """Fold one day's rows into the per-symbol series; -> symbols kept."""
+           min_total: float, cap: int, low: dict | None = None) -> int:
+    """Fold one day's rows into the per-symbol series; -> symbols kept.
+    ``low`` collects the newest below-``min_total`` row per symbol."""
     kept = 0
     for sym, row in rows.items():
         if row["total"] < min_total:
             _stats["low_total_skips"] += 1
+            if low is not None and row["date"] >= (low.get(sym) or {}).get("date", ""):
+                low[sym] = {"date": row["date"], "total": int(round(row["total"]))}
             continue
         entry = {"date": row["date"],
                  "ratio": round(row["short"] / row["total"], 6),
@@ -188,6 +194,8 @@ def _merge(have: dict[str, list], rows: dict[str, dict],
         series.append(entry)
         series.sort(key=lambda r: r.get("date", ""))
         have[sym] = series[-cap:]
+        if low is not None and (low.get(sym) or {}).get("date", "") <= row["date"]:
+            low.pop(sym, None)           # a liquid print supersedes an older thin one
         kept += 1
     return kept
 
@@ -204,6 +212,9 @@ async def refresh() -> dict:
                              in (store.get("symbols") or {}).items()
                              if isinstance(v, list)}
     seen: set[str] = set(store.get("seen_dates") or [])
+    low: dict[str, dict] = {str(k): dict(v) for k, v
+                            in (store.get("low_volume") or {}).items()
+                            if isinstance(v, dict)}
     cap = max(1, int(conf["max_series"]))
     # How many more dated rows the thinnest series still needs (backfill).
     need = max(1, cap - max((len(v) for v in have.values()), default=0))
@@ -222,13 +233,14 @@ async def refresh() -> dict:
                 log.debug("shortvolume: %s not published yet", day)
             else:
                 seen.add(day.isoformat())
-                hits += _merge(have, rows, min_total, cap)
+                hits += _merge(have, rows, min_total, cap, low)
         day -= datetime.timedelta(days=1)
         steps += 1
 
     store = {"updated": datetime.datetime.now().isoformat(timespec="seconds"),
              "seen_dates": sorted(seen)[-MAX_SEEN_DATES:],
-             "symbols": {s: rows[-cap:] for s, rows in have.items()}}
+             "symbols": {s: rows[-cap:] for s, rows in have.items()},
+             "low_volume": {s: v for s, v in low.items() if s in symbols}}
     if not jsonstore.save(SERIES_FILE, store):
         log.warning("shortvolume series not persisted; pass will repeat")
     _stats["last_run"] = time.time()
@@ -270,6 +282,19 @@ def series(symbol: str) -> list[dict]:
 def latest(symbol: str) -> dict | None:
     rows = series(symbol)
     return rows[-1] if rows else None
+
+
+def insufficient(symbol: str) -> dict | None:
+    """``{date, total, minTotal}`` when FINRA printed this symbol but every
+    row was below ``min_total`` (so there is no series); None otherwise."""
+    sym = symbol.upper()
+    if series(sym):
+        return None
+    rec = (_store().get("low_volume") or {}).get(sym)
+    if not isinstance(rec, dict):
+        return None
+    return {"date": rec.get("date"), "total": rec.get("total"),
+            "minTotal": int(float(cfg()["min_total"]))}
 
 
 def mean_ratio(symbol: str, window: int = 20) -> float | None:

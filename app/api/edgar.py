@@ -10,9 +10,12 @@ Live-verified endpoint set (see the P4 endpoint report):
 - SEC policy: declared ``User-Agent`` (app name + admin contact, never a
   browser string), ``Accept-Encoding: gzip, deflate``, <= 10 req/s.
 
-Scope: US registrants only. ASML is a foreign private issuer (6-K/20-F, no
-Form 4 - insider deals go to the Dutch AFM), so the insider feed is gated per
-issuer by the presence of ``4`` filings. Enabled with ``EDGAR_ENABLED=1``.
+Scope: US registrants only for alerts. ASML is a foreign private issuer
+(6-K/20-F, no Form 4 - insider deals go to the Dutch AFM), so the insider feed
+is gated per issuer by the presence of ``4`` filings. 6-K / 20-F / 10-Q / 10-K
+rows are NEVER alerted on (ASML files a 6-K for every weekly buyback): they are
+only remembered, with the issuer's filer type, for the analysis evidence pack
+(``filer_type`` / ``periodic``). Enabled with ``EDGAR_ENABLED=1``.
 
 Alerts: one push per FILING (its notable trades grouped): Form 4 open-market
 sale (code S) or purchase (code P) above a dollar threshold -> ntfy priority
@@ -42,6 +45,7 @@ DATA_DIR = pathlib.Path(os.getenv("HISTORY_DIR", "/app/data"))
 SEEN_FILE = DATA_DIR / "edgar_seen.json"
 RECENT_FILE = DATA_DIR / "insider_recent.json"
 TICKER_CACHE = DATA_DIR / "edgar_tickers.json"
+FILER_FILE = DATA_DIR / "edgar_filers.json"
 SEC_UA = os.getenv("SEC_USER_AGENT",
                    "portfolio-dashboard (set SEC_USER_AGENT with a contact email)")
 SEC_HEADERS = {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}
@@ -54,6 +58,14 @@ REQ_DELAY_S = 0.15
 MAX_ALERT_TRADE_LINES = 8
 # Fallback map if company_tickers.json is unreachable.
 BUILTIN_CIK = {"NVDA": 1045810}
+# Annual forms that tell a foreign private issuer (20-F/40-F) from a US filer
+# (10-K); the newest one in the submissions decides.
+FPI_ANNUAL_FORMS = frozenset({"20-F", "20-F/A", "40-F", "40-F/A"})
+DOMESTIC_ANNUAL_FORMS = frozenset({"10-K", "10-K/A"})
+# Periodic reports kept (newest first, metadata only) for the evidence pack.
+PERIODIC_FORMS = ("6-K", "20-F", "40-F", "10-Q", "10-K")
+PERIODIC_KEEP = 8
+FILER_FPI, FILER_DOMESTIC = "fpi", "domestic"
 
 _client: httpx.AsyncClient | None = None
 _task: asyncio.Task | None = None
@@ -211,6 +223,61 @@ def parse_form4(xml_text: str) -> dict:
     return out
 
 
+def classify_filer(sub: dict) -> str | None:
+    """``"fpi"`` / ``"domestic"`` from the NEWEST annual report form in a
+    submissions body (20-F/40-F vs 10-K); None when it lists neither."""
+    rows = _recent_records(sub, tuple(FPI_ANNUAL_FORMS | DOMESTIC_ANNUAL_FORMS))
+    if not rows:
+        return None
+    newest = max(rows, key=lambda r: r["date"])
+    return FILER_FPI if newest["form"] in FPI_ANNUAL_FORMS else FILER_DOMESTIC
+
+
+def periodic_rows(sub: dict) -> list[dict]:
+    """Newest ``PERIODIC_KEEP`` 6-K/20-F/40-F/10-Q/10-K rows as
+    ``{form, filed, acc}`` (metadata only: the documents are never read)."""
+    rows = sorted(_recent_records(sub, PERIODIC_FORMS),
+                  key=lambda r: r["date"], reverse=True)[:PERIODIC_KEEP]
+    return [{"form": r["form"], "filed": r["date"], "acc": r["acc"]}
+            for r in rows]
+
+
+def _filer_store() -> dict:
+    data = jsonstore.load(FILER_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _remember_filer(sym: str, sub: dict) -> None:
+    """Record the issuer's filer type and periodic rows from a submissions
+    body. Never alerts; a body that classifies nothing keeps the old type."""
+    kind, periodic = classify_filer(sub), periodic_rows(sub)
+    if kind is None and not periodic:
+        return
+    store = _filer_store()
+    old = store.get(sym.upper()) if isinstance(store.get(sym.upper()), dict) else {}
+    entry = {"type": kind or old.get("type"), "periodic": periodic,
+             "checked": time.strftime("%Y-%m-%d", time.gmtime())}
+    if store.get(sym.upper()) != entry:
+        store[sym.upper()] = entry
+        if not jsonstore.save(FILER_FILE, store):
+            log.warning("edgar filer-type write failed for %s", sym)
+
+
+def filer_type(symbol: str) -> str | None:
+    """Cache-only: ``"fpi"`` | ``"domestic"`` | None (not seen yet)."""
+    entry = _filer_store().get((symbol or "").upper())
+    kind = entry.get("type") if isinstance(entry, dict) else None
+    return kind if kind in (FILER_FPI, FILER_DOMESTIC) else None
+
+
+def periodic(symbol: str) -> list[dict]:
+    """Cache-only: the issuer's newest periodic-report rows (see
+    ``periodic_rows``), newest first."""
+    entry = _filer_store().get((symbol or "").upper())
+    rows = entry.get("periodic") if isinstance(entry, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
 def _store_recent(parsed: dict) -> None:
     """Keep the parsed filing for the UI; a retried filing replaces itself."""
     recent = jsonstore.load(RECENT_FILE, [])
@@ -331,6 +398,7 @@ async def run_once() -> None:
         sub = await _submissions(cik, sym)
         if sub is None:
             continue
+        _remember_filer(sym, sub)
         for rec in _recent_records(sub, ("4", "8-K")):
             if rec["date"] < cutoff:
                 continue
@@ -372,6 +440,7 @@ async def _seed_seen() -> None:
         sub = await _submissions(cik, sym)
         if sub is None:
             continue
+        _remember_filer(sym, sub)
         fetched += 1
         for rec in _recent_records(sub, ("4", "8-K")):
             if rec["date"] >= cutoff:

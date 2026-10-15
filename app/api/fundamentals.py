@@ -26,6 +26,13 @@ USD would be a ~15% error. USD is preferred when present.
 
 A weekly warm pass keeps the cache hot for the analysis evidence pack (which
 reads caches only, never the network).
+
+Quarterly (10-Q) facts and trailing-twelve-month figures exist for US filers
+only: the quarterly revenue/net-income rows (Q4 derived as FY - 9-month YTD,
+flagged ``derived``), the quarter-end balance sheet, and ``ttm`` = latest FY +
+current YTD - prior-year YTD per flow concept. A foreign private issuer (its
+newest annual form is a 20-F/40-F) files no 10-Q: ``quarterly`` and ``ttm`` are
+then the literal ``NOT_APPLICABLE (foreign private issuer)``, never MISSING.
 """
 import asyncio
 import datetime
@@ -79,12 +86,19 @@ CONCEPTS = {
 # Balance-sheet concepts carry no ``start``.
 INSTANT = frozenset({"ltDebt", "assets", "equity"})
 ANNUAL_FORMS = frozenset({"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"})
+QUARTERLY_FORMS = frozenset({"10-Q", "10-Q/A"})
+FPI_FORMS = frozenset({"20-F", "20-F/A", "40-F", "40-F/A"})
+DOMESTIC_FORMS = frozenset({"10-K", "10-K/A"})
+NOT_APPLICABLE_FPI = "NOT_APPLICABLE (foreign private issuer)"
+# Duration facts that are summed/derived across periods.
+FLOW_FIELDS = ("revenue", "ni", "ocf", "capex")
 
 DEFAULTS = {
     "ttl_days": 7,
     "years": 8,
     "warm_interval_days": 7,
     "warm_start_delay_s": 90,
+    "quarters": 6,
 }
 
 _client: httpx.AsyncClient | None = None
@@ -254,10 +268,151 @@ def _near(mapping: dict[str, float], end: str,
     return mapping.get(best_key) if best_key else None
 
 
+def filer_type(us_gaap: dict) -> str | None:
+    """``"fpi"`` | ``"domestic"`` | None: the kind of annual report (20-F/40-F
+    vs 10-K) in the NEWEST filing that reported any extracted concept."""
+    best_filed, best = "", None
+    for names in CONCEPTS.values():
+        for name in names:
+            for entries in ((us_gaap.get(name) or {}).get("units") or {}).values():
+                for entry in entries:
+                    form = entry.get("form")
+                    kind = ("fpi" if form in FPI_FORMS else
+                            "domestic" if form in DOMESTIC_FORMS else None)
+                    filed = str(entry.get("filed", ""))
+                    if kind and filed >= best_filed:
+                        best_filed, best = filed, kind
+    return best
+
+
+def _flow_values(us_gaap: dict, names: tuple[str, ...], unit: str,
+                 forms: frozenset) -> dict[tuple[str, str], float]:
+    """(start, end) -> value of the duration facts reported on ``forms``: the
+    preferred concept that reports a period wins, the latest filing wins
+    within a concept."""
+    out: dict[tuple[str, str], float] = {}
+    for name in names:
+        got: dict[tuple[str, str], tuple[str, float]] = {}
+        for entry in ((us_gaap.get(name) or {}).get("units") or {}).get(unit) or []:
+            val = entry.get("val")
+            if (entry.get("form") not in forms or isinstance(val, bool)
+                    or not isinstance(val, (int, float))
+                    or _date(entry.get("start")) is None
+                    or _date(entry.get("end")) is None):
+                continue
+            key = (str(entry["start"]), str(entry["end"]))
+            filed = str(entry.get("filed", ""))
+            if key not in got or filed > got[key][0]:
+                got[key] = (filed, float(val))
+        for key, (_, val) in got.items():
+            out.setdefault(key, val)
+    return out
+
+
+def _days(key: tuple[str, str]) -> int:
+    return (_date(key[1]) - _date(key[0])).days
+
+
+def _gap(a: str, b: str) -> int:
+    return abs((_date(a) - _date(b)).days)
+
+
+def _ttm_value(fy: dict, ytd: dict) -> tuple[float, str] | None:
+    """TTM = latest FY + current YTD - prior-year YTD -> (value, period end).
+
+    The current YTD must start right after that FY ends and its prior-year
+    twin (same length, one year earlier) must be reported too - otherwise
+    the figure is unavailable, never an approximation. With no 10-Q after the
+    FY the TTM is the FY itself."""
+    fy = {k: v for k, v in fy.items() if 300 <= _days(k) <= 400}
+    if not fy:
+        return None
+    fy_key = max(fy, key=lambda k: k[1])
+    after = [k for k in ytd if k[1] > fy_key[1] and 60 <= _days(k) <= 290
+             and _gap(k[0], fy_key[1]) <= 6]
+    if not after:
+        return fy[fy_key], fy_key[1]
+    cur = max(after, key=lambda k: (k[1], _days(k)))
+    twins = [k for k in ytd if _gap(k[1], cur[1]) in range(358, 373)
+             and abs(_days(k) - _days(cur)) <= 7]
+    if not twins:
+        return None
+    prior = min(twins, key=lambda k: abs(_days(k) - _days(cur)))
+    return fy[fy_key] + ytd[cur] - ytd[prior], cur[1]
+
+
+def extract_ttm(us_gaap: dict, unit: str) -> dict | None:
+    """``{periodEnd, revenue, ni, ocf, capex, fcf}`` trailing twelve months
+    (None per field when it cannot be built exactly; None when nothing can)."""
+    out: dict = {}
+    ends: list[str] = []
+    for field in FLOW_FIELDS:
+        names = CONCEPTS[field]
+        got = _ttm_value(_flow_values(us_gaap, names, unit, ANNUAL_FORMS),
+                         _flow_values(us_gaap, names, unit, QUARTERLY_FORMS))
+        out[field] = got[0] if got else None
+        if got:
+            ends.append(got[1])
+    if not ends:
+        return None
+    ocf, capex = out["ocf"], out["capex"]
+    out["fcf"] = ocf - abs(capex) if ocf is not None and capex is not None else None
+    out["periodEnd"] = max(ends)
+    return out
+
+
+def extract_quarterly(us_gaap: dict, unit: str, quarters: int) -> list[dict]:
+    """Newest ``quarters`` fiscal quarters, oldest first:
+    ``{end, fy, revenue, ni, assets, equity, ltDebt, derived}``.
+
+    Revenue/net income are the 3-month facts of the 10-Qs; a Q4 (which has no
+    10-Q) is FY - 9-month YTD and flagged ``derived``. The balance-sheet
+    items are the quarter-end instants of the 10-Q."""
+    rows: dict[str, dict] = {}
+    for field in ("revenue", "ni"):
+        names = CONCEPTS[field]
+        quarterly = _flow_values(us_gaap, names, unit, QUARTERLY_FORMS)
+        annual = _flow_values(us_gaap, names, unit, ANNUAL_FORMS)
+        for key, val in quarterly.items():
+            if 80 <= _days(key) <= 100:
+                rows.setdefault(key[1], {"derived": False})[field] = val
+        for key, val in annual.items():
+            if not 300 <= _days(key) <= 400:
+                continue
+            nine = [k for k in quarterly if 255 <= _days(k) <= 290
+                    and _gap(k[0], key[0]) <= 6]
+            if nine:
+                row = rows.setdefault(key[1], {"derived": True})
+                if row["derived"]:
+                    row[field] = val - quarterly[max(nine)]
+    instants = {}
+    for field in ("assets", "equity", "ltDebt"):
+        vals: dict[str, float] = {}
+        for name in CONCEPTS[field]:
+            for entry in ((us_gaap.get(name) or {}).get("units") or {}).get(unit) or []:
+                val = entry.get("val")
+                if (entry.get("form") in QUARTERLY_FORMS and not entry.get("start")
+                        and _date(entry.get("end")) is not None
+                        and isinstance(val, (int, float))
+                        and not isinstance(val, bool)):
+                    vals.setdefault(str(entry["end"]), float(val))
+        instants[field] = vals
+    out = []
+    for end in sorted(rows)[-max(1, quarters):]:
+        row = rows[end]
+        out.append({"end": end, "fy": int(end[:4]),
+                    "revenue": row.get("revenue"), "ni": row.get("ni"),
+                    **{f: _near(instants[f], end) for f in instants},
+                    "derived": row["derived"]})
+    return out
+
+
 def extract(us_gaap: dict, years: int) -> dict:
-    """Annual rows + ROE / FCF-NI series from a trimmed companyfacts body."""
+    """Annual rows + ROE / FCF-NI series, and for US filers the quarterly rows
+    and TTM, from a trimmed companyfacts body."""
     unit = _currency(us_gaap)
-    empty = {"currency": unit, "annual": [], "roe": [], "fcfNi": []}
+    empty = {"currency": unit, "annual": [], "roe": [], "fcfNi": [],
+             "filer": None, "quarterly": [], "ttm": None}
     if not unit:
         return empty
     vals = {field: _field_values(us_gaap, names, unit, field in INSTANT)
@@ -285,13 +440,21 @@ def extract(us_gaap: dict, years: int) -> dict:
             if isinstance(ni, (int, float)) and ni:
                 fcf_ni.append({"fy": row["fy"],
                                "value": round(fcf / ni, 3)})
-    return {"currency": unit, "annual": rows, "roe": roe, "fcfNi": fcf_ni}
+    filer = filer_type(us_gaap)
+    if filer == "fpi":
+        quarterly = ttm = NOT_APPLICABLE_FPI          # no 10-Q exists: not a gap
+    else:
+        quarterly = extract_quarterly(us_gaap, unit, int(cfg()["quarters"]))
+        ttm = extract_ttm(us_gaap, unit)
+    return {"currency": unit, "annual": rows, "roe": roe, "fcfNi": fcf_ni,
+            "filer": filer, "quarterly": quarterly, "ttm": ttm}
 
 
 def _payload(symbol: str, cik: int | None, cache: dict | None,
              note: str = "") -> dict:
     body = {"symbol": symbol.upper(), "cik": cik, "currency": None,
-            "annual": [], "roe": [], "fcfNi": [], "fetched": None}
+            "annual": [], "roe": [], "fcfNi": [], "fetched": None,
+            "filer": None, "quarterly": [], "ttm": None}
     if isinstance(cache, dict):
         part = extract(cache.get("units") or {}, int(cfg()["years"]))
         body.update(part)

@@ -1,6 +1,7 @@
 """evidence: untrusted news is cleaned, capped and framed; the position section
 is the EUR position (weight, unrealized return, cost-basis flag); the
-portfolio_context section does the look-through math; a foreign private
+portfolio_context section does the look-through math; policy_context is the
+owner's rulebook for the ticker (MISSING without policy, lots and residency); a foreign private
 issuer's filings/insider/quarterly data are NOT_APPLICABLE (never MISSING); a
 failing section degrades to MISSING instead of raising."""
 import asyncio
@@ -194,6 +195,115 @@ def test_performance_benchmark_config_then_role_benchmark(monkeypatch):
     fake_config(monkeypatch, {"performanceBenchmark": "NOPE"})   # unknown id: role benchmark
     assert evidence.performance_benchmark()["id"] == "GSPC"
     assert evidence.performance_benchmark()["configured"] is False
+
+
+# ------------------------------------------------------------ policy_context
+
+POLICY_PAYLOAD = {
+    "configured": True, "targets": {"ASML": 30, "NVDA": 20},
+    "current": {"ASML": 38.2, "NVDA": 10.0},
+    "drift": [{"id": "ASML", "targetPct": 30, "currentPct": 38.2, "bandLoPct": 22.5,
+               "bandHiPct": 37.5, "status": "over"},
+              {"id": "NVDA", "targetPct": 20, "currentPct": 10.0, "bandLoPct": 15.0,
+               "bandHiPct": 25.0, "status": "under"}],
+    "maxSingleStock": {"limitPct": 35, "breaches": ["ASML"]},
+    "contribution": {"amountEur": 300.0, "allocation": {"ASML": 0.0, "NVDA": 300.0}},
+    "trend": [{"id": "ASML", "monthEnd": "2026-09-30", "close": 120.0, "sma10m": 102.0,
+               "state": "above", "changed": True}],
+    "warnings": [], "asOf": "2026-10-15T18:00:00"}
+TAX_STATUS = {"taxable": True, "youngestLotDate": "2025-09-01", "unlockDate": "2028-09-02",
+              "exemptShares": 1.0, "taxableShares": 2.0, "residency": "CZ", "lotsKnown": True}
+LOTS = [{"date": "2025-09-01", "shares": 3.0, "priceEur": 100.0, "feesEur": 0.0, "side": "buy"}]
+
+
+def fake_policy(monkeypatch, payload=POLICY_PAYLOAD):
+    calls = {"payload": 0, "tax": []}
+
+    async def pay():
+        calls["payload"] += 1
+        return payload
+
+    def status(ident, shares=None):
+        calls["tax"].append((ident, shares))
+        return dict(TAX_STATUS)
+    monkeypatch.setattr(evidence.policy, "policy_payload", pay)
+    monkeypatch.setattr(evidence.tax, "sell_tax_status", status)
+    return calls
+
+
+def test_policy_context_carries_this_tickers_rulebook_and_the_whole_position_tax_status(monkeypatch):
+    calls = fake_policy(monkeypatch)
+    fake_config(monkeypatch, {"investmentPolicy": {"targets": {"ASML": 30}},
+                              "taxResidency": "CZ", "portfolio": {"ASML": {"lots": LOTS}}})
+    ctx = asyncio.run(evidence._policy_context("ASML"))
+    assert ctx["configured"] is True and ctx["taxResidency"] == "CZ"
+    assert ctx["targetPct"] == 30 and ctx["currentPct"] == 38.2
+    assert ctx["band"] == {"loPct": 22.5, "hiPct": 37.5, "status": "over"}
+    assert ctx["maxSingleStock"] == {"limitPct": 35, "breached": True}
+    assert ctx["trend"] == {"monthEnd": "2026-09-30", "close": 120.0, "sma10m": 102.0,
+                            "state": "above", "changed": True}
+    assert ctx["contribution"] == {"amountEur": 300.0, "allocationEur": 0.0}
+    assert ctx["tax"] == TAX_STATUS and calls["tax"] == [("ASML", None)]   # whole position
+    assert ctx["as_of"] == "2026-10-15T18:00:00"
+    assert "policy.policy_payload" in ctx["source"] and "tax.sell_tax_status" in ctx["source"]
+    assert any("lotsKnown false" in n for n in ctx["notes"])
+
+
+def test_policy_context_routes_the_contribution_to_the_underweight_ticker(monkeypatch):
+    fake_policy(monkeypatch)
+    fake_config(monkeypatch, {"investmentPolicy": {"targets": {"ASML": 30}}})
+    ctx = asyncio.run(evidence._policy_context("NVDA"))
+    assert ctx["band"]["status"] == "under" and ctx["maxSingleStock"]["breached"] is False
+    assert ctx["contribution"]["allocationEur"] == 300.0 and ctx["trend"] is None
+    assert "tax" not in ctx                                   # no residency configured
+
+
+def test_policy_context_for_a_ticker_without_a_target(monkeypatch):
+    fake_policy(monkeypatch)
+    fake_config(monkeypatch, {"investmentPolicy": {"targets": {"ASML": 30}}, "taxResidency": "DE"})
+    ctx = asyncio.run(evidence._policy_context("SXR8"))
+    assert ctx["targetPct"] is None and ctx["currentPct"] is None and ctx["band"] is None
+    assert ctx["contribution"]["allocationEur"] is None
+    assert "tax" not in ctx and ctx["taxResidency"] == "DE"   # the 3-year rule is Czech
+
+
+def test_policy_context_without_a_policy_still_reports_the_tax_status(monkeypatch):
+    calls = fake_policy(monkeypatch)
+    fake_config(monkeypatch, {"taxResidency": "cz", "portfolio": {"ASML": {"lots": LOTS}}})
+    ctx = asyncio.run(evidence._policy_context("ASML"))
+    assert ctx["configured"] is False and ctx["tax"] == TAX_STATUS
+    assert "band" not in ctx and "targetPct" not in ctx and calls["payload"] == 0
+    assert any("no investmentPolicy" in n for n in ctx["notes"])
+    assert ctx["as_of"] and "tax.sell_tax_status" in ctx["source"]
+
+
+def test_policy_context_is_missing_without_policy_lots_and_residency(monkeypatch):
+    calls = fake_policy(monkeypatch)
+    fake_config(monkeypatch, {})
+    assert asyncio.run(evidence._policy_context("ASML")) is None
+    # another ticker's lots, an empty policy and an empty residency do not count
+    fake_config(monkeypatch, {"investmentPolicy": {}, "taxResidency": " ",
+                              "portfolio": {"NVDA": {"lots": LOTS}, "ASML": {"shares": 1.0}}})
+    assert asyncio.run(evidence._policy_context("ASML")) is None
+    assert calls["payload"] == 0 and calls["tax"] == []
+
+
+def test_a_failing_policy_section_degrades_to_missing_in_the_pack(monkeypatch):
+    async def ok(sym):
+        return {"as_of": "t", "source": "s"}
+
+    async def boom():
+        raise RuntimeError("snapshot down")
+    for name in evidence.SECTIONS:
+        monkeypatch.setitem(evidence._BUILDERS, name, ok)
+    monkeypatch.setitem(evidence._BUILDERS, "policy_context", evidence._policy_context)
+    monkeypatch.setattr(evidence.policy, "policy_payload", boom)
+    fake_config(monkeypatch, {"investmentPolicy": {"targets": {"ASML": 100}}})
+    monkeypatch.setattr(evidence, "performance_benchmark",
+                        lambda: {"id": None, "label": None, "kind": None, "configured": False})
+    pack = asyncio.run(evidence.build_pack("ASML"))
+    assert pack["policy_context"] == "MISSING" and pack["missing"] == ["policy_context"]
+    assert pack["quote"] == {"as_of": "t", "source": "s"}
 
 
 # ------------------------------------------------- filings: FPI vs US filer

@@ -27,6 +27,7 @@ from app.api import (evidence, filings, fundamentals, lane_client, rule_eval,
                      shortvolume)
 from app.api import jsonstore, market_light, notify, ops_watch, price_alerts, runlog
 from app.api import approvals, jobs, ta_pipeline, triage
+from app.api import policy, tax as tax_mod
 
 # Background workers absorbed from retired sidecar containers/timers.
 # Every module here implements start()/async stop()/status(). One that is
@@ -34,7 +35,8 @@ from app.api import approvals, jobs, ta_pipeline, triage
 # exactly that way (their endpoints kept answering from stale files).
 BACKGROUND_MODULES = [notify, kb_sync, news_alerts, jobs, digest, scoreboard_mod,
                       edgar, macro, shortvolume, filings, fundamentals,
-                      rule_eval, market_light, triage, ops_watch, price_alerts]
+                      rule_eval, market_light, triage, ops_watch, price_alerts,
+                      policy]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -458,6 +460,19 @@ async def get_portfolio_risk():
     return JSONResponse(await risk_mod.risk())
 
 
+@app.get("/api/policy")
+async def get_policy():
+    """Drift vs targets and bands, single-stock cap, contribution routing and
+    the monthly trend filter (configured: false without investmentPolicy)."""
+    return JSONResponse(await policy.policy_payload())
+
+
+@app.get("/api/tax")
+async def get_tax():
+    """Czech time-test lots, FIFO matching and YTD gross sale proceeds in CZK."""
+    return JSONResponse(await tax_mod.tax_payload())
+
+
 @app.get("/api/advice")
 async def get_advice():
     """Latest tracked LLM advice per ticker (digest module state)."""
@@ -524,6 +539,17 @@ async def get_macro():
 async def get_earnings():
     """Next earnings dates for the watchlist (Nasdaq calendar cache)."""
     return JSONResponse({"ok": True, "earnings": await macro.earnings()})
+
+
+from app.api import events as events_mod
+
+
+@app.get("/api/events")
+async def get_events(days: int = Query(60)):
+    """Upcoming earnings, dividends, central-bank dates, CPI and market
+    closures; ``days`` is clamped to 1..365 and a failing source only adds a
+    ``warnings`` entry."""
+    return JSONResponse(await events_mod.build(days))
 
 
 app.include_router(shortvolume.router)   # GET /api/shortvolume/{symbol}

@@ -1,6 +1,6 @@
 """Evidence pack: the only numbers the analysis spine is allowed to cite.
 
-``build_pack()`` assembles ten sections from the caches the shipped modules
+``build_pack()`` assembles eleven sections from the caches the shipped modules
 already maintain — no new fetchers, no per-pack fan-out to the internet. That
 is the whole anti-fabrication argument in one object: the model is told that
 this pack is the extent of its knowledge, and every section either carries an
@@ -26,14 +26,15 @@ import math
 import time
 
 from app.api import (config_store, edgar, filings, fundamentals, indicators,
-                     jsonstore, macro, portfolio, prices, registry, shortvolume,
-                     textsafe, topnews)
+                     jsonstore, macro, policy, portfolio, prices, registry,
+                     shortvolume, tax, textsafe, topnews)
 
 log = logging.getLogger("evidence")
 
 MISSING = "MISSING"
 SECTIONS = ("identity", "quote", "technicals", "news", "filings", "macro",
-            "fundamentals", "shortvolume", "position", "portfolio_context")
+            "fundamentals", "shortvolume", "position", "portfolio_context",
+            "policy_context")
 
 NEWS_ITEMS = 12
 NEWS_HEADLINE_CHARS = 200
@@ -552,6 +553,68 @@ async def _portfolio_context(sym: str) -> dict | None:
     }
 
 
+async def _policy_context(sym: str) -> dict | None:
+    """The owner's own rulebook as it applies to THIS ticker, from
+    ``policy.policy_payload()`` (target, current weight, band status,
+    max-single-stock status, month-end trend state, next-contribution
+    allocation) and, with ``taxResidency`` CZ, ``tax.sell_tax_status`` for the
+    whole position. None (MISSING) when there is no ``investmentPolicy``, no
+    lots for this ticker and no residency. Policy keys are absent without an
+    ``investmentPolicy``; the ``tax`` key is absent without residency CZ."""
+    cfg = config_store.read()
+    raw_policy = cfg.get("investmentPolicy")
+    configured = isinstance(raw_policy, dict) and bool(raw_policy)
+    raw_res = cfg.get("taxResidency")
+    residency = raw_res.strip().upper() if isinstance(raw_res, str) and raw_res.strip() else None
+    positions = cfg.get("portfolio")
+    pos = positions.get(sym) if isinstance(positions, dict) else None
+    has_lots = isinstance(pos, dict) and bool(pos.get("lots"))
+    if not (configured or has_lots or residency):
+        return None
+    out: dict = {"configured": configured, "taxResidency": residency}
+    notes = []
+    as_of = _iso_now()
+    sources = []
+    if configured:
+        pay = await policy.policy_payload()
+        drift = next((r for r in pay["drift"] if r["id"] == sym), None)
+        trend = next((r for r in pay["trend"] if r["id"] == sym), None)
+        limit = pay["maxSingleStock"]["limitPct"]
+        alloc = pay["contribution"]["allocation"]
+        out.update({
+            "targetPct": pay["targets"].get(sym),
+            "currentPct": pay["current"].get(sym),
+            "band": ({"loPct": drift["bandLoPct"], "hiPct": drift["bandHiPct"],
+                      "status": drift["status"]} if drift else None),
+            "maxSingleStock": {"limitPct": limit,
+                               "breached": sym in pay["maxSingleStock"]["breaches"]},
+            "trend": ({k: trend[k] for k in ("monthEnd", "close", "sma10m", "state",
+                                              "changed")} if trend else None),
+            "contribution": {"amountEur": pay["contribution"]["amountEur"],
+                             "allocationEur": alloc.get(sym)},
+        })
+        as_of = pay.get("asOf") or as_of
+        sources.append("policy.policy_payload (portfolio.snapshot weights vs config "
+                       "investmentPolicy; month-end SMA10 from prices.daily_closes)")
+        notes += ["currentPct is this ticker's share of the PRICED portfolio value",
+                  "band.status over/under = outside the owner's rebalancing band; "
+                  "contribution.allocationEur is where the next monthly contribution "
+                  "goes (no selling); a null band/targetPct means no target for this ticker",
+                  "trend is null when trendFilter is off or the history is too short"]
+    else:
+        notes.append("no investmentPolicy configured: state no target, band or "
+                     "contribution figure")
+    if residency == tax.RESIDENCY_CZ:
+        out["tax"] = tax.sell_tax_status(sym)
+        sources.append("tax.sell_tax_status (config lots, FIFO)")
+        notes.append("tax: taxable true = a full sale touches a lot younger than 3 "
+                     "years (FIFO); lotsKnown false = no dated lots, taxability unknown; "
+                     "informational, not tax advice")
+    out.update(notes=notes, as_of=as_of, source=" + ".join(sources) or
+               "config (investmentPolicy / lots / taxResidency read via config_store)")
+    return out
+
+
 _BUILDERS = {
     "identity": _identity,
     "quote": _quote,
@@ -563,6 +626,7 @@ _BUILDERS = {
     "shortvolume": _shortvolume,
     "position": _position,
     "portfolio_context": _portfolio_context,
+    "policy_context": _policy_context,
 }
 
 

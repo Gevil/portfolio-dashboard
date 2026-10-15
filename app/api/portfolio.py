@@ -155,6 +155,7 @@ async def _build_snapshot() -> dict:
                "dayPnlEur": None, "dayPct": None, "mddPct": None,
                "priceAsOf": None, "priceSource": None, "stale": None}
         q = q if isinstance(q, dict) else {}
+        row["prevCloseSource"] = q.get("prevCloseSource")
         price = _num(q.get("price"))
         if shares is None or price is None or price <= 0:
             no_price.append(pid)

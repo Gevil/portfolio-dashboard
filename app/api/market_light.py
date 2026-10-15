@@ -153,7 +153,7 @@ async def _holdings_trend(symbols: list[str], c: dict) -> dict:
     pct = 100.0 * above / total
     return {"available": True, "label": label, "period": period,
             "above": above, "total": total, "pct": round(pct, 1),
-            "detail": f"{above}/{total} {label} ({pct:.0f}%)"}
+            "detail": f"{above} of {total} holdings above MA{period} ({pct:.0f}%)"}
 
 
 def _dim_index(closes: list[float], c: dict) -> dict:

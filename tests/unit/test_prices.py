@@ -545,6 +545,7 @@ def test_price_item_carries_listing_currency_and_labelled_us_reference(monkeypat
     item = run(prices._price_item("ASML"))
     assert item["price"] == 1850.0 and item["priceCurrency"] == "EUR"
     assert item["previousClose"] == 1800.0 and item["change24h"] == 2.78
+    assert "prevCloseSource" in item
     assert item["usLive"]["currency"] == "USD" and item["usLive"]["price"] == 2010.0
     assert item["price"] != item["usLive"]["price"]       # never merged
     assert "status" not in item

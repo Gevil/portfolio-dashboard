@@ -1049,6 +1049,7 @@ async def _price_item(ticker: str) -> dict:
         "ticker": ticker,
         "price": q["price"],
         "previousClose": q["prevClose"],
+        "prevCloseSource": q.get("prevCloseSource"),
         "change24h": q["changePct"],
         "change": q["change"],
         "priceCurrency": q["currency"],

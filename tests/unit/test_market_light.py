@@ -74,7 +74,7 @@ def test_payload_dims_are_index_and_momentum_only(ml):
 def test_holdings_trend_is_labelled_and_informational(ml):
     t = snap()["holdingsTrend"]
     assert t["label"] == "your holdings above MA20" and t["period"] == 20
-    assert "0/3 your holdings above MA20 (0%)" == t["detail"]
+    assert "0 of 3 holdings above MA20 (0%)" == t["detail"]
 
 
 def test_too_few_holdings_leave_trend_unavailable_but_status_untouched(ml):

@@ -20,6 +20,7 @@ from app.api import kb_sync, news_alerts, digest
 from app.api import indicators as indicators_mod, rules as rules_mod
 from app.api import config_edit, config_store, registry
 from app.api import portfolio as portfolio_mod
+from app.api import risk as risk_mod
 from app.api import scoreboard as scoreboard_mod
 from app.api import edgar, macro
 from app.api import (evidence, filings, fundamentals, lane_client, rule_eval,
@@ -418,15 +419,43 @@ async def get_portfolio():
     return JSONResponse(await portfolio_mod.snapshot())
 
 
+def _bad_range(rng: str):
+    """400 body for a range outside ``portfolio.HISTORY_RANGES`` (else None)."""
+    if rng in portfolio_mod.HISTORY_RANGES:
+        return None
+    return JSONResponse(
+        {"error": "range must be one of "
+                  + ", ".join(portfolio_mod.HISTORY_RANGES)},
+        status_code=400)
+
+
 @app.get("/api/portfolio/history")
 async def get_portfolio_history(range: str = Query("3M")):
     rng = range.upper()
-    if rng not in portfolio_mod.HISTORY_RANGES:
-        return JSONResponse(
-            {"error": "range must be one of "
-                      + ", ".join(portfolio_mod.HISTORY_RANGES)},
-            status_code=400)
-    return JSONResponse(await portfolio_mod.history(rng))
+    return _bad_range(rng) or JSONResponse(await portfolio_mod.history(rng))
+
+
+@app.get("/api/portfolio/performance")
+async def get_portfolio_performance(range: str = Query("3M")):
+    """TWR, XIRR and the excess over the performance benchmark."""
+    rng = range.upper()
+    return _bad_range(rng) or JSONResponse(
+        await portfolio_mod.performance_summary(rng))
+
+
+@app.get("/api/portfolio/attribution")
+async def get_portfolio_attribution(range: str = Query("3M")):
+    """Per-holding EUR return split into local, FX and cross terms."""
+    rng = range.upper()
+    return _bad_range(rng) or JSONResponse(
+        await portfolio_mod.attribution(rng))
+
+
+@app.get("/api/portfolio/risk")
+async def get_portfolio_risk():
+    """Exposures (direct / look-through / currency), volatility, beta,
+    drawdown, correlation and concentration."""
+    return JSONResponse(await risk_mod.risk())
 
 
 @app.get("/api/advice")

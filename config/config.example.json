@@ -104,6 +104,22 @@
       "investedAmount": null
     }
   },
+  "performanceBenchmark": "SXR8",
+  "exposureCurrency": {
+    "ASML": "EUR",
+    "NVDA": "USD",
+    "SXR8": "USD"
+  },
+  "lookThrough": {
+    "SXR8": {
+      "asOf": "2026-10-14",
+      "source": "Slickcharts S&P 500 weights",
+      "weights": {
+        "NVDA": 7.64
+      }
+    }
+  },
+  "taxResidency": null,
   "alertRules": {
     "version": 2,
     "default": {

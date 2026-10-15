@@ -1,10 +1,13 @@
 """EUR-native portfolio valuation (replaces analytics.py).
 
 Position model (config ``portfolio[id] = {"shares": float,
-"investedAmount": float | None}``): ``investedAmount`` is the EUR cost basis,
-``None`` = unknown. Each holding is valued at ``shares x`` the quote of its
-single EUR listing (``prices.listing_quote``) - the same series the chart
-uses. The US live feeds are a separate reference and are never mixed in.
+"investedAmount": float | None, "lots": [...]}``): ``investedAmount`` is the
+EUR cost basis, ``None`` = unknown. ``lots`` (optional, validated and
+reflected into ``shares`` / ``investedAmount`` by ``config_edit``) are dated
+buys/sells that drive the history basis (``performance``). Each holding is
+valued at ``shares x`` the quote of its single EUR listing
+(``prices.listing_quote``) - the same series the chart uses. The US live
+feeds are a separate reference and are never mixed in.
 
 Rules:
 
@@ -27,12 +30,13 @@ import datetime
 import logging
 import time
 
-from app.api import config_store, forex, prices, registry
+from app.api import config_store, forex, performance, prices, registry
 
 log = logging.getLogger(__name__)
 
-HISTORY_RANGES = ("1M", "3M", "6M", "1Y")
-_RANGE_DAYS = {"1M": 31, "3M": 92, "6M": 183, "1Y": 366}
+HISTORY_RANGES = performance.RANGES
+BASIS_LOTS = "lots"
+BASIS_CURRENT = "current_shares"
 MDD_RANGE = "1Y"
 CACHE_TTL_S = 30.0
 
@@ -45,12 +49,8 @@ def _r(value, nd: int = 2):
     return None if value is None else round(float(value), nd)
 
 
-def _num(value) -> float | None:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    return v if v == v and abs(v) != float("inf") else None
+_num = performance.num
+_day_ts = performance.day_ts
 
 
 async def _safe(coro, what: str):
@@ -75,14 +75,9 @@ def _max_drawdown_pct(closes: list[float]) -> float | None:
     return worst * 100.0
 
 
-def _day(t) -> str:
-    return datetime.datetime.fromtimestamp(
-        float(t), datetime.timezone.utc).date().isoformat()
-
-
-def _day_ts(day: str) -> int:
-    return int(datetime.datetime.fromisoformat(day).replace(
-        tzinfo=datetime.timezone.utc).timestamp())
+def _pct(fraction) -> float | None:
+    """Fraction -> percent rounded for the payload (None stays None)."""
+    return None if fraction is None else _r(fraction * 100.0)
 
 
 def _holdings() -> tuple[list[dict], dict, list[str]]:
@@ -325,41 +320,6 @@ def position_for(id: str) -> dict | None:
 
 # ---------------------------------------------------------------- history
 
-def _by_day(bars, factor_for_day=None) -> dict[str, float]:
-    """{iso_day: last close of that UTC day}; ascending input. With
-    ``factor_for_day`` each close is converted (days without a rate are
-    dropped)."""
-    out: dict[str, float] = {}
-    for b in sorted((b for b in bars or [] if isinstance(b, dict)),
-                    key=lambda b: _num(b.get("t")) or 0):
-        t, c = _num(b.get("t")), _num(b.get("c"))
-        if t is None or c is None or c <= 0:
-            continue
-        day = _day(t)
-        if factor_for_day is not None:
-            f = factor_for_day(day)
-            if f is None:
-                continue
-            c = c * f
-        out[day] = c
-    return out
-
-
-def _carry(series: dict[str, float], days: list[str]) -> dict[str, float]:
-    """Carry the last known value forward over ``days`` (ascending); days
-    before the series' first value stay absent."""
-    out, last = {}, None
-    idx = sorted(series)
-    j = 0
-    for d in days:
-        while j < len(idx) and idx[j] <= d:
-            last = series[idx[j]]
-            j += 1
-        if last is not None:
-            out[d] = last
-    return out
-
-
 def _indexed(series: dict[str, float], start: str) -> list[dict]:
     base = series.get(start)
     if not base:
@@ -368,60 +328,112 @@ def _indexed(series: dict[str, float], start: str) -> list[dict]:
             for d, v in sorted(series.items()) if d >= start]
 
 
-async def history(range_key: str = "3M") -> dict:
-    """Portfolio value vs benchmark over ``range_key`` (1M|3M|6M|1Y).
+def _indexed_all(pv: dict[str, float], others: dict[str, dict]) -> dict:
+    """Rebase the portfolio and every non-empty series of ``others`` to 0 % at
+    the first date present in ALL of them; each is then aligned on the union
+    of their days (from that date) with last-value carry-forward. Empty
+    series stay ``[]``."""
+    out = {"portfolio": [], **{k: [] for k in others}}
+    live = {k: s for k, s in others.items() if s}
+    if not pv or not live:
+        return out
+    common = sorted(set(pv).intersection(*live.values()))
+    if not common:
+        return out
+    axis = sorted(d for d in set(pv).union(*live.values()) if d >= common[0])
+    out["portfolio"] = _indexed(performance.carry(pv, axis), common[0])
+    for k, s in live.items():
+        out[k] = _indexed(performance.carry(s, axis), common[0])
+    return out
 
-    Method (daily closes, UTC days):
 
-    * Holdings: current ``shares`` x the daily close of the holding's EUR
-      listing. There is no purchase history, so today's share counts are
-      applied to the whole window (a "what the current book was worth"
-      series, not a transaction-accurate one).
-    * Axis: union of the holdings' trading days, starting at the first day on
-      which EVERY holding has a close (no back-filled prices); a holding that
-      did not trade on a given day (other exchange holiday) carries its
-      previous close forward. A holding with no bars at all is left out and
-      reported in ``warnings`` (``history_missing``).
-    * ``investedEur`` is the constant EUR cost basis, or None when any
-      included holding has no cost basis (a partial cost would not be
-      comparable with the full value).
-    * Benchmark: daily closes of the index (USD) converted to EUR with the
-      ECB rate of the same day (``forex.daily_rates``, last earlier rate on
-      days without one) - the owner holds an unhedged USD S&P ETF, so the
-      EUR-converted index is the fair comparison. Days without any rate are
-      dropped; no rate at all -> empty benchmark + ``fx_missing`` warning.
-    * ``indexed`` rebases both series to 0 % at the first date present in
-      both; both are then aligned on the union of their days (from that date)
-      with last-value carry-forward.
+def _perf_benchmark_id(cfg: dict, by_id: dict, default_id: str | None,
+                       warnings: list[dict]) -> str | None:
+    """``performanceBenchmark`` when it is on the watchlist, else the role
+    benchmark (a configured-but-unknown id is reported, never guessed)."""
+    want = cfg.get("performanceBenchmark")
+    if isinstance(want, str) and want.strip():
+        want = want.strip().upper()
+        if want in by_id:
+            return want
+        _warn(warnings, "perf_benchmark_unknown",
+              f"performanceBenchmark {want} is not on the watchlist; "
+              f"using {default_id}", [want])
+    return default_id
+
+
+async def model(range_key: str = "3M") -> dict:
+    """Everything the history / performance / attribution / risk views share
+    for ``range_key`` (1M|3M|6M|1Y|ALL); raises ValueError on a bad range.
+
+    Method (daily closes, UTC days, EUR):
+
+    * Holdings: the daily close of the holding's EUR listing
+      (``performance.fetch_rows``: listing bars up to 1Y, ``prices.daily_closes``
+      for ALL). A holding with no bars at all is left out and reported in
+      ``warnings`` (``history_missing``).
+    * ``basis`` ``"lots"`` (every included holding has dated lots): shares
+      held on each day come from the lots (trade-date accounting), the axis
+      starts on the first day with a positive value and a close for every
+      held holding, and external flows / TWR / net invested are computed.
+      Otherwise ``"current_shares"``: today's share counts are applied to the
+      whole window, the axis starts on the first day on which EVERY holding
+      has a close, and warning ``history_basis_current_shares`` lists the
+      holdings without dated lots. Days a holding did not trade (other
+      exchange holiday) carry its previous close forward.
+    * ``cost`` is the constant EUR cost basis of the book, or None when any
+      included holding has no cost basis.
+    * Benchmarks: ``bench`` is the role benchmark, ``perf`` the performance
+      benchmark (``performanceBenchmark``, default the role benchmark; kind
+      ``total_return`` for an ETF, else ``price``). Both are converted to EUR
+      with the ECB rate of the same day (``forex.daily_rates``, last earlier
+      rate on days without one); days without any rate are dropped, no rate
+      at all -> empty series + ``fx_missing`` warning.
+    * ``twr`` is the cumulative time-weighted return of the book as
+      ``[(day, fraction)]`` for both bases (without lots there are no flows,
+      so it is the value index).
     """
     rng = range_key.upper()
     if rng not in HISTORY_RANGES:
         raise ValueError(f"range must be one of {', '.join(HISTORY_RANGES)}")
     entries, portfolio, _ = _holdings()
+    cfg = config_store.read()
+    by_id = {e["id"]: e for e in registry.entries()}
     bench_id = registry.benchmark_id()
-    bench_entry = next((e for e in registry.entries()
-                        if e["id"] == bench_id), None) if bench_id else None
-    days = _RANGE_DAYS[rng] + 10          # buffer so day 1 has a rate
-
-    fx_t = _safe(forex.daily_rates(days), "daily rates")
-    bar_t = [_safe(prices.listing_bars(e["id"], rng), f"bars {e['id']}")
-             for e in entries]
-    bench_t = (_safe(prices.listing_bars(bench_id, rng), "benchmark bars")
-               if bench_id else asyncio.sleep(0, result=None))
-    rates, bench_bars, bars = await asyncio.gather(
-        fx_t, bench_t, asyncio.gather(*bar_t))
-    rates = rates if isinstance(rates, dict) else {}
-
-    def usd_factor(day: str) -> float | None:
-        return _num(forex.rate_on(rates, day)) if rates else None
-
     warnings: list[dict] = []
+    perf_id = _perf_benchmark_id(cfg, by_id, bench_id, warnings)
+
+    lots_by_id = {e["id"]: performance.clean_lots(portfolio[e["id"]])
+                  for e in entries}
+    first_lot = min((lot["date"] for lots in lots_by_id.values()
+                     for lot in lots), default=None)
+    if rng != "ALL":
+        days = performance.RANGE_DAYS[rng] + 10   # buffer so day 1 has a rate
+    elif first_lot:
+        days = (performance.today()
+                - datetime.date.fromisoformat(first_lot)).days + 10
+    else:
+        days = performance.ALL_FALLBACK_DAYS + 10
+    period = performance.period_for(days)
+
+    ids = list(dict.fromkeys([e["id"] for e in entries]
+                             + [i for i in (bench_id, perf_id) if i]))
+    rates, rows = await asyncio.gather(
+        _safe(forex.daily_rates(days), "daily rates"),
+        asyncio.gather(*[performance.fetch_rows(i, rng, period)
+                         for i in ids]))
+    rates = rates if isinstance(rates, dict) else {}
+    rows_by_id = dict(zip(ids, rows))
+
+    def closes(pid: str) -> dict[str, float]:
+        e = by_id.get(pid)
+        return (performance.to_days(rows_by_id.get(pid),
+                                    performance.factor_for(e, rates))
+                if e else {})
+
     included, series, missing = [], {}, []
-    for e, b in zip(entries, bars):
-        cur = ((e.get("listing") or {}).get("currency")
-               or e.get("quoteCurrency") or "EUR").upper()
-        factor = (lambda _d: 1.0) if cur == "EUR" else usd_factor
-        s = _by_day(b, factor)
+    for e in entries:
+        s = closes(e["id"])
         if s and _shares(portfolio[e["id"]]):
             included.append(e)
             series[e["id"]] = s
@@ -431,57 +443,260 @@ async def history(range_key: str = "3M") -> dict:
           "No price history, left out of the series: " + ", ".join(missing),
           missing)
 
-    points: list[dict] = []
+    no_lots = [e["id"] for e in included if not lots_by_id[e["id"]]]
+    basis = BASIS_LOTS if included and not no_lots else BASIS_CURRENT
+    _warn(warnings, "history_basis_current_shares",
+          "No dated lots, today's share counts are applied to the whole "
+          "window: " + ", ".join(no_lots), no_lots)
+
+    axis: list[str] = []
     pv: dict[str, float] = {}
-    if included:
+    carried: dict[str, dict[str, float]] = {}
+    if included and basis == BASIS_LOTS:
+        full = sorted({d for s in series.values() for d in s})
+        carried = {pid: performance.carry(s, full)
+                   for pid, s in series.items()}
+        held = {pid: performance.shares_by_day(lots_by_id[pid], full)
+                for pid in series}
+        for d in full:
+            if any(held[pid][d] > 0 and d not in carried[pid]
+                   for pid in series):
+                continue
+            v = sum(held[pid][d] * carried[pid][d]
+                    for pid in series if held[pid][d] > 0)
+            if not axis and v <= 0:
+                continue
+            axis.append(d)
+            pv[d] = v
+    elif included:
         start = max(min(s) for s in series.values())
         axis = sorted({d for s in series.values() for d in s if d >= start})
-        carried = {pid: _carry(s, axis) for pid, s in series.items()}
-        costs = [_invested(portfolio[e["id"]]) for e in included]
-        invested = (sum(costs) if all(c is not None for c in costs)
-                    else None)
+        carried = {pid: performance.carry(s, axis)
+                   for pid, s in series.items()}
         for d in axis:
-            pv[d] = sum(_shares(portfolio[e["id"]]) * carried[e["id"]][d]
-                        for e in included)
-            points.append({"t": _day_ts(d), "valueEur": _r(pv[d]),
-                           "investedEur": _r(invested)})
+            pv[d] = sum(_shares(portfolio[pid]) * carried[pid][d]
+                        for pid in series)
 
-    bench_pts: dict[str, float] = {}
-    if bench_id and bench_bars:
-        bcur = ((bench_entry or {}).get("quoteCurrency") or "USD").upper()
-        bench_pts = _by_day(bench_bars,
-                            (lambda _d: 1.0) if bcur == "EUR" else usd_factor)
-        if not bench_pts and bcur != "EUR":
+    flows: dict[str, float] = {}
+    net: dict[str, float] = {}
+    twr: list[tuple[str, float]] = []
+    if axis:
+        if basis == BASIS_LOTS:
+            for pid in series:
+                for d, f in performance.flows_by_day(lots_by_id[pid],
+                                                     axis).items():
+                    flows[d] = flows.get(d, 0.0) + f
+                for d, v in performance.net_invested_by_day(lots_by_id[pid],
+                                                            axis).items():
+                    net[d] = net.get(d, 0.0) + v
+        twr = performance.twr_series(pv, flows, axis)
+    costs = [_invested(portfolio[e["id"]]) for e in included]
+    cost = sum(costs) if costs and all(c is not None for c in costs) else None
+
+    def bench_series(pid: str | None) -> dict[str, float]:
+        if not pid or pid not in by_id:
+            return {}
+        if not rows_by_id.get(pid):
+            _warn(warnings, "history_missing",
+                  f"No price history for benchmark {pid}", [pid])
+            return {}
+        pts = closes(pid)
+        cur = performance.entry_currency(by_id[pid])
+        if not pts and cur != "EUR":
             _warn(warnings, "fx_missing",
                   "No USD/EUR rates: benchmark cannot be converted to EUR",
-                  [bench_id])
-        elif rates and bcur != "EUR":
+                  [pid])
+        elif (rates and cur != "EUR"
+                and not any(w["code"] == "fx_stale" for w in warnings)):
             age = (datetime.date.today()
                    - datetime.date.fromisoformat(max(rates))).days
             if age > 5:
                 _warn(warnings, "fx_stale",
                       f"Newest USD/EUR rate is {age} days old", None)
-    elif bench_id:
-        _warn(warnings, "history_missing",
-              f"No price history for benchmark {bench_id}", [bench_id])
+        return pts
 
-    indexed = {"portfolio": [], "benchmark": []}
-    common = sorted(set(pv) & set(bench_pts))
-    if common:
-        axis = sorted(d for d in set(pv) | set(bench_pts) if d >= common[0])
-        indexed = {"portfolio": _indexed(_carry(pv, axis), common[0]),
-                   "benchmark": _indexed(_carry(bench_pts, axis), common[0])}
+    bench_pts = bench_series(bench_id)
+    perf_pts = bench_pts if perf_id == bench_id else bench_series(perf_id)
+
+    def label(pid: str | None) -> str | None:
+        return (by_id.get(pid) or {}).get("label") or pid
 
     return {
-        "range": rng,
-        "points": points,
-        "benchmark": {
-            "id": bench_id,
-            "label": (bench_entry or {}).get("label") or bench_id,
-            "points": [{"t": _day_ts(d), "c": _r(c, 4)}
-                       for d, c in sorted(bench_pts.items())],
-            "currency": "EUR",
-        },
-        "indexed": indexed,
+        "range": rng, "basis": basis, "axis": axis, "value": pv,
+        "included": [e["id"] for e in included],
+        "entries": {e["id"]: e for e in included},
+        "series": series, "carried": carried, "lots": lots_by_id,
+        "noLots": no_lots, "flows": flows, "invested": net, "twr": twr,
+        "cost": cost, "rates": rates,
+        "bench": {"id": bench_id, "label": label(bench_id),
+                  "days": bench_pts},
+        "perf": {"id": perf_id, "label": label(perf_id),
+                 "kind": ("total_return"
+                          if (by_id.get(perf_id) or {}).get("kind") == "etf"
+                          else "price"),
+                 "days": perf_pts},
         "warnings": warnings,
     }
+
+
+async def history(range_key: str = "3M") -> dict:
+    """Portfolio value vs benchmarks over ``range_key`` (1M|3M|6M|1Y|ALL).
+
+    Built from ``model`` (see there for the valuation, axis and benchmark
+    rules). Keys: ``range``, ``basis``, ``points`` [{t, valueEur,
+    investedEur}] (``investedEur`` = the constant current cost basis, None
+    when unknown), ``benchmark`` (role benchmark in EUR), ``perfBenchmark``
+    {id, label, kind, points [{t, c}]}, ``indexed`` {portfolio, benchmark,
+    perfBenchmark} (each rebased to 0 % at the first date present in all
+    non-empty series), ``warnings`` and, with basis ``lots`` only,
+    ``invested`` [{t, eur}] (net money put in by lots up to that day) and
+    ``twr`` [{t, pct}] (cumulative time-weighted return).
+    """
+    m = await model(range_key)
+    axis, pv = m["axis"], m["value"]
+    bench, perf = m["bench"], m["perf"]
+    out = {
+        "range": m["range"],
+        "basis": m["basis"],
+        "points": [{"t": _day_ts(d), "valueEur": _r(pv[d]),
+                    "investedEur": _r(m["cost"])} for d in axis],
+        "benchmark": {
+            "id": bench["id"],
+            "label": bench["label"],
+            "points": [{"t": _day_ts(d), "c": _r(c, 4)}
+                       for d, c in sorted(bench["days"].items())],
+            "currency": "EUR",
+        },
+        "perfBenchmark": {
+            "id": perf["id"],
+            "label": perf["label"],
+            "kind": perf["kind"],
+            "points": [{"t": _day_ts(d), "c": _r(c, 4)}
+                       for d, c in sorted(perf["days"].items())],
+        },
+        "indexed": _indexed_all(pv, {"benchmark": bench["days"],
+                                     "perfBenchmark": perf["days"]}),
+        "warnings": m["warnings"],
+    }
+    if m["basis"] == BASIS_LOTS:
+        out["invested"] = [{"t": _day_ts(d), "eur": _r(m["invested"][d])}
+                           for d in axis]
+        out["twr"] = [{"t": _day_ts(d), "pct": _r(x * 100.0)}
+                      for d, x in m["twr"]]
+    return out
+
+
+async def performance_summary(range_key: str = "3M") -> dict:
+    """Return of the book over ``range_key`` (served as GET
+    /api/portfolio/performance).
+
+    ``twrPct`` is the time-weighted return (flow-neutral with basis ``lots``,
+    plain value change of the constant share counts otherwise),
+    ``xirrPct`` the annualised money-weighted return (None unless basis is
+    ``lots``; warning ``xirr_needs_dated_lots``), ``perfBenchmarkPct`` the
+    EUR price change of the performance benchmark between the same first and
+    last day, ``excessPct`` = ``twrPct - perfBenchmarkPct`` (percentage
+    points). ``netFlowsEur`` is the sum of external flows inside the window
+    (None without lots). ``asOf`` is the last valuation day.
+    """
+    m = await model(range_key)
+    warnings, axis, pv, perf = m["warnings"], m["axis"], m["value"], m["perf"]
+    out = {"range": m["range"], "basis": m["basis"], "twrPct": None,
+           "xirrPct": None, "perfBenchmarkId": perf["id"],
+           "perfBenchmarkPct": None, "excessPct": None,
+           "startValueEur": None, "endValueEur": None, "netFlowsEur": None,
+           "asOf": None, "warnings": warnings}
+    if not axis:
+        return out
+    start, end = axis[0], axis[-1]
+    twr = m["twr"][-1][1] * 100.0 if len(axis) > 1 else None
+    pc = performance.carry(perf["days"], [start, end])
+    bench_pct = ((pc[end] / pc[start] - 1.0) * 100.0
+                 if len(pc) == 2 else None)
+    out.update(
+        twrPct=_r(twr), perfBenchmarkPct=_r(bench_pct),
+        excessPct=(_r(twr - bench_pct)
+                   if twr is not None and bench_pct is not None else None),
+        startValueEur=_r(pv[start]), endValueEur=_r(pv[end]), asOf=end)
+    if m["basis"] == BASIS_LOTS:
+        out["netFlowsEur"] = _r(sum(m["flows"].values()))
+        if len(axis) > 1:
+            x = performance.xirr_for_window(
+                {pid: m["lots"][pid] for pid in m["included"]}, start, end,
+                pv[start], pv[end], m["range"] == "ALL")
+            out["xirrPct"] = _r(x * 100.0) if x is not None else None
+            if x is None:
+                _warn(warnings, "xirr_unavailable",
+                      "XIRR has no solution for these flows", None)
+    else:
+        _warn(warnings, "xirr_needs_dated_lots",
+              "XIRR needs dated lots for every holding"
+              + (": " + ", ".join(m["noLots"]) if m["noLots"] else ""),
+              m["noLots"] or None)
+    return out
+
+
+async def attribution(range_key: str = "3M") -> dict:
+    """Currency attribution of each holding's EUR listing return over
+    ``range_key`` (served as GET /api/portfolio/attribution).
+
+    ``eur`` is the listing's EUR price return from the window's first day
+    (the first day on or after the first lot when the position has lots) to
+    its last day. ``fx`` is the change of EUR per 1 unit of the exposure
+    currency (``exposureCurrency[id]``, default the listing currency) over
+    the same days (``forex.daily_rates``); EUR exposure has ``fx`` 0. Then
+    ``local = (1 + eur) / (1 + fx) - 1`` and ``cross = eur - local - fx``, so
+    ``eur = local + fx + cross`` exactly. Only USD has a rate source; any
+    other exposure currency gets None and a warning.
+    """
+    m = await model(range_key)
+    exposure = config_store.read().get("exposureCurrency")
+    exposure = exposure if isinstance(exposure, dict) else {}
+    axis, rates = m["axis"], m["rates"]
+    end = axis[-1] if axis else None
+
+    def fx_change(start_day: str, end_day: str) -> float | None:
+        r0 = _num(forex.rate_on(rates, start_day)) if rates else None
+        r1 = _num(forex.rate_on(rates, end_day)) if rates else None
+        return r1 / r0 - 1.0 if r0 and r1 else None
+
+    positions, no_fx, bad_ccy = [], [], []
+    for pid in m["included"]:
+        ccy = str(exposure.get(pid)
+                  or performance.entry_currency(m["entries"][pid])).upper()
+        lots = m["lots"][pid] if m["basis"] == BASIS_LOTS else []
+        start = (performance.first_on_or_after(axis, lots[0]["date"])
+                 if lots else axis[0])
+        c0 = m["carried"][pid].get(start) if start else None
+        c1 = m["carried"][pid].get(end)
+        eur = c1 / c0 - 1.0 if c0 and c1 else None
+        if ccy == "EUR":
+            fx = 0.0
+        elif ccy == "USD" and start:
+            fx = fx_change(start, end)
+            if fx is None:
+                no_fx.append(pid)
+        else:
+            fx = None
+            bad_ccy.append(pid)
+        local = ((1.0 + eur) / (1.0 + fx) - 1.0
+                 if eur is not None and fx is not None else None)
+        cross = (eur - local - fx
+                 if local is not None and fx is not None else None)
+        positions.append({"id": pid, "exposureCurrency": ccy,
+                          "eurReturnPct": _pct(eur),
+                          "localReturnPct": _pct(local),
+                          "fxReturnPct": _pct(fx), "crossPct": _pct(cross)})
+
+    warnings: list[dict] = []
+    _warn(warnings, "fx_missing",
+          "No USD/EUR rates: local return cannot be split out: "
+          + ", ".join(no_fx), no_fx)
+    _warn(warnings, "fx_unsupported_currency",
+          "Only USD exposure has an FX source: " + ", ".join(bad_ccy),
+          bad_ccy)
+    usd = fx_change(axis[0], end) if axis else None
+    return {"range": m["range"], "positions": positions,
+            "fx": {"pair": "USD/EUR",
+                   "changePct": None if usd is None else _r(usd * 100.0)},
+            "warnings": warnings}

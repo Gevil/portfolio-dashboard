@@ -1,6 +1,6 @@
-/* AI Ops view: lane, workers, job queue, triage, approvals, evidence pack.
+/* AI Ops view: lane, workers, notification policy, job queue, triage, approvals, evidence pack.
    export function mount(root, ctx) -> unmount() */
-import { createKit, isObj, num, str, fmtAgo, fmtSpan, fmtNum, errText } from './_kit.js';
+import { createKit, isObj, num, str, toSec, fmtAgo, fmtSpan, fmtNum, fmtWhen, errText } from './_kit.js';
 import { summarizeWorkers, renderWorkerTable } from './_workers.js';
 import { openReport } from './_report.js';
 
@@ -15,17 +15,25 @@ export function mount(root, ctx) {
   const { h, chip } = kit;
   const grid = h('div', { class: 'v-grid v-aiops' });
   root.appendChild(grid);
+  let laneTimer = null;
+  const bgSrc = kit.memo(() => kit.get('/api/background'), 500);
 
   /* ---------------- lane ---------------- */
   const lane = kit.section({ title: 'GPU lane', id: 'lane', cls: 'v-span-2' });
   const renderLane = (body, s) => {
     const role = s.role === 'primary' || s.role === 'fallback' ? s.role : null;
     const serving = s.serving_model !== false && !!(s.lane || s.model);
+    const probedSec = toSec(s.probedAt);
     body.appendChild(h('div', { class: 'v-lanehead' },
       chip(serving ? 'serving' : 'no model loaded', serving ? 'up' : 'down'),
       role ? chip(role === 'fallback' ? 'FALLBACK lane' : 'primary lane', role === 'fallback' ? 'warn' : 'up') : null,
       h('span', { class: 'v-mono v-strong' }, str(s.lane, '–')),
-      h('span', { class: 'v-muted v-mono' }, str(s.model, ''))));
+      h('span', { class: 'v-muted v-mono' }, str(s.model, '')),
+      h('span', { class: 'v-muted v-small', id: 'v-lane-probed', title: probedSec ? fmtWhen(probedSec) : '' },
+        probedSec === null ? 'not probed yet' : 'probed ' + fmtAgo(probedSec)),
+      s.refreshing === true ? h('span', { class: 'v-chip v-chip--info', id: 'v-lane-refreshing', role: 'status', title: 'A background probe is running; this is the last known state.' }, 'refreshing') : null));
+    clearTimeout(laneTimer);
+    if (s.refreshing === true) laneTimer = setTimeout(() => lane.reload(), 4000);
     if (role === 'fallback') {
       body.appendChild(h('p', { class: 'v-callout v-callout--warn', role: 'status' },
         'Answers are currently coming from the fallback lane. Quality and latency can differ from the primary model.'));
@@ -73,10 +81,24 @@ export function mount(root, ctx) {
   };
   kit.autoLoad(lane, { source: '/api/lane-status', render: renderLane, isEmpty: d => !isObj(d) }, 20000);
 
+  /* ---------------- notification policy ---------------- */
+  const notify = kit.section({ title: 'Notification policy', id: 'notify', hint: 'quiet hours · per-source caps · ops topic', cls: 'v-span-2' });
+  kit.autoLoad(notify, {
+    source: async () => {
+      const r = await bgSrc();
+      if (!r.ok) return r;
+      const n = isObj(r.data) ? r.data.notify : null;
+      return { ok: true, stale: r.stale, data: isObj(n) && isObj(n.policy) ? n.policy : null };
+    },
+    isEmpty: d => !isObj(d),
+    emptyText: 'The notify worker did not report a policy (older backend).',
+    render: (body, p) => renderNotifyPolicy(kit, body, p),
+  }, 30000);
+
   /* ---------------- workers ---------------- */
   const workers = kit.section({ title: 'Background workers', id: 'workers', cls: 'v-span-2' });
   const workersSrc = kit.memo(async () => {
-    const [bg, runs] = await Promise.all([kit.get('/api/background'), kit.get('/api/worker-runs?limit=200')]);
+    const [bg, runs] = await Promise.all([bgSrc(), kit.get('/api/worker-runs?limit=200')]);
     if (!bg.ok && !runs.ok) return { ok: false, error: errText(bg.error), status: bg.status };
     return { ok: true, stale: !!(bg.stale || runs.stale), data: { bg: bg.ok ? bg.data : null, runs: runs.ok && Array.isArray(runs.data) ? runs.data : [], partial: !bg.ok || !runs.ok } };
   }, 500);
@@ -222,8 +244,48 @@ export function mount(root, ctx) {
   const evid = kit.section({ title: 'Evidence pack', id: 'evidence', hint: 'what the analysis may cite', cls: 'v-span-2' });
   mountEvidence(kit, evid);
 
-  grid.append(lane.el, workers.el, jobs.el, appr.el, triage.el, evid.el);
-  return () => kit.dispose();
+  grid.append(lane.el, workers.el, notify.el, jobs.el, appr.el, triage.el, evid.el);
+  return () => { clearTimeout(laneTimer); kit.dispose(); };
+}
+
+/* ---------- notification policy panel (GET /api/background notify.policy) ---------- */
+
+function renderNotifyPolicy(kit, body, p) {
+  const { h, chip } = kit;
+  const qh = isObj(p.quiet_hours) ? p.quiet_hours : {};
+  const win = str(qh.window, 'off');
+  const off = win === 'off' || win === '';
+  const until = toSec(qh.until);
+  const state = off ? chip('quiet hours off', 'flat')
+    : qh.active ? chip('quiet now' + (until !== null ? ' · until ' + fmtWhen(until) : ''), 'warn')
+      : chip('not active', 'flat');
+  body.appendChild(h('div', { class: 'v-lanehead', id: 'v-notify-quiet' },
+    h('span', { class: 'v-label' }, 'Quiet hours'),
+    h('span', { class: 'v-mono v-strong' }, off ? 'off' : win),
+    state,
+    qh.active && !off ? h('span', { class: 'v-muted v-small' }, 'pushes are queued and sent after the window; priority 5 price/policy alerts bypass it') : null));
+  const caps = isObj(p.caps) ? p.caps : {};
+  const counts = isObj(p.counts_24h) ? p.counts_24h : {};
+  const sources = [...new Set([...Object.keys(caps), ...Object.keys(counts)])].sort();
+  if (sources.length) {
+    const rows = sources.map(src => {
+      const cap = num(caps[src]);
+      const n = num(counts[src]) || 0;
+      const hit = cap !== null && n >= cap;
+      return h('tr', { class: hit ? 'v-row--stale' : null },
+        h('th', { scope: 'row', class: 'v-mono' }, src),
+        h('td', { class: 'v-num' }, cap === null ? 'no cap' : fmtNum(cap)),
+        h('td', { class: 'v-num' }, fmtNum(n)),
+        h('td', {}, hit ? chip('at cap', 'warn', 'Further pushes from this source are stored but not sent') : chip('ok', 'flat')));
+    });
+    body.appendChild(kit.table('Per-source push caps, rolling 24 hours', [
+      { label: 'Source' }, { label: 'Cap / 24 h', num: true }, { label: 'Sent in 24 h', num: true }, { label: 'State' }], rows));
+  } else {
+    body.appendChild(kit.empty('No per-source caps reported.'));
+  }
+  body.appendChild(h('dl', { class: 'v-kv v-kv--row', id: 'v-notify-meta' },
+    h('dt', {}, 'Held'), h('dd', { id: 'v-notify-held' }, fmtNum(num(p.held) || 0) + ' push' + ((num(p.held) || 0) === 1 ? '' : 'es') + ' held back'),
+    h('dt', {}, 'Ops topic'), h('dd', { class: 'v-mono', id: 'v-notify-topic' }, str(p.ops_topic, '–'))));
 }
 
 /* ---------- evidence pack viewer ---------- */

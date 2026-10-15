@@ -1,10 +1,17 @@
 /* Worker health model shared by the Market (rings) and AI Ops (table) views.
    GET /api/background -> {module: {last_run, runs, errors, running, enabled,
    next_run, skip_reason, ...}}; GET /api/worker-runs -> [{ts, worker, ok,
-   duration_s, note}] newest first. */
+   duration_s, note}] newest first. A run note that starts with "deferred:" is a
+   deliberate deferral (lane busy, no session today): the DEFERRED state, never
+   a failure or a stale worker. */
 import { isObj, num, str, toSec, fmtSpan, fmtAgo, fmtIn } from './_kit.js';
 
 const RING_LEN = 14;
+
+/** "deferred: no session today" -> true. Case-insensitive, leading space tolerated. */
+export function isDeferredNote(note) {
+  return /^\s*deferred:/i.test(str(note));
+}
 
 /* Not every module reports a plain last_run (macro: curve_last/earnings_last/
    cot_last, filings: last_fts ...): the freshest *_last / last_run wins. */
@@ -50,27 +57,30 @@ export function summarizeWorkers(bg, runs) {
     const intervalS = num(st.interval_s) || cadence(newestFirst) || null;
     const limit = intervalS ? Math.max(intervalS * 3.5, 600) : 48 * 3600;
     const disabled = st.enabled === false;
+    const note = str((latest && latest.note) || st.last_note || st.skip_reason || '');
+    const deferred = isDeferredNote(note) && !(latest && latest.ok === false && !isDeferredNote(latest.note));
     let verdict = 'ok';
     if (disabled) verdict = 'off';
-    else if (latest && latest.ok === false) verdict = 'fail';
+    else if (latest && latest.ok === false && !isDeferredNote(latest.note)) verdict = 'fail';
     else if (st.running === false && isObj(bg) && name in bg) verdict = 'fail';
+    else if (deferred) verdict = 'deferred';
     else if (age !== null && age > limit) verdict = 'stale';
     else if (age === null && !disabled && isObj(bg) && name in bg && newestFirst.length === 0) verdict = 'stale';
     const errors = num(st.errors);
     out.push({
       name, st, runs: newestFirst.slice(0, RING_LEN).reverse(), allRuns: newestFirst,
       verdict, last, age, intervalS, errors, disabled,
-      note: str((latest && latest.note) || st.last_note || st.skip_reason || ''),
+      note,
       nextRun: toSec(st.next_run),
     });
   });
-  const rank = { fail: 0, stale: 1, ok: 2, off: 3 };
+  const rank = { fail: 0, stale: 1, deferred: 2, ok: 3, off: 4 };
   out.sort((a, b) => rank[a.verdict] - rank[b.verdict] || a.name.localeCompare(b.name));
   return out;
 }
 
-export const VERDICT_LABEL = { ok: 'ok', fail: 'failing', stale: 'stale', off: 'disabled' };
-const VERDICT_CHIP = { ok: 'up', fail: 'down', stale: 'warn', off: 'flat' };
+export const VERDICT_LABEL = { ok: 'ok', fail: 'failing', stale: 'stale', deferred: 'deferred', off: 'disabled' };
+const VERDICT_CHIP = { ok: 'up', fail: 'down', stale: 'warn', deferred: 'flat', off: 'flat' };
 
 export function verdictChip(kit, verdict) {
   return kit.chip(VERDICT_LABEL[verdict] || verdict, VERDICT_CHIP[verdict] || 'flat');
@@ -83,12 +93,16 @@ export function renderRings(kit, body, list) {
   const grid = h('ul', { class: 'v-rings' });
   list.forEach(w => {
     const dots = h('span', { class: 'v-ring', role: 'img',
-      'aria-label': w.runs.length ? w.runs.filter(r => r.ok !== false).length + ' of ' + w.runs.length + ' recent runs ok' : 'no recorded runs' });
+      'aria-label': w.runs.length ? w.runs.filter(r => r.ok !== false || isDeferredNote(r.note)).length + ' of ' + w.runs.length + ' recent runs ok or deferred' : 'no recorded runs' });
     if (!w.runs.length) dots.appendChild(h('span', { class: 'v-dot v-dot--none' }));
-    w.runs.forEach(r => dots.appendChild(h('span', {
-      class: 'v-dot ' + (r.ok === false ? 'v-dot--bad' : 'v-dot--ok'),
-      title: (r.ok === false ? 'FAIL ' : 'ok ') + fmtAgo(r.ts) + (r.note ? ' – ' + str(r.note).slice(0, 120) : ''),
-    })));
+    w.runs.forEach(r => {
+      const deferred = isDeferredNote(r.note);
+      const bad = r.ok === false && !deferred;
+      dots.appendChild(h('span', {
+        class: 'v-dot ' + (bad ? 'v-dot--bad' : deferred ? 'v-dot--deferred' : 'v-dot--ok'),
+        title: (bad ? 'FAIL ' : deferred ? 'DEFERRED ' : 'ok ') + fmtAgo(r.ts) + (r.note ? ' – ' + str(r.note).slice(0, 120) : ''),
+      }));
+    });
     grid.appendChild(h('li', { class: 'v-ringcard v-ringcard--' + w.verdict },
       h('div', { class: 'v-ringcard__head' }, h('span', { class: 'v-mono v-strong' }, w.name), verdictChip(kit, w.verdict)),
       dots,

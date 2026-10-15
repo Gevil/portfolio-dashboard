@@ -48,7 +48,7 @@
 .st-sub { margin: var(--space-2) 0 0; }
 .st-spacer { flex: 1; }
 .st-entries { display: grid; gap: var(--space-3); min-width: 0; }
-.st-entry, .st-pos, .st-rt, .st-add-card { display: grid; gap: var(--space-3); align-content: start; }
+.st-entry, .st-pos, .st-rt, .st-add-card, .st-fund { display: grid; gap: var(--space-3); align-content: start; }
 .st-entry:focus { outline: none; }
 .st-entry:focus-visible { outline: 2px solid var(--focus); }
 .st-entry-head { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); min-width: 0; }
@@ -69,6 +69,28 @@
 .st-avg { color: var(--ink-2); font-size: var(--fs-sm); grid-column: 1 / -1; }
 .st-nopos { justify-content: space-between; flex-wrap: wrap; background: var(--panel-2); border: 1px dashed var(--line-strong); }
 .st-orphan { border-color: var(--red); }
+.st-pos-body { display: grid; gap: var(--space-4); min-width: 0; }
+.st-f input[readonly] { background: var(--panel-2); color: var(--ink-2); cursor: default; }
+
+/* ---- dated lots ---- */
+.st-lots { display: grid; gap: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--line); min-width: 0; }
+.st-lots-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--space-2) var(--space-3); }
+.st-lots-title { margin: 0; font-size: var(--fs-base); }
+.st-lot-list { display: grid; gap: var(--space-2); min-width: 0; }
+.st-lot { display: grid; gap: var(--space-2); padding: var(--space-3); min-width: 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); }
+.st-lot-fields { display: grid; gap: var(--space-2) var(--space-3); grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)) auto; align-items: end; min-width: 0; }
+.st-lot-del { flex: none; font-size: 1.3rem; line-height: 1; align-self: end; }
+.st-lot-del:hover:not(:disabled) { color: var(--red); }
+.st-lots-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+/* ---- policy ---- */
+.st-pol-sum { font-size: var(--fs-sm); color: var(--ink-2); }
+.st-pol-sum.is-bad, .st-look-sum.is-bad { color: var(--red); font-weight: 600; }
+.st-look-rows { display: grid; gap: var(--space-2); min-width: 0; }
+.st-look-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) auto; gap: var(--space-2) var(--space-3); align-items: end; min-width: 0; }
+.st-look-del { flex: none; font-size: 1.3rem; line-height: 1; }
+.st-look-del:hover:not(:disabled) { color: var(--red); }
+.st-look-sum { font-size: var(--fs-sm); }
 
 /* ---- alert rules ---- */
 .st-rt-head { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2) var(--space-3); min-width: 0; }
@@ -87,6 +109,11 @@
 .st-rf.st-check { align-self: end; }
 .st-rt-empty { font-size: var(--fs-sm); }
 .st-default .st-rule-fields { padding-top: var(--space-1); }
+.st-sigma { font-family: var(--font-mono); font-size: var(--fs-xs); }
+.st-sigma.is-na { color: var(--ink-3); }
+.st-notify { background: var(--panel-2); }
+.st-caps { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-3); }
+.st-caps .is-cap { color: var(--amber); font-weight: 600; }
 
 /* ---- appearance ---- */
 .st-fieldset { border: 1px solid var(--line); border-radius: var(--radius-lg); padding: var(--space-3) var(--space-4) var(--space-4); margin: 0; min-width: 0; display: grid; gap: var(--space-3); }

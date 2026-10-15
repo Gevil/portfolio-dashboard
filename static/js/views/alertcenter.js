@@ -1,13 +1,17 @@
 // Alert center: a drawer listing every stored alert (store slot 'alerts', filled by
 // data.refreshAlerts()), plus the live-alert toast. The toast is NOT the record - every
 // alert that reaches handleLiveAlert is also persisted server-side and shows up here.
+// openAlertCenter({focusId}) opens (or re-focuses) the drawer; with a focusId it loads the
+// last 200 alerts, scrolls that row into view, highlights it and moves focus to it.
 import { el, clear, fmtDateTime24, ago, safeUrl } from '../util.js';
-import { apiSend } from '../api.js';
+import { apiGet, apiSend, latestRequest } from '../api.js';
 import * as store from '../store.js';
 import { toast, openDialog, renderState, stamp, usePolling } from '../ui.js';
 import { refreshAlerts, selectHolding, entryOf } from '../data.js';
 
 const POLL_MS = 30000;
+const DEFAULT_LIMIT = 100; // what data.refreshAlerts() loads
+const WIDE_LIMIT = 200;    // loaded while a focus request needs older rows
 const TOAST_SEEN_MAX = 200;
 const TOAST_MSG_MAX = 220;
 
@@ -65,7 +69,7 @@ export function handleLiveAlert(alert) {
     toast(msg, {
       type: meta.toast,
       title: ticker + (alert.title ? String(alert.title) : 'Alert'),
-      onClick: () => { openAlertCenter(); },
+      onClick: () => { openAlertCenter({ focusId: alert.id != null ? String(alert.id) : null }); },
     });
   } catch (e) {
     console.error('handleLiveAlert failed', e);
@@ -75,11 +79,18 @@ export function handleLiveAlert(alert) {
 // ------------------------------------------------------------------ center
 
 let current = null; // the open drawer handle (singleton)
+let focusRequest = null; // set while the drawer is open: (id) => void
 
-/** Open (or re-focus) the alert center drawer. Returns the dialog handle. */
-export function openAlertCenter() {
+/**
+ * Open (or re-focus) the alert center drawer. Returns the dialog handle.
+ * focusId: load enough rows to include that alert (limit 200), scroll it into view, give it
+ * the `is-focus` class and move keyboard focus to it. Not found -> an inline note.
+ */
+export function openAlertCenter({ focusId } = {}) {
+  const wanted = focusId == null || focusId === '' ? null : String(focusId);
   if (current) {
-    current.panel.focus();
+    if (wanted !== null && focusRequest) focusRequest(wanted);
+    else current.panel.focus();
     return current;
   }
 
@@ -87,6 +98,15 @@ export function openAlertCenter() {
   let unreadOnly = false;
   let busy = false;
   let lastSig = null;
+  let limit = wanted !== null ? WIDE_LIMIT : DEFAULT_LIMIT;
+  let pendingFocus = wanted; // id waiting for the wide load to settle
+  let highlightId = null;    // row carrying the highlight class
+  let missingId = null;      // requested id that is not in the loaded rows
+  let wideSettled = false;   // the limit=200 request has answered (ok or not)
+  let wideOk = false;
+  let wideData = null;       // the payload object of our own last wide load
+  let selfWrite = false;     // true while this drawer itself writes the slot
+  const lrWide = latestRequest();
 
   const badge = el('span', { class: 'badge ac-badge', hidden: true });
   const stampEl = stamp(null, { prefix: 'updated ' });
@@ -138,10 +158,46 @@ export function openAlertCenter() {
   current = handle;
   store.set('alertCenterOpen', true);
 
-  const unsub = store.subscribe('alerts', () => render(false));
-  const stopPoll = usePolling(() => refreshAlerts(), POLL_MS);
+  const unsub = store.subscribe('alerts', () => {
+    const s = store.slot('alerts');
+    // another loader (SSE refresh) replaced our wide payload with the 100-row one: ask again
+    if (limit > DEFAULT_LIMIT && wideSettled && !selfWrite && !s.loading && s.data && s.data !== wideData) load();
+    render(false);
+  });
+  const stopPoll = usePolling(() => load(), POLL_MS);
+  focusRequest = (id) => {
+    pendingFocus = id;
+    missingId = null;
+    if (limit < WIDE_LIMIT) { limit = WIDE_LIMIT; wideSettled = false; }
+    render(true);
+    load();
+  };
 
-  function retry() { refreshAlerts(); }
+  const setSlot = (v) => {
+    selfWrite = true;
+    try { store.set('alerts', v); } finally { selfWrite = false; }
+  };
+
+  /** Load the alerts slot at the current limit (data.refreshAlerts for 100, our own request for 200). */
+  async function load() {
+    if (limit <= DEFAULT_LIMIT) return refreshAlerts();
+    const t = lrWide.begin();
+    selfWrite = true;
+    try { store.slotLoading('alerts'); } finally { selfWrite = false; }
+    const res = await apiGet(`/api/alerts?limit=${limit}`, { signal: t.signal, timeoutMs: 25000 });
+    if (!t.current()) return null;
+    selfWrite = true;
+    try { store.slotApply('alerts', res); } finally { selfWrite = false; }
+    if (!res.aborted) {
+      wideSettled = true;
+      wideOk = !!res.ok;
+      if (res.ok) wideData = store.slot('alerts').data;
+      render(true);
+    }
+    return res;
+  }
+
+  function retry() { load(); }
 
   function visibleItems(items) {
     return items.filter(a => (sev === 'all' || normalizeSeverity(a.severity) === sev) && (!unreadOnly || !a.acked));
@@ -169,6 +225,14 @@ export function openAlertCenter() {
     if (target) target.focus();
   }
 
+  function focusItem(id) {
+    const li = [...list.children].find(n => n.dataset.id === id);
+    if (!li) return;
+    const calm = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    li.scrollIntoView({ block: 'center', behavior: calm ? 'auto' : 'smooth' });
+    li.focus({ preventScroll: true });
+  }
+
   function render(force) {
     if (!handle.root.isConnected) return;
     const s = store.slot('alerts');
@@ -176,9 +240,32 @@ export function openAlertCenter() {
     const items = data && Array.isArray(data.items) ? data.items : null;
     const unread = unreadCount();
 
+    // resolve a pending focus request once the wide load has settled
+    let focusNow = null;
+    if (pendingFocus !== null && wideSettled) {
+      if (items) {
+        const id = pendingFocus;
+        const hit = items.find(a => String(a.id) === id);
+        pendingFocus = null;
+        force = true;
+        if (hit) {
+          highlightId = id;
+          missingId = null;
+          focusNow = id;
+          if (!visibleItems([hit]).length) { sev = 'all'; unreadOnly = false; syncControls(); } // a filter must not hide the row
+        } else if (wideOk) {
+          highlightId = null;
+          missingId = id;
+        }
+      } else if (!s.loading) {
+        pendingFocus = null; // the load failed and nothing is shown: the error state says so
+      }
+    }
+
     // cheap signature: skip DOM work on polls that changed nothing visible
     const sig = JSON.stringify([
       sev, unreadOnly, s.error, s.loading && !items, unread, Math.floor(Date.now() / 60000), // minute bucket keeps "x min ago" fresh
+      highlightId, missingId,
       items ? items.map(a => [a.id, a.acked ? 1 : 0, a.title, a.message]) : null,
     ]);
     stampEl.setTs(s.ts, !!s.error || !!s.stale);
@@ -204,6 +291,9 @@ export function openAlertCenter() {
     }
     // stale data + failed refresh: keep the list, say so
     if (s.error) renderState(banner, { error: s.error, retry });
+    if (missingId !== null) {
+      banner.append(el('div', { class: 'ac-notfound', id: 'ac-notfound', role: 'status', dataset: { id: missingId }, text: 'alert not found (older than the last 200)' }));
+    }
 
     const shown = visibleItems(items);
     summary.textContent = `${shown.length} of ${items.length} shown \u00B7 ${unread} unread`;
@@ -219,7 +309,8 @@ export function openAlertCenter() {
       return;
     }
     for (const a of shown) list.append(renderItem(a));
-    restoreFocus(fk, shown.map(a => String(a.id)));
+    if (focusNow) focusItem(focusNow);
+    else restoreFocus(fk, shown.map(a => String(a.id)));
   }
 
   function renderItem(a) {
@@ -234,7 +325,7 @@ export function openAlertCenter() {
     const rel = ago(a.time);
 
     return el('li', {
-      class: `ac-item ac-sev-${level}${a.acked ? ' is-acked' : ''}`, dataset: { id, sev: level },
+      class: `ac-item ac-sev-${level}${a.acked ? ' is-acked' : ''}${id === highlightId ? ' is-focus' : ''}`, dataset: { id, sev: level }, tabindex: '-1',
     },
       el('div', { class: 'ac-item-meta' },
         el('span', { class: `chip ${meta.chip} ac-sev-chip` },
@@ -289,7 +380,7 @@ export function openAlertCenter() {
       items: prev.data.items.map(a => (changedIds.has(String(a.id)) ? { ...a, acked: true } : a)),
       unread: body.all ? 0 : Math.max(0, (prev.data.unread || 0) - changed.length),
     };
-    store.set('alerts', { ...prev, data: optimistic });
+    setSlot({ ...prev, data: optimistic });
     busy = true;
     root.classList.add('is-busy');
     root.setAttribute('aria-busy', 'true');
@@ -304,14 +395,14 @@ export function openAlertCenter() {
     if (!res.ok) {
       // only roll back when no fresher server snapshot has landed in the meantime
       const now = store.slot('alerts');
-      if (now.data === optimistic) store.set('alerts', { ...now, data: prev.data });
+      if (now.data === optimistic) setSlot({ ...now, data: prev.data });
       toast(res.error || 'Could not mark alerts as read', { type: 'error', title: 'Alerts' });
       return;
     }
-    await refreshAlerts();
+    await load();
   }
 
   render(true);
-  refreshAlerts();
+  load();
   return handle;
 }

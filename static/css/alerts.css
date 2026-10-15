@@ -53,6 +53,14 @@ button.ac-ticker:hover { border-color: var(--accent); background: var(--panel-3)
 .ac-actions:empty { display: none; }
 .ac-link { text-decoration: none; }
 
+/* a row opened from a toast / #alerts/<id>: highlighted by outline + tint (not colour alone: it also takes focus) */
+.ac-item:focus { outline: none; }
+.ac-item.is-focus, .ac-item:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; background: var(--accent-soft); }
+.ac-notfound {
+  padding: var(--space-2) var(--space-3); border: 1px dashed var(--line-strong); border-radius: var(--radius);
+  font-size: var(--fs-sm); color: var(--ink-2); overflow-wrap: anywhere;
+}
+
 .ac.is-busy .ac-ack, .ac.is-busy .ac-markall, .ac.is-busy .ac-ticker { opacity: 0.55; pointer-events: none; }
 
 @media (max-width: 640px) {

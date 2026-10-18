@@ -7,7 +7,14 @@ how it compares with the benchmark, and what needs your attention.
 
 ![Overview, dark theme](../media/screenshots/overview-dark.webp)
 
-*Demo data only: ASML, NVDA and an S&P 500 UCITS ETF with fictional share counts and cost bases.*
+*Demo data only: ASML, NVDA and an S&P 500 UCITS ETF with fictional share counts, lots and cost bases.*
+
+The whole page, top to bottom: the "since your last visit" strip, structured needs-attention cards, positions, the
+performance card (time-weighted and money-weighted return against the total-return benchmark), the allocation policy
+(drift against target bands, where the next contribution goes, monthly trend flags) and the risk panel (look-through
+exposure, currency split, volatility, drawdown, correlation):
+
+![Overview, full page](../media/screenshots/overview-full.webp)
 
 ## Header
 

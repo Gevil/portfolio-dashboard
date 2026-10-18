@@ -10,9 +10,9 @@ details.
 
 | Fictional (seeded by `tools/demo/seed.py`) | Real (fetched live by the demo container) |
 |---|---|
-| Share counts and cost bases (ASML 2.5 sh / €2,500, NVDA 10 sh / €1,200, ETF 3 sh / cost unknown) | Prices, charts, FX, benchmark, yield curve, CFTC data, earnings dates, market light |
+| Share counts and cost bases (ASML 2.5 sh, NVDA 10 sh, ETF 3 sh with invented purchase lots, prices and fees; target weights, benchmark, look-through and tax settings) | Prices, charts, FX, benchmark, yield curve, CFTC data, earnings dates, market light |
 | Alert history, notifications, approvals, triage items and their headlines ("Demo Wire") | |
-| Advice history and the three sample analysis reports | The scoreboard's *grading* of that fictional advice against real prices |
+| Advice history (with probabilities and one pending call) and the three sample analysis reports | The scoreboard's *grading* of that fictional advice against real prices |
 | Credentials (`demo` / `demo-pass`), tokens, contact strings | |
 
 The demo instance has no API keys, no ntfy and no reachable LLM: pushes stay in the outbox, FRED is off and the

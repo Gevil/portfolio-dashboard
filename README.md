@@ -14,8 +14,8 @@ on Bazzite (Fedora Atomic) with an RTX 5090.
 ![Portfolio Dashboard overview (demo data)](docs/media/screenshots/overview-dark.webp)
 
 <p align="center">
-  <img src="docs/media/video/walkthrough.gif" alt="Walkthrough: positions table, allocation, holding detail, chart ranges and indicator overlays" width="720"><br>
-  <sub>first 26 s · <a href="docs/media/video/walkthrough.mp4">full 60 s video (mp4)</a> also covers the alert center, digest, market, AI Ops and settings</sub>
+  <img src="docs/media/video/walkthrough.gif" alt="Walkthrough: positions table, allocation, holding detail, the performance, policy and risk cards, chart ranges and indicator overlays" width="720"><br>
+  <sub>first 26 s · <a href="docs/media/video/walkthrough.mp4">full 65 s video (mp4)</a> also covers the alert center, the digest with the v3 scoreboard, the market view with the events calendar, AI Ops and settings</sub>
 </p>
 
 | Holding detail | Alert center | Digest and scoreboard |

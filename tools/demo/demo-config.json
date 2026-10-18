@@ -92,16 +92,57 @@
   "chatModel": "lane",
   "portfolio": {
     "ASML": {
+      "lots": [
+        {
+          "date": "2024-03-14",
+          "shares": 1.0,
+          "priceEur": 900.0,
+          "feesEur": 1.0,
+          "side": "buy"
+        },
+        {
+          "date": "2025-02-10",
+          "shares": 1.5,
+          "priceEur": 1000.0,
+          "feesEur": 0.0,
+          "side": "buy"
+        }
+      ],
       "shares": 2.5,
-      "investedAmount": 2500
+      "investedAmount": 2401.0
     },
     "NVDA": {
-      "shares": 10,
-      "investedAmount": 1200
+      "lots": [
+        {
+          "date": "2025-06-02",
+          "shares": 6.0,
+          "priceEur": 110.0,
+          "feesEur": 1.0,
+          "side": "buy"
+        },
+        {
+          "date": "2026-01-12",
+          "shares": 4.0,
+          "priceEur": 135.0,
+          "feesEur": 1.0,
+          "side": "buy"
+        }
+      ],
+      "shares": 10.0,
+      "investedAmount": 1202.0
     },
     "SXR8": {
-      "shares": 3,
-      "investedAmount": null
+      "lots": [
+        {
+          "date": "2025-09-01",
+          "shares": 3.0,
+          "priceEur": 640.0,
+          "feesEur": 1.0,
+          "side": "buy"
+        }
+      ],
+      "shares": 3.0,
+      "investedAmount": 1921.0
     }
   },
   "alertRules": {
@@ -145,5 +186,34 @@
         }
       ]
     }
-  }
+  },
+  "performanceBenchmark": "SXR8",
+  "exposureCurrency": {
+    "NVDA": "USD",
+    "SXR8": "USD"
+  },
+  "lookThrough": {
+    "SXR8": {
+      "asOf": "2026-10-14",
+      "source": "Slickcharts S&P 500 weights",
+      "weights": {
+        "NVDA": 7.64
+      }
+    }
+  },
+  "investmentPolicy": {
+    "targets": {
+      "ASML": 30,
+      "NVDA": 20,
+      "SXR8": 50
+    },
+    "maxSingleStockPct": 35,
+    "band": {
+      "absPct": 5,
+      "relPct": 25
+    },
+    "monthlyContributionEur": 300,
+    "trendFilter": true
+  },
+  "taxResidency": "CZ"
 }

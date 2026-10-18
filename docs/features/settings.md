@@ -92,3 +92,12 @@ Theme (System / Light / Dark, stored in the browser only), the chat model, and a
 `ops/deploy.sh` snapshots the config before a rebuild, refuses to deploy without a valid one and verifies it is
 unchanged afterwards; `ops/restore-config.sh` restores it. Details in the
 [README](../../README.md#run-build-deploy) and [`skills/ship-and-verify`](../../skills/ship-and-verify/SKILL.md).
+
+## Policy
+
+![Policy settings](../media/screenshots/settings-policy.webp)
+
+Target weights and rebalancing bands, the performance benchmark, per-holding exposure currency, ETF look-through
+weights, the monthly contribution, the trend filter and tax residency. Nothing is written until you press Save.
+Purchase lots (date, shares, price, fees) are entered per holding in the **Positions** tab; with lots the server
+derives shares and cost basis, and the overview reports true time-weighted and money-weighted returns.

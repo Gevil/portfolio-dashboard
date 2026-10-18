@@ -49,12 +49,14 @@ with sync_playwright() as pw:
         if scheme == "dark":
             step("allocation", lambda: (pg.locator('[data-mode="allocation"]').click(), pg.wait_for_timeout(1200), pg.screenshot(path=OUT / "allocation-dark.png"), pg.locator('[data-mode="table"]').click(), pg.wait_for_timeout(600)))
             step("detail", lambda: (select_holding(pg, 0), pg.screenshot(path=OUT / "detail-dark.png")))
+            step("overview-full", lambda: (pg.screenshot(path=OUT / "overview-full-dark.png", full_page=True)))
             step("detail-range", lambda: (pg.click('.dt-chart-tools button[data-range="3M"]'), pg.wait_for_timeout(2500), pg.screenshot(path=OUT / "detail-3m-dark.png")))
             step("detail-scroll", lambda: (pg.evaluate("document.querySelector('.dt-pane').scrollIntoView()"), pg.mouse.wheel(0, 900), pg.wait_for_timeout(1200), pg.screenshot(path=OUT / "detail-analysis-dark.png")))
             step("alerts", lambda: (pg.click("#btn-alerts"), pg.wait_for_selector("[role=dialog]:visible"), pg.wait_for_timeout(1500), pg.screenshot(path=OUT / "alert-center-dark.png"), close_dialog(pg)))
             step("settings-watchlist", lambda: (pg.click("#btn-settings"), pg.wait_for_selector("[role=dialog]:visible"), pg.wait_for_timeout(1200), pg.screenshot(path=OUT / "settings-watchlist-dark.png")))
             step("settings-positions", lambda: (pg.get_by_role("tab", name="Positions").click(), pg.wait_for_timeout(900), pg.screenshot(path=OUT / "settings-positions-dark.png")))
             step("settings-rules", lambda: (pg.get_by_role("tab", name="Alert rules").click(), pg.wait_for_timeout(900), pg.screenshot(path=OUT / "settings-rules-dark.png"), close_dialog(pg)))
+            step("settings-policy", lambda: (pg.click("#btn-settings"), pg.wait_for_selector("[role=dialog]:visible"), pg.get_by_role("tab", name="Policy").click(), pg.wait_for_timeout(1200), pg.screenshot(path=OUT / "settings-policy-dark.png"), close_dialog(pg)))
             for view in ("digest", "market", "aiops"):
                 step(view, lambda v=view: (tab(pg, v, 4500), pg.screenshot(path=OUT / f"{v}-dark.png")))
             step("digest-full", lambda: (tab(pg, "digest", 3500), pg.screenshot(path=OUT / "digest-full-dark.png", full_page=True)))
@@ -76,6 +78,7 @@ with sync_playwright() as pw:
     pg = ctx.new_page(); ready(pg)
     pg.wait_for_timeout(2500)
     step("v-sort", lambda: (pg.locator('[data-mode="allocation"]').click(), pg.wait_for_timeout(2200), pg.locator('[data-mode="table"]').click(), pg.wait_for_timeout(1000)))
+    step("v-since", lambda: (pg.mouse.wheel(0, 650), pg.wait_for_timeout(1800), pg.mouse.wheel(0, 700), pg.wait_for_timeout(2200), pg.mouse.wheel(0, 700), pg.wait_for_timeout(2200), pg.mouse.wheel(0, -2100), pg.wait_for_timeout(800)))
     step("v-detail", lambda: (select_holding(pg, 0), pg.wait_for_timeout(1500)))
     for r in ("1W", "3M", "1Y"):
         step(f"v-range-{r}", lambda r=r: (pg.click(f'.dt-chart-tools button[data-range="{r}"]'), pg.wait_for_timeout(2300)))

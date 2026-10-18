@@ -23,6 +23,7 @@
 
 /* ---- generic card pieces ---- */
 .dt-card { display: block; }
+.dt-card[hidden] { display: none; }
 .dt-body { min-width: 0; }
 .dt-sub { margin: var(--space-4) 0 var(--space-2); }
 .dt-none { margin: 0; font-size: var(--fs-sm); }
@@ -86,6 +87,18 @@
 .dt-signals { display: grid; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
 .dt-signal { display: flex; align-items: center; gap: var(--space-2); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .dt-signal .dot { margin-top: 1px; }
+
+/* ---- advice (inside the AI card), attribution, lots ---- */
+.dt-advice { display: grid; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); min-width: 0; }
+.dt-advice[hidden] { display: none; }
+.dt-advice-head, .dt-advice-facts { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); min-width: 0; font-size: var(--fs-sm); }
+.dt-attr-note { margin-top: var(--space-2); }
+.dt-prevsrc { font-size: var(--fs-xs); }
+.dt-lots-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.dt-lots-table th, .dt-lots-table td { padding: var(--space-1) var(--space-2); text-align: right; border-top: 1px solid var(--line); white-space: nowrap; }
+.dt-lots-table thead th { border-top: 0; font-family: var(--font-mono); font-size: var(--fs-xs); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; }
+.dt-lots-table th[scope="row"], .dt-lots-table thead th:first-child, .dt-lots-table td:nth-child(2) { text-align: left; }
+.dt-lot-left { font-size: var(--fs-xs); }
 
 /* ---- news ---- */
 .dt-news-list { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }

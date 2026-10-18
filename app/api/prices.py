@@ -11,6 +11,9 @@
   skipped, no request is sent and no negative-cache entry is written.
 * History is retained by age (<=24 h 1-min, <=7 d 5-min, <=365 d daily) and
   persisted at most once per ``HISTORY_WRITE_INTERVAL`` from an executor.
+* ``prevClose`` is the close of ``calendars.previous_session`` of the session
+  the quote belongs to NOW (clock + venue calendar), exact-date row only;
+  ``daily_closes`` serves raw daily closes without touching the stored series.
 """
 import asyncio
 import datetime
@@ -23,10 +26,27 @@ from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
-from app.api import forex, jsonstore, registry
+from app.api import calendars, forex, jsonstore, registry
 from app.api.providers import finnhub, twelvedata
 
 log = logging.getLogger(__name__)
+
+
+class _YfNoDataFilter(logging.Filter):
+    """Drop yfinance's per-symbol "possibly delisted; no price data found" line:
+    the empty-fetch handling here (negative cache, one INFO) already covers it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "possibly delisted; no price data found" not in record.getMessage()
+
+
+def _install_yf_log_filter() -> None:
+    yf_log = logging.getLogger("yfinance")
+    if not any(isinstance(f, _YfNoDataFilter) for f in yf_log.filters):
+        yf_log.addFilter(_YfNoDataFilter())
+
+
+_install_yf_log_filter()
 
 # ------------------------------------------------------------------ config
 
@@ -102,7 +122,10 @@ _valuation_tasks: set = set()
 
 _quotes: dict[str, dict] = {}                 # id -> latest listing quote
 _quote_inflight: dict[str, asyncio.Task] = {}
-_prev_close_cache: dict[str, tuple] = {}      # id -> (value|None, session_day, ts)
+_prev_close_cache: dict[tuple[str, str], tuple] = {}  # (id, expected prev date) -> (value|None, ts)
+_prev_close_src: dict[str, str] = {}  # id -> 'daily'|'intraday': where its cached prevClose came from
+_daily_closes_cache: dict[tuple[str, str], tuple] = {}  # (id, period) -> (rows, ts)
+_empty_1d_logged: set[tuple[str, str]] = set()
 _seed_last: dict[str, float] = {}
 _seed_inflight: dict[str, asyncio.Task] = {}
 
@@ -115,6 +138,13 @@ _fetch_lock = asyncio.Lock()
 # than the old hour: a transient empty answer must not blank a symbol for long.
 _negative_cache: dict[tuple[str, str], float] = {}
 _NEGATIVE_TTL = 600
+
+# prevClose is the exact previous session's close (calendars): see _prev_close.
+# A 1d fetch that is empty within this window after the open is expected
+# (Yahoo EU data lags ~15 min) and is not logged.
+EMPTY_1D_QUIET_S = 20 * 60
+DAILY_CLOSES_TTL_S = 6 * 3600
+DAILY_CLOSES_PERIODS = ("6mo", "1y", "2y", "5y", "max")
 
 
 # ------------------------------------------------------------------ helpers
@@ -693,29 +723,146 @@ def _align_bars(ticker: str, interval: str, bars: list[dict]) -> list[dict]:
 
 # ------------------------------------------------------------------ listing quote
 
-def _venue_day(ticker: str, ts: int) -> str:
-    v = registry.venue(ticker)
-    tz = ZoneInfo(v["tz"]) if v else datetime.timezone.utc
-    return datetime.datetime.fromtimestamp(ts, tz).date().isoformat()
+def _note_empty_1d(ticker: str) -> None:
+    """One INFO per (listing, session) when the 1d fetch is empty outside the
+    first EMPTY_1D_QUIET_S of a session (Yahoo EU data lags ~15 min, so an
+    empty answer right after the open is expected and not worth a line)."""
+    now = time.time()
+    mic = calendars.mic_for(ticker)
+    day = calendars.quote_session(mic, now)
+    bounds = calendars.session_bounds(mic, day)
+    if bounds is not None:
+        opened = bounds[0].timestamp()
+        if opened <= now < opened + EMPTY_1D_QUIET_S:
+            return
+    key = (ticker, day.isoformat())
+    if key in _empty_1d_logged:
+        return
+    if len(_empty_1d_logged) > 500:
+        _empty_1d_logged.clear()
+    _empty_1d_logged.add(key)
+    log.info("yahoo 1d fetch empty for %s (session %s), using the 5d/15m fallback",
+             ticker, day)
 
 
-async def _prev_close(ticker: str, sym: str, as_of: int) -> float | None:
-    """Close of the session before the one `as_of` belongs to (cached 1h)."""
-    day = _venue_day(ticker, as_of)
-    ent = _prev_close_cache.get(ticker)
-    if ent:
-        val, ent_day, ts = ent
-        ttl = 3600 if val is not None else 300
-        if ent_day == day and time.time() - ts < ttl:
-            return val
-    rows = await _yf(sym, _yf_daily_blocking, sym, "5d")
-    if rows is None:
-        return ent[0] if ent and ent[1] == day else None
-    earlier = [c for d, c in rows if d < day]
-    val = earlier[-1] if earlier else None
-    _prev_close_cache[ticker] = (val, day, time.time())
-    _prune_cache(_prev_close_cache)
+def _exact_row(rows: list, day: str) -> float | None:
+    """Close of the daily row dated exactly ``day`` (never a neighbour)."""
+    for d, c in rows:
+        if d == day:
+            return c
+    return None
+
+
+def _last_bar_close(mic: str, day: datetime.date, bars) -> float | None:
+    """Close of the last bar dated ``day`` in the venue tz and not after the
+    session close; bars of other dates never count."""
+    bounds = calendars.session_bounds(mic, day)
+    if not bounds:
+        return None
+    close = bounds[1]
+    limit, tz = close.timestamp(), close.tzinfo
+    best = None
+    for b in bars or ():
+        t, c = b.get("t"), _finite(b.get("c"))
+        if not isinstance(t, (int, float)) or c is None or c <= 0 or t > limit:
+            continue
+        if datetime.datetime.fromtimestamp(t, tz).date() != day:
+            continue
+        if best is None or t > best[0]:
+            best = (t, c)
+    return best[1] if best else None
+
+
+async def _prev_close_intraday(ticker: str, sym: str, mic: str, expected: str,
+                               key: tuple) -> float | None:
+    """(b)/(c) of the prevClose chain: no daily row for ``expected``."""
+    day = datetime.date.fromisoformat(expected)
+    val = _last_bar_close(mic, day, history_store.get(ticker))
+    if val is None:
+        bars = await _yf(sym, _yf_bars_blocking, sym, "15m", "5d")
+        if bars is None:
+            ent = _prev_close_cache.get(key)
+            return ent[0] if ent else None   # failure/backoff: nothing cached
+        val = _last_bar_close(mic, day, bars)
+    if val is not None:
+        _prev_close_cache[key] = (val, time.time())
+        _prev_close_src[ticker] = "intraday"
+    else:
+        _prev_close_src.pop(ticker, None)
     return val
+
+
+async def _prev_close(ticker: str, sym: str) -> float | None:
+    """Close of the session before the one a quote belongs to NOW (F0).
+
+    The expected date is ``previous_session(quote_session(now))`` from the clock
+    and the venue calendar - never derived from the newest bar, which lags
+    (09:00-09:15 the 1d fetch is empty and the 15m fallback ends yesterday).
+    Only that exact date counts. Chain: the daily row (5d, then one retry with
+    1mo); else the close of the LAST bar dated that day (venue-local, at or
+    before the session close) from the stored listing history, then from a
+    5d/15m fetch; else None. The source lands in ``_prev_close_src``. The
+    cache is keyed by (id, expected date), so a value is never served for
+    another date; a None is remembered for 300 s only.
+    """
+    now = time.time()
+    mic = calendars.mic_for(ticker)
+    expected = calendars.previous_session(
+        mic, calendars.quote_session(mic, now)).isoformat()
+    key = (ticker, expected)
+    ent = _prev_close_cache.get(key)
+    if ent:
+        val, cached_at = ent
+        if now - cached_at < (3600 if val is not None else 300):
+            return val
+    val = None
+    for period in ("5d", "1mo"):
+        rows = await _yf(sym, _yf_daily_blocking, sym, period)
+        if rows is None:
+            return ent[0] if ent else None   # failure/backoff: same-date value only
+        val = _exact_row(rows, expected)
+        if val is not None:
+            break
+    _prev_close_cache[key] = (val, time.time())
+    _prune_cache(_prev_close_cache)
+    if val is not None:
+        _prev_close_src[ticker] = "daily"
+        return val
+    return await _prev_close_intraday(ticker, sym, mic, expected, key)
+
+
+async def daily_closes(ticker: str, period: str = "2y") -> list[tuple[str, float]]:
+    """[(exchange-local ISO date, raw unadjusted close)] oldest first.
+
+    The entry's listing symbol (index entries: their yahoo provider symbol,
+    native currency). Cached per (ticker, period) for DAILY_CLOSES_TTL_S; a
+    failed fetch returns the last cached value or []. Never raises, never
+    writes the listing history store; unknown/unsupported ids and periods -> [].
+    """
+    ticker = (ticker or "").strip().upper()
+    if period not in DAILY_CLOSES_PERIODS:
+        return []
+    entry = registry.get(ticker)
+    if not entry:
+        return []
+    sym = (entry.get("listing") or {}).get("symbol") or entry["providers"].get("yahoo")
+    if not sym:
+        return []
+    key = (ticker, period)
+    cached = _daily_closes_cache.get(key)
+    if cached and time.time() - cached[1] < DAILY_CLOSES_TTL_S:
+        return list(cached[0])
+    try:
+        rows = await _yf(sym, _yf_daily_blocking, sym, period)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("daily_closes %s failed: %s", ticker, e)
+        rows = None
+    if rows:
+        _daily_closes_cache[key] = (list(rows), time.time())
+        return list(rows)
+    return list(cached[0]) if cached else []
 
 
 async def _refresh_listing_quote(ticker: str) -> dict | None:
@@ -732,6 +879,8 @@ async def _refresh_listing_quote(ticker: str) -> dict | None:
             break
         if bars is None:
             return _quotes.get(ticker)   # failure/backoff: keep what we have
+        if period == "1d":
+            _note_empty_1d(ticker)
     if not bars:
         _note_negative("yahoo", sym)
         return _quotes.get(ticker)
@@ -739,7 +888,7 @@ async def _refresh_listing_quote(ticker: str) -> dict | None:
     _guard_series(ticker)
     _persist_points(ticker, bars, SRC_YF)
     last = bars[-1]
-    prev = await _prev_close(ticker, sym, last["t"])
+    prev = await _prev_close(ticker, sym)
     q = {
         "price": last["c"],
         "asOf": int(last["t"]),
@@ -781,6 +930,7 @@ def _quote_view(ticker: str, q: dict, refreshed_ok: bool) -> dict:
         "id": ticker,
         "price": price,
         "prevClose": prev,
+        "prevCloseSource": _prev_close_src.get(ticker) if prev is not None else None,
         "change": change,
         "changePct": pct,
         "currency": q["currency"],
@@ -899,6 +1049,7 @@ async def _price_item(ticker: str) -> dict:
         "ticker": ticker,
         "price": q["price"],
         "previousClose": q["prevClose"],
+        "prevCloseSource": q.get("prevCloseSource"),
         "change24h": q["changePct"],
         "change": q["change"],
         "priceCurrency": q["currency"],
@@ -1140,7 +1291,8 @@ async def refresh_history(ticker: str) -> bool:
     _valuation_cache.pop(ticker, None)
     _schedule_valuation_write()
     _quotes.pop(ticker, None)
-    _prev_close_cache.pop(ticker, None)
+    for k in [k for k in _prev_close_cache if k[0] == ticker]:
+        _prev_close_cache.pop(k, None)
     return _replace_series(ticker, pts)
 
 
@@ -1401,8 +1553,10 @@ def _reset_state():
     _history_meta = {}
     _load_failed = False
     for d in (_store_version, _history_cache, _quotes, _prev_close_cache, _seed_last,
-              _backoff, _consecutive_429, _negative_cache, _valuation_cache):
+              _backoff, _consecutive_429, _negative_cache, _valuation_cache,
+              _daily_closes_cache, _prev_close_src):
         d.clear()
+    _empty_1d_logged.clear()
     for w in (_history_writer, _valuation_writer):
         if w._handle is not None:
             w._handle.cancel()

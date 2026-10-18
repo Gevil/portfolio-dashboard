@@ -14,7 +14,6 @@ earnings scan weekly. Needs ``FRED_API_KEY`` for the FRED rows (curve works
 without it).
 """
 import asyncio
-import calendar as _calendar
 import csv
 import datetime
 import io
@@ -25,7 +24,7 @@ import time
 
 import httpx
 
-from app.api import jsonstore, runlog
+from app.api import calendars, jsonstore, runlog
 
 log = logging.getLogger("macro")
 
@@ -75,130 +74,38 @@ COT_TEXT_FIELDS = frozenset({"date", "market", "exchange"})
 
 
 # ------------------------------------------------------------------ calendar
-# Trading-day gate (digest batching, scoreboard horizons). No new pip deps:
-# ``exchange-calendars`` would drag a pandas-sized tree in for what is a fixed
-# rule table plus one computus. Holidays are DERIVED per year (fixed dates +
-# nth-weekday rules + Easter movables) instead of being pasted as a literal
-# list — a literal silently treats any year outside its range as a full
-# working year, which is exactly the failure mode that would fire a digest on
-# Christmas.
-
-CAL_YEARS = range(datetime.date.today().year - 1,
-                  datetime.date.today().year + 3)
-
-
-def _easter(year: int) -> datetime.date:
-    """Easter Sunday — anonymous Gregorian (Meeus/Jones/Butcher) computus."""
-    a = year % 19
-    b, c = divmod(year, 100)
-    d, e = divmod(b, 4)
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i, k = divmod(c, 4)
-    l = (32 + 2 * e + 2 * i - h - k) % 7  # noqa: E741 - computus naming
-    m = (a + 11 * h + 22 * l) // 451
-    month, day = divmod(h + l - 7 * m + 114, 31)
-    return datetime.date(year, month, day + 1)
-
-
-def _observed(day: datetime.date) -> datetime.date:
-    """US-style observance: a fixed holiday on Saturday moves to Friday, on
-    Sunday to Monday (what NYSE publishes; Euronext simply stays closed)."""
-    if day.weekday() == 5:
-        return day - datetime.timedelta(days=1)
-    if day.weekday() == 6:
-        return day + datetime.timedelta(days=1)
-    return day
-
-
-def _weekday_n(year: int, month: int, weekday: int, n: int) -> datetime.date:
-    """n-th (or n==-1: last) ``weekday`` (Mon=0) of ``month``."""
-    first = datetime.date(year, month, 1)
-    offset = (weekday - first.weekday()) % 7
-    if n > 0:
-        return first + datetime.timedelta(days=offset + 7 * (n - 1))
-    last = datetime.date(year, month,
-                         _calendar.monthrange(year, month)[1])
-    return last - datetime.timedelta(days=(last.weekday() - weekday) % 7)
-
-
-def _year_holidays(market: str, year: int) -> set:
-    """Exchange closures for one year (weekend-only closures dropped: they are
-    not trading days anyway and would only bloat the set)."""
-    e = _easter(year)
-    if market == "XAMS":
-        # Euronext Amsterdam: Good Friday, Easter Monday, Ascension, Whit
-        # Monday + King's Day (Apr 27), Liberation Day (May 5), 1st + 2nd
-        # Christmas day. No observance shifts (a Sunday holiday just stays one).
-        days = {datetime.date(year, 1, 1), datetime.date(year, 4, 27),
-                datetime.date(year, 5, 5), datetime.date(year, 12, 25),
-                datetime.date(year, 12, 26),
-                e - datetime.timedelta(days=2), e + datetime.timedelta(days=1),
-                e + datetime.timedelta(days=39),
-                e + datetime.timedelta(days=50)}
-    else:
-        days = {_observed(datetime.date(year, 1, 1)),
-                _observed(datetime.date(year, 6, 19)),
-                _observed(datetime.date(year, 7, 4)),
-                _observed(datetime.date(year, 12, 25)),
-                _weekday_n(year, 1, 0, 3),      # Martin Luther King Jr. Day
-                _weekday_n(year, 2, 0, 3),      # Presidents Day
-                _weekday_n(year, 5, 0, -1),     # Memorial Day
-                _weekday_n(year, 9, 0, 1),      # Labor Day
-                _weekday_n(year, 11, 3, 4),     # Thanksgiving
-                e - datetime.timedelta(days=2)}  # Good Friday
-    return {d for d in days if d.weekday() < 5}
-
-
-HOLIDAYS: dict = {m: set().union(*(_year_holidays(m, y) for y in CAL_YEARS))
-                  for m in ("XNYS", "XAMS")}
-
-
-def holidays(market: str, year: int) -> set:
-    """Closure set for one market/year, computed on demand so any horizon walk
-    reaching outside ``CAL_YEARS`` still gets real holidays."""
-    return _year_holidays(market if market in ("XNYS", "XAMS") else "XNYS",
-                          year)
-
+# Trading-day gate (digest batching, scoreboard horizons). Sessions and
+# holidays come from ``calendars`` (exchange_calendars); these helpers keep
+# the names the scoreboard and digest already call.
 
 def is_trading_day(market: str, day: datetime.date) -> bool:
-    """Mon-Fri and not an exchange closure."""
-    return day.weekday() < 5 and day not in holidays(market, day.year)
+    """True when ``day`` is a session of the ``market`` MIC."""
+    return calendars.is_session(market, day)
 
 
 def market_for_ticker(ticker: str) -> str:
-    """XAMS for Euronext-listed symbols (the same membership the Euronext
-    quote provider uses), XNYS otherwise — including indices."""
-    from app.api import live_ws
-    return "XAMS" if live_ws.is_eu_symbol(ticker) else "XNYS"
+    """MIC of the watchlist id's listing venue (``.DE`` listings are XETR,
+    ``.AS`` XAMS); indices and unknown ids -> XNYS."""
+    return calendars.mic_for(ticker)
 
 
 def next_trading_day(market: str, day: datetime.date) -> datetime.date:
     """First trading day strictly after ``day``."""
-    nxt = day + datetime.timedelta(days=1)
-    while not is_trading_day(market, nxt):
-        nxt += datetime.timedelta(days=1)
-    return nxt
+    return calendars.next_session(market, day)
 
 
 def advance_trading_days(market: str, day: datetime.date, n: int) -> datetime.date:
     """The trading day ``n`` sessions after ``day`` (n<=0 returns ``day``)."""
-    out = day
-    for _ in range(max(0, n)):
-        out = next_trading_day(market, out)
-    return out
+    if n <= 0:
+        return day
+    return calendars.add_sessions(market, day, n)
 
 
 def trading_days_between(market: str, start: datetime.date,
                          end: datetime.date) -> list:
     """Trading days in [start, end] (empty when inverted)."""
-    out, cur = [], start
-    while cur <= end:
-        if is_trading_day(market, cur):
-            out.append(cur)
-        cur += datetime.timedelta(days=1)
-    return out
+    return calendars.sessions_between(market, start, end)
+
 
 _client: httpx.AsyncClient | None = None
 _tasks: list[asyncio.Task] = []
@@ -480,4 +387,4 @@ def status() -> dict:
     cal = datetime.date.today()
     return {**_stats, "fred_key": bool(FRED_KEY), "running": bool(_tasks),
             "today_trading_day": {m: is_trading_day(m, cal)
-                                  for m in ("XNYS", "XAMS")}}
+                                  for m in ("XNYS", "XAMS", "XETR")}}

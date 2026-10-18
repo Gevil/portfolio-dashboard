@@ -1,13 +1,19 @@
-// Overview: hero strip, attention list, positions table / allocation, portfolio-vs-benchmark chart,
-// and the host for the selected-holding detail (docked pane on wide screens, drawer otherwise).
+// Overview: since-your-last-visit strip, hero strip, needs-attention cards, positions table /
+// allocation, performance card (TWR / XIRR, perf-vs-role benchmark), risk and policy panels, and the
+// host for the selected-holding detail (docked pane on wide screens, drawer otherwise).
+// Panel logic lives in _since / _attn / _perf / _risk / _policy; this file wires data, state and DOM.
 import { el, clear, fmtEur, fmtPct, fmtNum, fmtDateTime24, signCls, isNum } from '../util.js';
 import { get, slot, subscribe } from '../store.js';
 import { apiGet, latestRequest } from '../api.js';
 import { renderState, stamp, openDialog, usePolling } from '../ui.js';
 import * as data from '../data.js';
 import { drawSparkline, createDonut, createIndexedChart } from '../charts.js';
+import { buildSince, computeSince, isCollapsed, isDismissed, markDismissed, setCollapsed } from './_since.js';
+import { buildAttentionCard, buildAttentionItems } from './_attn.js';
+import { PERF_RANGES, basisOf, benchmarkChoices, buildBasisWarning, buildKpis, kindText, perfBenchmarkLabel } from './_perf.js';
+import { buildRisk } from './_risk.js';
+import { buildPolicy } from './_policy.js';
 
-const PERF_RANGES = ['1M', '3M', '6M', '1Y'];
 const SORTS = [
   { key: 'weightPct', label: 'Weight', th: 'Weight' },
   { key: 'valueEur', label: 'Value', th: 'Value' },
@@ -20,48 +26,64 @@ const SORTS = [
 ];
 const LIGHT_LABEL = { green: 'Green', yellow: 'Yellow', red: 'Red' };
 const LIGHT_CLS = { green: 'ok', yellow: 'warn', red: 'err' };
-const SEV_ORDER = { urgent: 0, warn: 1, info: 2 };
-const SEV_TEXT = { urgent: 'Urgent', warn: 'Warning', info: 'Info' };
+const PERF_REFRESH_MS = 600000;
+const RISK_KEY = 'pd.riskOpen';
 
 const wideQuery = window.matchMedia('(min-width: 1200px)');
 
+function readFlag(key, dflt) {
+  try {
+    const v = localStorage.getItem(key);
+    return v == null ? dflt : v === '1';
+  } catch (_) { return dflt; }
+}
+function writeFlag(key, on) {
+  try { localStorage.setItem(key, on ? '1' : '0'); } catch (_) { /* storage blocked: not remembered */ }
+}
 function openSettingsTab(tab) {
   import('./settings.js').then(m => m.openSettings({ tab })).catch(e => console.error('settings failed', e));
 }
-function openAlerts() {
-  import('./alertcenter.js').then(m => m.openAlertCenter()).catch(e => console.error('alert center failed', e));
+/** Routes are hashes owned by main.js (#detail/<ID>, #alerts/<id>, #aiops, ...). */
+function go(hash) {
+  location.hash = hash;
 }
 
 export function mountOverview(root) {
   const cleanups = [];
-  const view = { sort: 'weightPct', dir: 'desc', mode: 'table', perfRange: '3M', attnAll: false };
+  const view = {
+    sort: 'weightPct', dir: 'desc', mode: 'table', perfRange: '3M', perfBench: 'perf', attnAll: false,
+    sinceCollapsed: isCollapsed(), sinceDismissed: isDismissed(get('lastVisit')), riskOpen: readFlag(RISK_KEY, true),
+  };
   const prevValues = new Map();
-  const perf = { res: null, ts: null, error: null, data: null, loading: false };
+  // history = /api/portfolio/history payload, performance = /api/portfolio/performance payload (same range).
+  const perf = { history: null, performance: null, ts: null, error: null, perfError: null, loading: false };
 
   // ------------------------------------------------------------ skeleton DOM
+  const sinceHost = el('div', { class: 'since-host' });
   const heroHost = el('section', { class: 'hero', 'aria-label': 'Portfolio summary' });
-  const attnHost = el('section', { class: 'card attn', 'aria-labelledby': 'attn-title' });
+  const attnHost = el('section', { class: 'card attn', id: 'attn-card', 'aria-labelledby': 'attn-title' });
   const posCard = el('section', { class: 'card pos-card', 'aria-labelledby': 'pos-title' });
-  const perfCard = el('section', { class: 'card perf-card', 'aria-labelledby': 'perf-title' });
+  const perfCard = el('section', { class: 'card perf-card', id: 'perf-card', 'aria-labelledby': 'perf-title' });
+  const policyCard = el('section', { class: 'card policy-card', id: 'policy-card', 'aria-labelledby': 'policy-title' });
+  const riskCard = el('section', { class: 'card risk-card', id: 'risk-card', 'aria-labelledby': 'risk-title' });
   const dock = el('aside', { class: 'ov-dock', 'aria-label': 'Holding detail', hidden: true });
-  const main = el('div', { class: 'ov-main' }, el('div', { class: 'ov-left' }, posCard, perfCard), dock);
-  root.replaceChildren(el('div', { class: 'ov' }, heroHost, attnHost, main));
+  const main = el('div', { class: 'ov-main' }, el('div', { class: 'ov-left' }, posCard, perfCard, policyCard, riskCard), dock);
+  root.replaceChildren(el('div', { class: 'ov' }, sinceHost, heroHost, attnHost, main));
 
   // ------------------------------------------------------------ helpers
-  const bench = () => {
+  const roleBench = () => {
     const d = slot('portfolio').data;
     return (d && d.benchmark) || null;
   };
-  const benchLabel = () => (bench() && bench().label) || 'Benchmark';
+  const roleLabel = () => (roleBench() && roleBench().label) || 'Benchmark';
+  /** Label of the PERFORMANCE benchmark (hero KPI, KPI strip); falls back to the role benchmark. */
+  const benchLabel = () => perfBenchmarkLabel(perf.history, perf.performance, data.labelOf) || roleLabel();
   const labelsOf = ids => (ids || []).map(id => data.labelOf(id)).join(', ');
 
-  function vsBenchmark() {
-    const ix = perf.data && perf.data.indexed;
-    if (!ix || !Array.isArray(ix.portfolio) || !Array.isArray(ix.benchmark)) return null;
-    const p = ix.portfolio[ix.portfolio.length - 1];
-    const b = ix.benchmark[ix.benchmark.length - 1];
-    if (!p || !b || !isNum(p.pct) || !isNum(b.pct)) return null;
-    return { portfolio: p.pct, benchmark: b.pct, diff: p.pct - b.pct };
+  /** The /performance payload for the selected range, when it carries an excess return. */
+  function excess() {
+    const p = perf.performance;
+    return p && p.range === view.perfRange && isNum(p.excessPct) ? p : null;
   }
 
   // ------------------------------------------------------------ hero
@@ -87,7 +109,7 @@ export function mountOverview(root) {
     }
     const t = d.totals || {};
     const b = d.benchmark || {};
-    const vb = vsBenchmark();
+    const pe = excess();
     const stale = !!pf.error || !!pf.stale;
     const cards = [];
 
@@ -129,11 +151,11 @@ export function mountOverview(root) {
 
     cards.push(statCard({
       label: `vs ${benchLabel()} \u00b7 ${view.perfRange}`,
-      value: vb ? `${vb.diff >= 0 ? '+' : '\u2212'}${fmtNum(Math.abs(vb.diff), 1)} pp` : '\u2013',
-      valueCls: vb ? signCls(vb.diff) : 'flat',
-      sub: `${benchLabel()} today ${fmtPct(b.dayPct)}`,
+      value: pe ? `${pe.excessPct >= 0 ? '+' : '\u2212'}${fmtNum(Math.abs(pe.excessPct), 1)} pp` : '\u2013',
+      valueCls: pe ? signCls(pe.excessPct) : 'flat',
+      sub: `${roleLabel()} today ${fmtPct(b.dayPct)}`,
       subCls: 'flat',
-      note: vb ? `portfolio ${fmtPct(vb.portfolio)} vs ${fmtPct(vb.benchmark)}` : (perf.error ? 'comparison unavailable' : ''),
+      note: pe ? `portfolio ${fmtPct(pe.twrPct)} vs ${fmtPct(pe.perfBenchmarkPct)}` : (perf.perfError ? 'comparison unavailable' : ''),
     }));
 
     cards.push(lightCard());
@@ -160,57 +182,37 @@ export function mountOverview(root) {
     return btn;
   }
 
-  // ------------------------------------------------------------ attention
-  function attentionItems() {
-    const items = [];
+  // ------------------------------------------------------------ since your last visit
+  function renderSince() {
     const pf = slot('portfolio');
-    const d = pf.data;
-    const cfgRules = (slot('config').data || {}).alertRules;
-    const def = (cfgRules && cfgRules.default) || {};
-    const thr = isNum(def.thresholdPct) ? def.thresholdPct : 3;
-    const hot = isNum(def.hotPct) ? def.hotPct : 5;
-    const open = id => ({ label: 'Open', fn: () => data.selectHolding(id) });
-
-    const al = slot('alerts');
-    if (al.error && !al.data) items.push({ sev: 'info', text: `Alerts could not be loaded: ${al.error}`, action: { label: 'Retry', fn: () => data.refreshAlerts() } });
-    const unacked = al.data && Array.isArray(al.data.items) ? al.data.items.filter(a => !a.acked) : [];
-    unacked.slice(0, 3).forEach(a => items.push({
-      sev: a.severity === 'urgent' || a.severity === 'warn' ? a.severity : 'info',
-      text: a.title + (a.message && a.message !== a.title ? ` \u2014 ${a.message}` : ''),
-      meta: fmtDateTime24(a.time),
-      action: a.ticker && data.positionOf(a.ticker) ? open(a.ticker) : { label: 'Alerts', fn: openAlerts },
+    if (view.sinceDismissed || !pf.data) { sinceHost.replaceChildren(); return; }
+    const last = get('lastVisit') || null;
+    const model = computeSince({
+      portfolio: pf.data, rules: slot('alertRules').data, alerts: slot('alerts').data,
+      advice: slot('advice').data, events: slot('events').data, lastVisit: last,
+    });
+    sinceHost.replaceChildren(buildSince(model, {
+      lastVisit: last, collapsed: view.sinceCollapsed, labelOf: data.labelOf,
+      onToggle: () => {
+        view.sinceCollapsed = !view.sinceCollapsed;
+        setCollapsed(view.sinceCollapsed);
+        renderSince();
+        const b = sinceHost.querySelector('#since-toggle');
+        if (b) b.focus({ preventScroll: true });
+      },
+      onDismiss: () => { view.sinceDismissed = true; markDismissed(last); renderSince(); },
     }));
-    if (unacked.length > 3) items.push({ sev: 'info', text: `${unacked.length - 3} more unread alerts`, action: { label: 'Alerts', fn: openAlerts } });
-
-    if (pf.error) {
-      items.push({ sev: d ? 'warn' : 'urgent', text: `Portfolio could not be refreshed: ${pf.error}${d ? ` (showing data from ${fmtDateTime24(pf.ts)})` : ''}`, action: { label: 'Retry', fn: () => data.refreshPortfolio() } });
-    }
-    if (d) {
-      (d.warnings || []).forEach(w => items.push({ sev: 'warn', text: w.message || w.code, action: Array.isArray(w.ids) && w.ids.length === 1 && data.positionOf(w.ids[0]) ? open(w.ids[0]) : null }));
-      if (d.fx && d.fx.stale) items.push({ sev: 'warn', text: `FX rate is stale (${d.fx.source || 'unknown source'}, as of ${fmtDateTime24(d.fx.asOf)}) \u2013 EUR values may be off.` });
-      const missing = (d.totals && d.totals.costMissing) || [];
-      const warned = (d.warnings || []).some(w => /cost/i.test(w.code || ''));
-      if (missing.length && !warned) items.push({ sev: 'info', text: `Cost basis missing for ${labelsOf(missing)}; total P&L excludes it.`, action: { label: 'Settings', fn: () => openSettingsTab('positions') } });
-      for (const p of d.positions || []) {
-        const name = p.label || p.id;
-        if (isNum(p.dayPct) && Math.abs(p.dayPct) >= thr) {
-          items.push({ sev: Math.abs(p.dayPct) >= hot ? 'urgent' : 'warn', text: `${name} ${fmtPct(p.dayPct)} today (alert threshold \u00b1${thr}%)`, action: open(p.id) });
-        }
-        if (isNum(p.mddPct) && Math.abs(p.mddPct) >= 15) {
-          items.push({ sev: 'warn', text: `${name} is ${fmtPct(-Math.abs(p.mddPct), { dec: 1 })} from its 52-week high`, action: open(p.id) });
-        }
-        if (p.stale) items.push({ sev: 'info', text: `${name}: price is stale (last tick ${fmtDateTime24(p.priceAsOf)})`, action: open(p.id) });
-      }
-    }
-    const lane = slot('lane').data;
-    if (lane && lane.role === 'fallback') {
-      items.push({ sev: 'info', text: `AI answers are coming from the fallback model${lane.model ? ` (${lane.model})` : ''}.`, action: { label: 'AI Ops', fn: () => { location.hash = 'aiops'; } } });
-    }
-    return items.sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev]);
   }
 
+  // ------------------------------------------------------------ attention
   function renderAttention() {
-    const items = attentionItems();
+    const items = buildAttentionItems({
+      portfolio: slot('portfolio'), alerts: slot('alerts'), lane: slot('lane'),
+      config: slot('config').data, rules: slot('alertRules').data, advice: slot('advice').data,
+      events: slot('events').data, policy: slot('policy').data,
+      labelOf: data.labelOf, positionOf: data.positionOf, go, settings: openSettingsTab,
+      retryAlerts: () => data.refreshAlerts(), retryPortfolio: () => data.refreshPortfolio(),
+    });
     const shown = view.attnAll ? items : items.slice(0, 3);
     const head = el('div', { class: 'card-head' },
       el('h2', { class: 'card-title', id: 'attn-title' }, 'Needs attention',
@@ -222,15 +224,9 @@ export function mountOverview(root) {
       return;
     }
     attnHost.classList.remove('is-clear');
-    const list = el('ul', { class: 'attn-list' });
-    for (const it of shown) {
-      list.append(el('li', { class: `attn-item sev-${it.sev}` },
-        el('span', { class: 'attn-sev' }, SEV_TEXT[it.sev]),
-        el('span', { class: 'attn-text' }, it.text, it.meta ? el('span', { class: 'attn-meta num', text: ` \u00b7 ${it.meta}` }) : null),
-        it.action ? el('button', { type: 'button', class: 'btn btn-sm', onclick: it.action.fn, text: it.action.label }) : null));
-    }
+    const list = el('ul', { class: 'attn-list', id: 'attn-list' }, shown.map(buildAttentionCard));
     const more = items.length > 3
-      ? el('button', { type: 'button', class: 'link-btn', 'aria-expanded': view.attnAll ? 'true' : 'false', onclick: () => { view.attnAll = !view.attnAll; renderAttention(); }, text: view.attnAll ? 'Show fewer' : `Show all ${items.length}` })
+      ? el('button', { type: 'button', class: 'link-btn', id: 'attn-more', 'aria-expanded': view.attnAll ? 'true' : 'false', onclick: () => { view.attnAll = !view.attnAll; renderAttention(); }, text: view.attnAll ? 'Show fewer' : `Show all ${items.length}` })
       : null;
     attnHost.replaceChildren(...[head, list, more].filter(Boolean));
   }
@@ -402,30 +398,59 @@ export function mountOverview(root) {
     }
   }
 
-  // ------------------------------------------------------------ performance chart
+  // ------------------------------------------------------------ performance card
   const perfChartHost = el('div', { class: 'perf-chart' });
+  const perfKpiHost = el('div', { class: 'perf-kpi-host' });
+  const perfNotes = el('div', { class: 'perf-notes' });
   const perfSummary = el('p', { class: 'perf-summary num' });
   const perfStamp = el('span', { class: 'perf-stamp' });
   const rangeBtns = PERF_RANGES.map(r => el('button', {
     type: 'button', 'aria-pressed': r === view.perfRange ? 'true' : 'false', dataset: { range: r }, text: r,
     onclick: () => { view.perfRange = r; paintRange(); loadPerf(); renderHero(); },
   }));
+  const benchBtns = ['perf', 'role'].map(k => el('button', {
+    type: 'button', 'aria-pressed': k === view.perfBench ? 'true' : 'false', dataset: { bench: k }, text: k === 'perf' ? 'Performance benchmark' : 'Role benchmark',
+    onclick: () => { view.perfBench = k; paintPerf(); },
+  }));
+  const benchSeg = el('div', { class: 'seg perf-bench-seg', id: 'perf-bench-toggle', role: 'group', 'aria-label': 'Benchmark line', hidden: true }, benchBtns);
   function paintRange() { rangeBtns.forEach(b => b.setAttribute('aria-pressed', b.dataset.range === view.perfRange ? 'true' : 'false')); }
   perfCard.append(
     el('div', { class: 'card-head' },
       el('h2', { class: 'card-title', id: 'perf-title' }, 'Portfolio vs benchmark (indexed %)'),
-      el('div', { class: 'card-tools' }, perfStamp, el('div', { class: 'seg', role: 'group', 'aria-label': 'Chart range' }, rangeBtns))),
-    perfChartHost, perfSummary);
+      el('div', { class: 'card-tools' }, perfStamp, el('div', { class: 'seg', id: 'perf-range', role: 'group', 'aria-label': 'Chart range' }, rangeBtns))),
+    benchSeg, perfKpiHost, perfNotes, perfChartHost, perfSummary);
   const perfChart = createIndexedChart(perfChartHost);
   cleanups.push(() => perfChart.destroy());
-  const perfReq = latestRequest();
-  cleanups.push(() => perfReq.abort());
+  const histReq = latestRequest();
+  const kpiReq = latestRequest();
+  cleanups.push(() => { histReq.abort(); kpiReq.abort(); });
 
   function paintPerf() {
     perfStamp.replaceChildren(perf.ts ? stamp(perf.ts, { stale: !!perf.error }) : '');
-    const ix = perf.data && perf.data.indexed;
+    const h = perf.history;
+    const ix = h && h.indexed;
     const n = ix && Array.isArray(ix.portfolio) ? ix.portfolio.length : 0;
-    if (!perf.data) {
+    const choices = benchmarkChoices(h);
+    const line = view.perfBench === 'role' && choices.role ? choices.role : choices.perf;
+    benchSeg.hidden = !choices.toggle;
+    if (choices.toggle) {
+      benchBtns[0].textContent = `${choices.perf.label} \u00b7 ${kindText(choices.perf.kind)}`;
+      benchBtns[1].textContent = `${choices.role.label} \u00b7 ${kindText(choices.role.kind)}`;
+    }
+    benchBtns.forEach(b => b.setAttribute('aria-pressed', (b.dataset.bench === 'role') === (line === choices.role && choices.toggle) ? 'true' : 'false'));
+
+    const p = perf.performance;
+    if (p && p.range === view.perfRange) {
+      perfKpiHost.replaceChildren(buildKpis(p, benchLabel()));
+    } else if (perf.perfError) {
+      perfKpiHost.replaceChildren(el('p', { class: 'pos-note warn-ink', role: 'status' }, `Return figures unavailable: ${perf.perfError}`));
+    } else {
+      perfKpiHost.replaceChildren();
+    }
+    perfNotes.replaceChildren(...(basisOf(h, p && p.range === view.perfRange ? p : null) === 'current_shares'
+      ? [buildBasisWarning(() => openSettingsTab('positions'))] : []));
+
+    if (!h) {
       perfChart.setState(perf.error ? { error: perf.error } : { loading: true });
       perfSummary.textContent = '';
       return;
@@ -436,27 +461,91 @@ export function mountOverview(root) {
       return;
     }
     perfChart.setState(null);
-    perfChart.setData({ portfolio: ix.portfolio, benchmark: ix.benchmark || [], portfolioLabel: 'Portfolio', benchmarkLabel: (perf.data.benchmark && perf.data.benchmark.label) || benchLabel() });
-    const vb = vsBenchmark();
-    perfSummary.textContent = vb
-      ? `Portfolio ${fmtPct(vb.portfolio)} \u00b7 ${benchLabel()} ${fmtPct(vb.benchmark)} \u00b7 difference ${vb.diff >= 0 ? '+' : '\u2212'}${fmtNum(Math.abs(vb.diff), 1)} pp over ${view.perfRange}`
+    const label = line ? `${line.label} (${kindText(line.kind)})` : 'Benchmark';
+    perfChart.setData({ portfolio: ix.portfolio, benchmark: line ? line.series : [], portfolioLabel: 'Portfolio', benchmarkLabel: label });
+    const lp = ix.portfolio[ix.portfolio.length - 1];
+    const lb = line && line.series[line.series.length - 1];
+    perfSummary.textContent = lp && lb && isNum(lp.pct) && isNum(lb.pct)
+      ? `Portfolio ${fmtPct(lp.pct)} \u00b7 ${label} ${fmtPct(lb.pct)} \u00b7 difference ${lp.pct - lb.pct >= 0 ? '+' : '\u2212'}${fmtNum(Math.abs(lp.pct - lb.pct), 1)} pp over ${view.perfRange}`
       : '';
     if (perf.error) perfSummary.textContent += ` \u00b7 refresh failed: ${perf.error}`;
   }
 
   async function loadPerf() {
     const range = view.perfRange;
-    const t = perfReq.begin();
+    const q = encodeURIComponent(range);
+    const th = histReq.begin();
+    const tk = kpiReq.begin();
     perf.loading = true;
-    if (!perf.data || perf.data.range !== range) { perf.data = null; paintPerf(); }
-    const res = await apiGet(`/api/portfolio/history?range=${encodeURIComponent(range)}`, { signal: t.signal, timeoutMs: 30000 });
-    if (!t.current()) return;
-    perf.loading = false;
-    if (res.ok) { perf.data = res.data; perf.ts = Date.now(); perf.error = null; } else { perf.error = res.error; }
+    if (!perf.history || perf.history.range !== range) perf.history = null;
+    if (!perf.performance || perf.performance.range !== range) perf.performance = null;
     paintPerf();
-    renderHero();
+    await Promise.all([
+      apiGet(`/api/portfolio/history?range=${q}`, { signal: th.signal, timeoutMs: 30000 }).then(res => {
+        if (!th.current()) return;
+        perf.loading = false;
+        if (res.ok) { perf.history = res.data; perf.ts = Date.now(); perf.error = null; } else { perf.error = res.error; }
+        paintPerf();
+        renderHero();
+      }),
+      apiGet(`/api/portfolio/performance?range=${q}`, { signal: tk.signal, timeoutMs: 30000 }).then(res => {
+        if (!tk.current()) return;
+        if (res.ok) { perf.performance = res.data; perf.perfError = null; } else { perf.perfError = res.error; }
+        paintPerf();
+        renderHero();
+      }),
+    ]);
   }
-  cleanups.push(usePolling(loadPerf, 120000));
+  cleanups.push(usePolling(loadPerf, PERF_REFRESH_MS));
+
+  // ------------------------------------------------------------ risk panel (collapsible)
+  const riskBody = el('div', { class: 'risk-body', id: 'risk-body' });
+  const riskStamp = el('span', { class: 'risk-stamp' });
+  const riskToggle = el('button', {
+    type: 'button', class: 'btn btn-ghost btn-sm', id: 'risk-toggle', 'aria-controls': 'risk-body',
+    onclick: () => { view.riskOpen = !view.riskOpen; writeFlag(RISK_KEY, view.riskOpen); paintRiskOpen(); },
+  });
+  riskCard.append(
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'card-title', id: 'risk-title' }, 'Risk'),
+      el('div', { class: 'card-tools' }, riskStamp, riskToggle)),
+    riskBody);
+  function paintRiskOpen() {
+    riskBody.hidden = !view.riskOpen;
+    riskToggle.setAttribute('aria-expanded', view.riskOpen ? 'true' : 'false');
+    riskToggle.textContent = view.riskOpen ? 'Collapse' : 'Expand';
+  }
+  function renderRisk() {
+    const s = slot('risk');
+    riskStamp.replaceChildren(s.ts ? stamp(s.ts, { stale: !!s.error }) : '');
+    if (!s.data) {
+      renderState(riskBody, s.error ? { error: `Risk unavailable: ${s.error}`, retry: () => data.refreshRisk() } : { loading: 'Loading risk' });
+      return;
+    }
+    riskBody.replaceChildren(...[buildRisk(s.data, data.labelOf),
+      s.error ? el('p', { class: 'pos-note warn-ink', role: 'status' }, `Refresh failed: ${s.error}`) : null].filter(Boolean));
+    riskBody.removeAttribute('aria-busy');
+  }
+
+  // ------------------------------------------------------------ policy card
+  const policyBody = el('div', { class: 'policy-body', id: 'policy-body' });
+  const policyStamp = el('span', { class: 'policy-stamp' });
+  policyCard.append(
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'card-title', id: 'policy-title' }, 'Allocation policy'),
+      el('div', { class: 'card-tools' }, policyStamp)),
+    policyBody);
+  function renderPolicy() {
+    const s = slot('policy');
+    policyStamp.replaceChildren(s.ts ? stamp(s.ts, { stale: !!s.error }) : '');
+    if (!s.data) {
+      renderState(policyBody, s.error ? { error: `Policy unavailable: ${s.error}`, retry: () => data.refreshPolicy() } : { loading: 'Loading policy' });
+      return;
+    }
+    policyBody.replaceChildren(...[...buildPolicy(s.data, { labelOf: data.labelOf, onSetTargets: () => openSettingsTab('policy') }),
+      s.error ? el('p', { class: 'pos-note warn-ink', role: 'status' }, `Refresh failed: ${s.error}`) : null].filter(Boolean));
+    policyBody.removeAttribute('aria-busy');
+  }
 
   // ------------------------------------------------------------ detail host
   const detailRoot = el('div', { class: 'ov-detail-root', dataset: { host: 'dock' } });
@@ -554,25 +643,34 @@ export function mountOverview(root) {
       const todo = [...dirty];
       dirty.clear();
       if (todo.includes('hero')) renderHero();
+      if (todo.includes('since')) renderSince();
       if (todo.includes('attn')) renderAttention();
       if (todo.includes('pos')) renderPositions();
+      if (todo.includes('risk')) renderRisk();
+      if (todo.includes('policy')) renderPolicy();
     });
   }
   const sub = (key, ...parts) => cleanups.push(subscribe(key, () => schedule(...parts)));
-  sub('portfolio', 'hero', 'attn', 'pos');
+  sub('portfolio', 'hero', 'since', 'attn', 'pos');
   sub('prices', 'pos');
-  sub('alerts', 'attn');
+  sub('alerts', 'since', 'attn');
   sub('config', 'attn');
   sub('lane', 'attn');
   sub('marketLight', 'hero');
-  sub('watchlist', 'pos');
+  sub('watchlist', 'pos', 'attn', 'risk', 'policy');
+  sub('advice', 'since', 'attn');
+  sub('events', 'since', 'attn');
+  sub('alertRules', 'since', 'attn');
+  sub('policy', 'attn', 'policy');
+  sub('risk', 'risk');
+  sub('lastVisit', 'since');
   cleanups.push(subscribe('selectedId', () => { schedule('pos'); syncDetail(); }));
-  const onVis = () => { if (!document.hidden) schedule('hero', 'attn', 'pos'); };
+  const onVis = () => { if (!document.hidden) schedule('hero', 'since', 'attn', 'pos'); };
   document.addEventListener('visibilitychange', onVis);
   cleanups.push(() => document.removeEventListener('visibilitychange', onVis));
 
-  paintMode();
-  renderHero(); renderAttention(); renderPositions(); paintPerf(); paintRange();
+  paintMode(); paintRiskOpen();
+  renderHero(); renderSince(); renderAttention(); renderPositions(); renderRisk(); renderPolicy(); paintPerf(); paintRange();
   loadPerf();
   if (get('selectedId')) syncDetail();
 

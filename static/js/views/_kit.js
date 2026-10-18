@@ -151,7 +151,7 @@ export function createKit(ctx, root) {
       h('h' + headingLevel, { class: 'v-section__title', id: hid }, title),
       hint ? h('span', { class: 'v-section__hint' }, hint) : null,
       actionsEl, stampSlot);
-    const el = h('section', { class: 'v-section' + (cls ? ' ' + cls : ''), 'aria-labelledby': hid }, head, body);
+    const el = h('section', { class: 'v-section' + (cls ? ' ' + cls : ''), 'aria-labelledby': hid, 'data-panel': id || null }, head, body);
 
     const sec = { el, body, head, actions: actionsEl, hasContent: false, seq: 0, busy: false, last: null };
 

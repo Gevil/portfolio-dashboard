@@ -22,8 +22,11 @@ fatigue on this box:
   when a lane is stuck ``starting`` past its boot wait — the case where free
   VRAM actually blocks a switch.
 
-Findings dedupe on a stable key with a re-alert interval, so a persistent
-condition nags on a schedule instead of once per pass.
+Findings dedupe on a stable key with a 24 h re-alert interval, so a persistent
+condition nags once a day instead of once per pass. Each alert is a priority-3
+warning from source ``ops_watch`` (``notify`` routes it to the ops topic).
+When a finding that had alerted clears, an info "Resolved" row is written to
+the notification store (alert center only, never pushed).
 """
 import asyncio
 import logging
@@ -45,7 +48,7 @@ STATE_URL = os.getenv("HOST_DASHBOARD_URL",
 INTERVAL_S = int(os.getenv("OPS_WATCH_INTERVAL_S", "300"))
 DEGRADED_GRACE_S = int(os.getenv("OPS_WATCH_DEGRADED_GRACE_S", "600"))
 LOW_FREE_MIB = int(os.getenv("OPS_WATCH_LOW_FREE_MIB", "1000"))
-REALERT_S = int(os.getenv("OPS_WATCH_REALERT_S", "21600"))   # 6 h
+REALERT_S = int(os.getenv("OPS_WATCH_REALERT_S", "86400"))   # 24 h
 STUCK_GRACE_S = 120          # a "starting" lane is not stuck for the first 2 min
 
 _user = os.getenv("DASHBOARD_USER", "")
@@ -249,13 +252,14 @@ async def run_pass() -> dict:
     now = started
     known = store.get("findings") or {}
     fired = []
+    resolved = []
     for f in findings:
         prev = known.get(f["key"]) or {}
         last = prev.get("last_alert_ts") or 0
         if now - last >= REALERT_S:
             delivery = await notify.alert(
-                "OPS", "ops_watch", f["title"], f["body"], priority=5,
-                tags="warning", severity="error")
+                "OPS", "ops_watch", f["title"], f["body"], priority=3,
+                tags="warning", severity="warning")
             ok = delivery.consumed
             if delivery:
                 fired.append(f["key"])
@@ -266,21 +270,33 @@ async def run_pass() -> dict:
                                "title": f["title"]}
         else:
             known[f["key"]] = {**prev, "last_seen": now}
-    # A finding that disappeared is cleared so it can alert again if it returns.
+    # A finding that disappeared is cleared so it can alert again if it
+    # returns. One that had alerted leaves an info "resolved" row; if that
+    # row cannot be stored the entry stays and the next pass retries.
     keys = {f["key"] for f in findings}
-    known = {k: v for k, v in known.items() if k in keys}
+    for k in [k for k in known if k not in keys]:
+        gone = known[k]
+        if gone.get("last_alert_ts"):
+            if not notify.store("OPS", "ops_watch",
+                                f"Resolved: {gone.get('title') or k}",
+                                "No longer firing.", priority=1,
+                                severity="info"):
+                continue
+            resolved.append(k)
+        del known[k]
     _save({**store, "findings": known, "ts": now, "snapshot": snap})
 
     _stats.update(last_run=now, runs=_stats["runs"] + 1, source=snap["source"],
                   low_free_mib=bool(snap.get("low_free_mib")),
                   findings=len(findings))
-    note = (f"{len(fired)} alert(s), {len(findings)} open finding(s), "
+    note = (f"{len(fired)} alert(s), {len(resolved)} resolved, "
+            f"{len(findings)} open finding(s), "
             f"lane={snap.get('lane')}, source={snap['source']}"
             + (", low free VRAM" if snap.get("low_free_mib") else ""))
     runlog.record("ops_watch", True, time.time() - started, note)
     log.info("ops_watch: %s", note)
     return {"findings": [f["key"] for f in findings], "fired": fired,
-            "snapshot": snap}
+            "resolved": resolved, "snapshot": snap}
 
 
 async def _loop() -> None:

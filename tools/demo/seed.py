@@ -76,17 +76,27 @@ exc = {"BUY": "Constructive set-up with supportive trend; accumulate on pullback
 for back, tk, rating, action, score, conf, lane, model in plan:
     d = weekday_back(back)
     ts = datetime.datetime.combine(d, datetime.time(8, 45)).timestamp()
+    p20 = round(min(0.62, max(0.38, 0.5 + (score - 58) / 100 * 0.6)), 2)
     rows.append({"ts": ts, "date": d.isoformat(), "ticker": tk, "rating": rating, "excerpt": exc[rating],
                  "action": action, "score": score, "confidence": conf, "scale_version": "ds-v1", "phase": "premarket",
                  "lane": lane, "model": model, "priceAtAdvice": None, "priceAsOf": None, "priceCurrency": "EUR",
-                 "data_quality": "partial", "report": None})
+                 "data_quality": "partial", "report": None, "p20": p20, "expExcess20Pct": round((p20 - 0.5) * 12, 1),
+                 "benchmark": "SXR8", "draft": lane != "ninfer-nvfp4", "confirmed": True, "state": "confirmed"})
 dump("advice_log.json", rows)
 state = {}
 for tk in ("ASML", "NVDA"):
     last = [r for r in rows if r["ticker"] == tk][-1]
     state[tk] = {"rating": last["rating"], "excerpt": last["excerpt"], "report": f"{tk}@{(today - datetime.timedelta(days=1)).isoformat()}",
                  "ts": last["ts"], "date": last["date"], "action": last["action"], "score": last["score"],
-                 "confidence": last["confidence"], "scale_tier": last["action"], "lane": last["lane"], "model": last["model"]}
+                 "confidence": last["confidence"], "scale_tier": last["action"], "lane": last["lane"], "model": last["model"],
+                 "p20": last["p20"], "expExcess20Pct": last["expExcess20Pct"], "benchmark": "SXR8", "draft": False,
+                 "state": "confirmed", "pending": None,
+                 "published": {"rating": last["rating"], "action": last["action"], "scale_tier": last["action"],
+                               "score": last["score"], "date": last["date"], "ts": last["ts"]}}
+# one unconfirmed candidate, so the 'pending' badge shows (needs a repeat before it is announced)
+state["NVDA"]["pending"] = {"rating": "BUY", "action": "buy", "scale_tier": "buy", "score": 68,
+                            "since": (today - datetime.timedelta(days=1)).isoformat(), "ts": NOW - DAY}
+state["NVDA"]["state"] = "pending"
 dump("advice_state.json", state)
 
 # ---------------------------------------------------------------- jobs / approvals / triage / news / budget

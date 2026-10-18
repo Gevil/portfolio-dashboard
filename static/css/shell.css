@@ -19,6 +19,9 @@
 .sb-session { color: var(--ink-3); }
 .sb-session.chip-ok { color: var(--ink-2); border-color: var(--line-strong); background: var(--panel-2); }
 .sb-session.chip-ok .dot { background: var(--accent); }
+.sb-data { max-width: 100%; }
+.sb-data-text { overflow: hidden; text-overflow: ellipsis; }
+.sb-sse { width: 0.65rem; height: 0.65rem; }
 
 .tabs { display: flex; align-items: stretch; gap: var(--space-1); align-self: stretch; }
 .tab {

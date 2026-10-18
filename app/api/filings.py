@@ -16,10 +16,16 @@ cap 200) that step 6's triage worker consumes:
 
    ``form`` = ``L[:12]``, ``company`` = ``L[12:74]``, then ``CIK``,
    ``YYYYMMDD`` and the ``edgar/...`` path. Forms of interest default to
-   ``144, 8-K, SC 13D, SC 13G, 13F-HR`` (Form 4 / 6-K stay on edgar.py's
-   per-ticker submissions path). Pass at 23:40 local — EDGAR closes 17:15 ET
+   ``144, 8-K, SC 13D, SC 13G, 13F-HR`` (Form 4 stays on edgar.py's per-ticker
+   submissions path). Pass at 23:40 local — EDGAR closes 17:15 ET
    (= 23:15 CET), so the file exists by then; a 404 on a fresh date is
    retried the next night, an old date is marked done.
+
+   The periodic reports of ``EVIDENCE_FORMS`` (6-K, 20-F, 40-F, 10-Q, 10-K) are
+   ingested too, flagged ``evidence_only``: they exist for the analysis
+   evidence pack and are invisible to ``recent()`` unless asked for, so the
+   triage worker and ``/api/filings`` never see (or push) an issuer's weekly
+   6-K buyback notices.
 
 2. Weekly EDGAR full-text watch (``efts.sec.gov/LATEST/search-index``) over
    the ``filingWatch`` config block (default ``{"keywords": ["HBM4"],
@@ -82,6 +88,8 @@ DEFAULTS = {
     "fts_window_days": 7,
     "fts_max_hits": 20,
 }
+# Periodic reports kept for the evidence pack only (never offered to triage).
+EVIDENCE_FORMS = ("6-K", "20-F", "40-F", "10-Q", "10-K")
 
 # Fixed-width head (form 12, company 62, CIK 12) + free-spaced tail.
 _TAIL_RE = re.compile(r"^(?P<cik>\d{1,10})\s+(?P<filed>\d{8})\s+(?P<path>\S+)")
@@ -186,8 +194,8 @@ def _iso(compact: str) -> str:
     return f"{compact[0:4]}-{compact[4:6]}-{compact[6:8]}"
 
 
-def parse_index(text: str, forms: set[str],
-                cik_to_sym: dict[int, str]) -> list[dict]:
+def parse_index(text: str, forms: set[str], cik_to_sym: dict[int, str],
+                evidence_only: frozenset = frozenset()) -> list[dict]:
     """Watchlist filing events from one ``form.*.idx`` body."""
     events = []
     for line in text.splitlines():
@@ -203,13 +211,16 @@ def parse_index(text: str, forms: set[str],
         sym = cik_to_sym.get(cik)
         if not sym:
             continue
-        events.append({"form": form,
-                       "company": line[12:74].strip(),
-                       "cik": cik,
-                       "filed": _iso(m["filed"]),
-                       "url": ARCHIVE + m["path"].lstrip("/"),
-                       "ticker": sym,
-                       "source": "daily-index"})
+        event = {"form": form,
+                 "company": line[12:74].strip(),
+                 "cik": cik,
+                 "filed": _iso(m["filed"]),
+                 "url": ARCHIVE + m["path"].lstrip("/"),
+                 "ticker": sym,
+                 "source": "daily-index"}
+        if form in evidence_only:
+            event["evidence_only"] = True
+        events.append(event)
     return events
 
 
@@ -242,7 +253,8 @@ def _load_state() -> dict:
 
 
 async def ingest_day(day: datetime.date, forms: set[str],
-                     cik_to_sym: dict[int, str]) -> tuple[int, bool]:
+                     cik_to_sym: dict[int, str],
+                     evidence_only: frozenset = frozenset()) -> tuple[int, bool]:
     """-> (new events, date settled). Settled means: do not probe again."""
     url = _idx_url(day)
     try:
@@ -259,7 +271,7 @@ async def ingest_day(day: datetime.date, forms: set[str],
     if not r.is_success:
         log.warning("daily index %s HTTP %s", day, r.status_code)
         return 0, False
-    events = parse_index(r.text, forms, cik_to_sym)
+    events = parse_index(r.text, forms, cik_to_sym, evidence_only)
     added = _append_events(events, int(cfg()["ring"]))
     log.info("filings: %s -> %d watchlist filing(s), %d new",
              day, len(events), added)
@@ -274,7 +286,9 @@ async def run_daily() -> int:
         log.warning("filings: no watchlist CIK resolvable, pass skipped")
         return 0
     cik_to_sym = {cik: sym for sym, cik in ciks.items()}
-    forms = {str(f).strip() for f in conf["forms"]}
+    configured = {str(f).strip() for f in conf["forms"]}
+    evidence_only = frozenset(f for f in EVIDENCE_FORMS if f not in configured)
+    forms = configured | evidence_only
     state = _load_state()
     seen = set(state.get("dates") or [])
     day = datetime.date.today() - datetime.timedelta(days=1)
@@ -284,7 +298,7 @@ async def run_daily() -> int:
             break
         if day.weekday() < 5 and day.isoformat() not in seen:
             processed += 1
-            n, settled = await ingest_day(day, forms, cik_to_sym)
+            n, settled = await ingest_day(day, forms, cik_to_sym, evidence_only)
             added += n
             if settled:
                 seen.add(day.isoformat())
@@ -366,8 +380,13 @@ def _fts_url(cik: str, adsh: str) -> str:
             f"{adsh.replace('-', '')}/{adsh}-index.htm")
 
 
-def recent(symbol: str | None = None, limit: int = 50) -> list[dict]:
+def recent(symbol: str | None = None, limit: int = 50,
+           include_evidence_only: bool = False) -> list[dict]:
+    """Newest-first watchlist events. ``evidence_only`` rows (periodic
+    reports for the analysis pack) are left out unless asked for."""
     events = _events()
+    if not include_evidence_only:
+        events = [e for e in events if not e.get("evidence_only")]
     if symbol:
         sym = symbol.upper()
         events = [e for e in events if e.get("ticker", "").upper() == sym]

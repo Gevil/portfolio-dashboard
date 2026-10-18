@@ -8,15 +8,16 @@
 // of the previous id is aborted on show(otherId); responses that still slip through are dropped
 // by comparing the per-id state object `S` captured before each await.
 import {
-  el, clear, fmtEur, fmtPct, fmtNum, fmtTime24, fmtDateTime24, signCls, isNum, safeUrl,
+  el, clear, fmtEur, fmtPct, fmtNum, fmtDate, fmtTime24, fmtDateTime24, signCls, isNum, safeUrl,
 } from '../util.js';
 import { apiGet, apiSend, latestRequest } from '../api.js';
 import * as store from '../store.js';
 import {
   openDialog, confirmDialog, toast, renderState, stamp, usePolling, setMarkdown,
 } from '../ui.js';
-import { entryOf, labelOf, positionOf, priceItemOf, refreshPortfolio } from '../data.js';
+import { configPositionOf, entryOf, labelOf, positionOf, priceItemOf, refreshPortfolio } from '../data.js';
 import { createPriceChart } from '../charts.js';
+import { daysFromToday, shortDate } from './_common.js';
 
 // ------------------------------------------------------------------ constants
 
@@ -30,6 +31,8 @@ const NEWS_REFRESH_MS = 300000;
 const HIST_VISIBLE = 6;
 const TV_SCRIPT_URL = 'https://s3.tradingview.com/tv.js';
 const TV_TIMEOUT_MS = 10000;
+const ATTR_RANGES = ['1M', '3M', '6M', '1Y', 'ALL'];
+const SLOW_REFRESH_MS = 600000; // attribution + tax status
 
 // ------------------------------------------------------------------ TradingView symbol map
 
@@ -479,13 +482,14 @@ export function mountDetail(root, { onClose } = {}) {
   const uid = 'dt' + (++uidCounter) + '-';
   const prefs = {
     range: '1M',
+    attrRange: '3M',
     overlays: { ema20: false, ema50: false, rsi14: false },
     mode: 'standard',
   };
   const lr = {
     hist: latestRequest(), markers: latestRequest(), ind: latestRequest(), ticker: latestRequest(),
     news: latestRequest(), reports: latestRequest(), jobs: latestRequest(), job: latestRequest(),
-    result: latestRequest(),
+    result: latestRequest(), attr: latestRequest(), tax: latestRequest(),
   };
   const unsubs = [];
   let S = null;            // per-id state; replaced on every id change
@@ -494,6 +498,7 @@ export function mountDetail(root, { onClose } = {}) {
   let stopChartPoll = null;
   let stopNewsPoll = null;
   let stopJobPoll = null;
+  let stopSlowPoll = null;
 
   // ---- DOM ----------------------------------------------------------------
 
@@ -519,9 +524,10 @@ export function mountDetail(root, { onClose } = {}) {
   dom.priceBox = el('div', { class: 'dt-price-box' });
   dom.usLive = el('div', { class: 'dt-us muted', hidden: true });
   dom.headStamp = stamp(null);
+  dom.prevNote = el('div', { class: 'dt-prevsrc muted', hidden: true });
   dom.head = el('header', { class: 'dt-head' },
     el('div', { class: 'dt-titlebar' }, dom.title, dom.closeBtn),
-    dom.priceBox, dom.usLive, el('div', { class: 'dt-head-foot' }, dom.headStamp));
+    dom.priceBox, dom.usLive, dom.prevNote, el('div', { class: 'dt-head-foot' }, dom.headStamp));
 
   // chart card
   dom.rangeSeg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Chart range' },
@@ -557,15 +563,24 @@ export function mountDetail(root, { onClose } = {}) {
   dom.aiHistHead = el('h4', { class: 'lbl dt-ai-hist-title', text: 'Analysis history' });
   dom.aiHist = el('div', { class: 'dt-ai-hist' });
   dom.aiLive = el('div', { class: 'dt-ai-live' }, dom.aiControls, dom.aiProgress, dom.aiResult, dom.aiHistHead, dom.aiHist);
-  dom.ai.body.append(dom.aiNote, dom.aiLive);
+  dom.advice = el('div', { class: 'dt-advice', hidden: true });
+  dom.ai.body.append(dom.advice, dom.aiNote, dom.aiLive);
 
   // position, valuation, news
   dom.pos = card('pos', 'Position');
   dom.val = card('val', 'Valuation & signals');
   dom.news = card('news', 'News & alerts');
+  dom.attrSeg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Attribution range' },
+    ATTR_RANGES.map(r => el('button', {
+      type: 'button', text: r, dataset: { attrRange: r }, 'aria-pressed': String(r === prefs.attrRange), onclick: () => setAttrRange(r),
+    })));
+  dom.attr = card('attr', 'Return attribution', dom.attrSeg);
+  dom.lots = card('lots', 'Lots');
+  dom.attr.node.hidden = true;
+  dom.lots.node.hidden = true;
   dom.grid = el('div', { class: 'dt-grid' }, dom.pos.node, dom.val.node);
 
-  dom.content = el('div', { class: 'dt-content' }, dom.head, dom.chart.node, dom.ai.node, dom.grid, dom.news.node);
+  dom.content = el('div', { class: 'dt-content' }, dom.head, dom.chart.node, dom.ai.node, dom.grid, dom.attr.node, dom.lots.node, dom.news.node);
   dom.empty = el('div', { class: 'dt-empty state state-empty', text: 'Select a holding to see its details.' });
 
   root.classList.add('dt-pane');
@@ -604,7 +619,8 @@ export function mountDetail(root, { onClose } = {}) {
     if (stopChartPoll) stopChartPoll();
     if (stopNewsPoll) stopNewsPoll();
     if (stopJobPoll) stopJobPoll();
-    stopChartPoll = stopNewsPoll = stopJobPoll = null;
+    if (stopSlowPoll) stopSlowPoll();
+    stopChartPoll = stopNewsPoll = stopJobPoll = stopSlowPoll = null;
   }
 
   function abortAll() {
@@ -668,6 +684,11 @@ export function mountDetail(root, { onClose } = {}) {
       dom.usLive.hidden = true;
       dom.usLive.textContent = '';
     }
+
+    // The day change is measured from an intraday reference when the official previous close is unavailable.
+    const pcs = (pos && pos.prevCloseSource) || (px && px.prevCloseSource) || null;
+    dom.prevNote.hidden = pcs !== 'intraday';
+    dom.prevNote.textContent = pcs === 'intraday' ? 'Day change vs an intraday reference (official previous close unavailable)' : '';
 
     const ts = (pos ? pSlot.ts : null) || store.slot('prices').ts || pSlot.ts;
     dom.headStamp.setTs(ts, !!(pSlot.error && pSlot.data) || stale);
@@ -1240,6 +1261,173 @@ export function mountDetail(root, { onClose } = {}) {
     })));
   }
 
+  // ---- advice -------------------------------------------------------------
+
+  function renderAdvice() {
+    if (!S) return;
+    const sl = store.slot('advice');
+    const a = sl.data && typeof sl.data === 'object' ? sl.data[S.id] : null;
+    clear(dom.advice);
+    if (!a) { dom.advice.hidden = true; return; }
+    // The published state is the headline; the latest answer (top-level fields) may still be unconfirmed.
+    const pub = a.published || { rating: a.rating, action: a.action, score: a.score, date: a.date };
+    const since = a.pending && a.pending.since ? (typeof a.pending.since === 'string' ? shortDate(a.pending.since) : fmtDate(a.pending.since)) : '';
+    const head = el('div', { class: 'dt-advice-head' },
+      el('span', { class: 'lbl', text: 'Advice' }),
+      decisionChip(pub.rating),
+      pub.action ? chip(String(pub.action)) : null,
+      isNum(pub.score) ? chip(`score ${Math.round(pub.score)}/100`) : null,
+      pub.date ? el('span', { class: 'muted num', text: String(pub.date) }) : null,
+      a.pending ? chip(`pending: ${a.pending.rating || '?'}${since ? ` since ${since}` : ''}`, 'chip-info', 'A candidate change that is not confirmed yet') : null,
+      a.draft ? chip('DRAFT', 'chip-warn', 'Answered by a non-publishing lane or model') : null);
+    const bench = a.benchmark ? labelOf(a.benchmark) : 'benchmark';
+    const facts = [];
+    if (isNum(a.p20)) facts.push(el('span', { class: 'num', text: `p(beat ${bench} in 20d) ${Math.round(a.p20 * 100)}%` }));
+    if (isNum(a.expExcess20Pct)) facts.push(el('span', { class: 'num', text: `expected excess ${fmtPct(a.expExcess20Pct)} (20d)` }));
+    if (a.trigger) facts.push(chip(`trigger: ${a.trigger}`, 'chip-info'));
+    if (a.taxTag) facts.push(chip(String(a.taxTag), '', 'Tax note'));
+    dom.advice.append(head);
+    if (facts.length) dom.advice.append(el('div', { class: 'dt-advice-facts' }, facts));
+    dom.advice.hidden = false;
+  }
+
+  // ---- return attribution (EUR = local + FX + cross) -------------------------
+
+  const signedPct = n => (isNum(n) ? el('span', { class: signCls(n), text: fmtPct(n) }) : '\u2013');
+
+  function setAttrRange(r) {
+    if (r === prefs.attrRange) return;
+    prefs.attrRange = r;
+    for (const b of dom.attrSeg.children) setPressed(b, b.dataset.attrRange === r);
+    if (!S) return;
+    S.attr = null;
+    loadAttribution();
+  }
+
+  async function loadAttribution() {
+    const s = S;
+    if (!s) return;
+    const range = prefs.attrRange;
+    const t = lr.attr.begin();
+    if (!s.attr || s.attr.range !== range) {
+      s.attr = null;
+      renderState(dom.attr.body, { loading: 'Loading attribution\u2026' });
+    }
+    const res = await apiGet(`/api/portfolio/attribution?range=${encodeURIComponent(range)}`, { signal: t.signal, timeoutMs: 30000 });
+    if (s !== S || destroyed || !t.current() || res.aborted) return;
+    if (!res.ok || !res.data || typeof res.data !== 'object') {
+      if (!s.attr) { s.attrFailed = true; renderState(dom.attr.body, { error: res.error || 'Unexpected response', retry: () => loadAttribution() }); }
+      dom.attr.stamp.setTs(s.attrTs, true);
+      return;
+    }
+    s.attrFailed = false;
+    s.attr = { range, data: res.data };
+    s.attrTs = Date.now();
+    dom.attr.stamp.setTs(s.attrTs, false);
+    paintAttribution();
+  }
+
+  function paintAttribution() {
+    const s = S;
+    if (!s || !s.attr) return;
+    const d = s.attr.data;
+    const row = Array.isArray(d.positions) ? d.positions.find(p => p.id === s.id) : null;
+    if (!row) { renderState(dom.attr.body, { empty: 'No attribution for this holding.' }); return; }
+    const cur = row.exposureCurrency || 'EUR';
+    if (cur === 'EUR') {
+      setContent(dom.attr.body,
+        kvList([[`EUR return (${s.attr.range})`, signedPct(row.eurReturnPct), 'num']]),
+        el('p', { class: 'muted dt-none dt-attr-note', text: 'EUR asset, no FX effect' }));
+      return;
+    }
+    const fx = d.fx && typeof d.fx === 'object' ? d.fx : {};
+    setContent(dom.attr.body,
+      kvList([
+        [`EUR return (${s.attr.range})`, signedPct(row.eurReturnPct), 'num'],
+        [`= local (${cur})`, signedPct(row.localReturnPct), 'num'],
+        ['+ FX', signedPct(row.fxReturnPct), 'num'],
+        ['+ cross', signedPct(row.crossPct), 'num'],
+      ]),
+      el('p', { class: 'muted dt-none dt-attr-note', text: `${cur} exposure${fx.pair ? `: ${fx.pair} moved ${fmtPct(fx.changePct)} over the range` : ''}.` }));
+  }
+
+  // ---- lots (config lots joined with /api/tax) --------------------------------
+
+  function lotsOf(id) {
+    const c = configPositionOf(id);
+    return c && Array.isArray(c.lots) ? c.lots : [];
+  }
+
+  async function loadTax() {
+    const s = S;
+    if (!s || !lotsOf(s.id).length) return;
+    const t = lr.tax.begin();
+    const res = await apiGet('/api/tax', { signal: t.signal });
+    if (s !== S || destroyed || !t.current() || res.aborted) return;
+    if (!res.ok || !res.data || typeof res.data !== 'object') {
+      s.taxError = res.error || 'Unexpected response';
+      dom.lots.stamp.setTs(s.taxTs, true);
+      paintLots();
+      return;
+    }
+    s.tax = res.data;
+    s.taxError = null;
+    s.taxTs = Date.now();
+    dom.lots.stamp.setTs(s.taxTs, false);
+    paintLots();
+  }
+
+  function ensureTax() {
+    const s = S;
+    if (!s || s.taxAsked || !lotsOf(s.id).length) return;
+    s.taxAsked = true;
+    loadTax();
+  }
+
+  function paintLots() {
+    const s = S;
+    if (!s) return;
+    const lots = lotsOf(s.id);
+    dom.lots.node.hidden = !lots.length;
+    if (!lots.length) return;
+    const taxRows = s.tax && Array.isArray(s.tax.lots) ? s.tax.lots.filter(r => r.id === s.id) : [];
+    const used = new Set();
+    const body = el('tbody');
+    for (const l of [...lots].sort((a, b) => String(a.date).localeCompare(String(b.date)))) {
+      const sell = l.side === 'sell';
+      let ti = -1;
+      if (!sell) ti = taxRows.findIndex((r, i) => !used.has(i) && r.date === l.date && isNum(r.shares) && Math.abs(r.shares - Number(l.shares)) < 1e-6);
+      if (ti >= 0) used.add(ti);
+      const t = ti >= 0 ? taxRows[ti] : null;
+      const dd = daysFromToday(l.date);
+      const age = t && isNum(t.ageDays) ? t.ageDays : (dd != null ? -dd : null);
+      const left = t && isNum(t.remainingShares) && t.remainingShares < t.shares - 1e-9 ? t.remainingShares : null;
+      body.append(el('tr', { dataset: { date: String(l.date), side: sell ? 'sell' : 'buy' } },
+        el('th', { scope: 'row', class: 'num', text: String(l.date) }),
+        el('td', { text: sell ? 'sell' : 'buy' }),
+        el('td', { class: 'num' }, fmtShares(Number(l.shares)), left != null ? el('span', { class: 'muted dt-lot-left', text: ` (${fmtShares(left)} left)` }) : null),
+        el('td', { class: 'num', text: fmtEur(Number(l.priceEur)) }),
+        el('td', { class: 'num', text: sell || age == null ? '\u2013' : String(age) }),
+        el('td', { class: 'num', text: t && t.unlockDate ? String(t.unlockDate) : '\u2013' }),
+        el('td', null, t ? (t.exempt ? chip('exempt', 'chip-ok', 'Held past the time test: sale is exempt') : chip('taxable', '', 'Still inside the time test')) : '\u2013')));
+    }
+    const table = el('table', { class: 'dt-lots-table' },
+      el('caption', { class: 'visually-hidden', text: 'Purchase lots with age, unlock date and tax status' }),
+      el('thead', null, el('tr', null, ['Date', 'Side', 'Shares', 'Price', 'Age (d)', 'Unlocks', 'Tax'].map(h => el('th', { scope: 'col', text: h })))),
+      body);
+    setContent(dom.lots.body,
+      el('div', { class: 'tbl-wrap' }, table),
+      s.taxError ? el('p', { class: 'dt-note warn-ink', role: 'status', text: `Tax status unavailable: ${s.taxError}` }) : null);
+  }
+
+  /** Cards that depend on the holding being a position / having lots. */
+  function syncExtraCards() {
+    if (!S) return;
+    dom.attr.node.hidden = !positionOf(S.id);
+    paintLots();
+    ensureTax();
+  }
+
   // ---- lifecycle ------------------------------------------------------------
 
   function paintEmpty() {
@@ -1262,6 +1450,15 @@ export function mountDetail(root, { onClose } = {}) {
     clear(dom.aiResult);
     renderState(dom.val.body, { loading: 'Loading valuation\u2026' });
     renderState(dom.news.body, { loading: 'Loading news\u2026' });
+    dom.advice.hidden = true;
+    clear(dom.advice);
+    dom.prevNote.hidden = true;
+    dom.attr.stamp.setTs(null);
+    dom.lots.stamp.setTs(null);
+    renderState(dom.attr.body, { loading: 'Loading attribution\u2026' });
+    clear(dom.lots.body);
+    dom.lots.node.hidden = true;
+    dom.attr.node.hidden = true;
     paintOverlays();
     chartCall('setOverlays', { ...prefs.overlays });
   }
@@ -1272,6 +1469,7 @@ export function mountDetail(root, { onClose } = {}) {
       if (anyOverlay()) loadIndicators();
     }, CHART_REFRESH_MS, { visibilityAware: true });
     stopNewsPoll = usePolling(() => loadNews({ silent: true }), NEWS_REFRESH_MS, { visibilityAware: true });
+    stopSlowPoll = usePolling(() => { loadAttribution(); loadTax(); }, SLOW_REFRESH_MS, { visibilityAware: true });
   }
 
   function show(id) {
@@ -1279,11 +1477,12 @@ export function mountDetail(root, { onClose } = {}) {
     id = id ? String(id) : null;
     if (S && id === S.id) {
       // Same holding: repaint from the store and retry only what failed.
-      renderHeader(); renderPosition(); paintAiShell();
+      renderHeader(); renderPosition(); paintAiShell(); renderAdvice(); syncExtraCards();
       if (S.histFailed) loadHistory();
       if (S.tickerFailed) loadTicker();
       if (S.newsFailed) loadNews();
       if (S.reportsError && !S.reports) loadReports();
+      if (S.attrFailed) loadAttribution();
       return;
     }
     abortAll();
@@ -1303,6 +1502,9 @@ export function mountDetail(root, { onClose } = {}) {
     loadNews();
     loadReports();
     adoptJob();
+    renderAdvice();
+    syncExtraCards();
+    loadAttribution();
     startPolls();
     // Move focus to the heading on a user-driven switch, never when focus is already inside.
     if (!root.contains(document.activeElement) && dom.title.offsetParent !== null) {
@@ -1311,9 +1513,10 @@ export function mountDetail(root, { onClose } = {}) {
   }
 
   // live store updates
-  unsubs.push(store.subscribe('portfolio', () => { renderHeader(); renderPosition(); }));
+  unsubs.push(store.subscribe('portfolio', () => { renderHeader(); renderPosition(); syncExtraCards(); }));
   unsubs.push(store.subscribe('prices', () => renderHeader()));
-  const onEntries = () => { if (S) { renderHeader(); paintAiShell(); } };
+  unsubs.push(store.subscribe('advice', () => renderAdvice()));
+  const onEntries = () => { if (S) { renderHeader(); paintAiShell(); syncExtraCards(); } };
   unsubs.push(store.subscribe('watchlist', onEntries));
   unsubs.push(store.subscribe('config', onEntries));
 

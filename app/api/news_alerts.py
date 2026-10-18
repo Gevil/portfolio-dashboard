@@ -6,9 +6,12 @@ this reads the per-ticker headline cache that ``topnews`` already maintains
 off there; this module no longer fetches the same providers a second time).
 GDELT is queried directly ONLY when a ticker's cache is missing or stale.
 
-Headlines are keyword-matched and pushed as ONE grouped ntfy alert per ticker +
-a notification-store entry. Quiet hours hold alerts in ``news_pending.json``
-until the window ends; hot (priority-5) alerts bypass the per-ticker cooldown.
+Headlines are keyword-matched and sent through ``notify.alert`` (source
+``news``: per-source cap and the global quiet-hours hold apply; the push
+deep-links to its notification row) as ONE grouped alert per ticker + a
+notification-store entry. This module's own quiet hours hold alerts in
+``news_pending.json`` until the window ends; hot (priority-5) alerts bypass
+the per-ticker cooldown.
 
 Gates that keep the noise out:
 * relevance - an item must mention its ticker (config ``aliases``) in the
@@ -296,18 +299,17 @@ async def process_ticker(client: httpx.AsyncClient, ticker: str, c: dict,
             log.error("%s: pending write failed - items stay unseen", ticker)
         return 0
 
-    delivery = await notify.push(
-        title, push_body, severity="error" if top_prio >= 5 else "warning",
-        priority=top_prio, tags="newspaper" if top_prio == 3 else "warning")
+    delivery = await notify.alert(
+        ticker, "news", title, push_body, priority=top_prio,
+        severity="error" if top_prio >= 5 else "warning",
+        tags="newspaper" if top_prio == 3 else "warning",
+        url=shown_items[0].get("url", ""), store_body=full_body)
     if not delivery.consumed:
         # Neither sent nor queued: keep the items unseen so the next pass
         # re-notifies once ntfy / the outbox is writable again.
         log.warning("%s: delivery failed (%s), alert not consumed", ticker,
                     delivery.reason)
         return 0
-    if delivery:
-        notify.store(ticker, "news", title, full_body, priority=top_prio,
-                     url=shown_items[0].get("url", ""))
     newsdedupe.mark(ticker, keys)
     st = jsonstore.load(LAST_ALERT_FILE, {})
     st[ticker] = time.time()
@@ -347,16 +349,15 @@ async def flush_pending(pending: dict) -> int:
             full_body = _body(items, len(items))
         else:
             push_body = full_body = "\n".join(legacy)[:3500]
-        delivery = await notify.push(
-            title, push_body, severity="error" if prio >= 5 else "warning",
-            priority=prio)
+        delivery = await notify.alert(
+            ticker, "news", title, push_body, priority=prio,
+            severity="error" if prio >= 5 else "warning",
+            url=(items[0].get("url", "") if items else ""),
+            store_body=full_body)
         if not delivery.consumed:
             log.warning("%s: overnight flush not delivered (%s), kept pending",
                         ticker, delivery.reason)
             continue
-        if delivery:
-            notify.store(ticker, "news", title, full_body, priority=prio,
-                         url=(items[0].get("url", "") if items else ""))
         pending.pop(ticker, None)
         if not jsonstore.save(PENDING_FILE, pending):
             log.error("pending write failed after flushing %s", ticker)

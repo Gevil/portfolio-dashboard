@@ -1,5 +1,5 @@
-/* Market view: market light, benchmark, macro (curve/FRED/COT), earnings,
-   insider Form 4, short volume, filings, worker rings.
+/* Market view: market light, benchmark, macro (curve/FRED/COT), events calendar,
+   earnings, insider Form 4, short volume, filings, worker rings.
    export function mount(root, ctx) -> unmount() */
 import { createKit, isObj, num, str, fmtAgo, fmtDay, fmtNum, fmtPct, tone, errText } from './_kit.js';
 import { summarizeWorkers, renderRings } from './_workers.js';
@@ -7,12 +7,47 @@ import { summarizeWorkers, renderRings } from './_workers.js';
 const LIGHT = { green: { cls: 'up', word: 'Green – risk-on' }, yellow: { cls: 'warn', word: 'Yellow – mixed' }, red: { cls: 'down', word: 'Red – risk-off' } };
 const INSIDER_CODE = { P: ['purchase', 'up'], S: ['sale', 'down'], A: ['grant', 'flat'], F: ['tax', 'flat'], M: ['option ex.', 'flat'], G: ['gift', 'flat'], D: ['disposition', 'flat'] };
 
-function maturityMonths(label) {
-  const m = /^(\d+)\s*(Mo|Yr)/i.exec(label);
-  return m ? Number(m[1]) * (/yr/i.test(m[2]) ? 12 : 1) : 1e9;
+/** Treasury maturity label -> months. "1.5 Month" 1.5, "1 Mo" 1, "10 Yr" 120, "30 Year" 360, "0,5 Yr" 6.
+    Unparseable labels sort last (1e9). Months are the base unit: m/mo/month(s) vs y/yr/year(s). */
+export function maturityMonths(label) {
+  const m = /^\s*(\d+(?:[.,]\d+)?|[.,]\d+)\s*([a-z]*)/i.exec(String(label == null ? '' : label));
+  if (!m) return 1e9;
+  const n = Number(m[1].replace(',', '.'));
+  if (!Number.isFinite(n)) return 1e9;
+  const unit = m[2].toLowerCase();
+  if (/^y/.test(unit)) return n * 12;
+  if (/^m/.test(unit)) return n;
+  return 1e9;
 }
 function safeUrl(u) {
   try { const x = new URL(String(u)); return x.protocol === 'https:' ? x.href : null; } catch (_) { return null; }
+}
+
+const EVENT_KIND = {
+  earnings: ['Earnings', 'info'], ex_dividend: ['Ex-dividend', 'flat'], dividend_pay: ['Dividend pay', 'up'],
+  fomc: ['FOMC', 'warn'], ecb: ['ECB', 'warn'], cpi_us: ['US CPI', 'warn'], market_closed: ['Market closed', 'flat'],
+};
+const WEEKDAY = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+/** 'YYYY-MM-DD' -> UTC midnight ms (null when malformed). Date-only math, no timezone drift. */
+function isoMs(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || ''));
+  return m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+}
+const msIso = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+/** Events -> [{weekStart:'YYYY-MM-DD' (Monday), events:[...date-sorted]}] oldest week first. Rows without a valid date are dropped. */
+export function groupEventsByWeek(events) {
+  const weeks = new Map();
+  (Array.isArray(events) ? events : []).filter(e => isObj(e) && isoMs(e.date) !== null)
+    .sort((a, b) => str(a.date).localeCompare(str(b.date)) || str(a.time).localeCompare(str(b.time)))
+    .forEach(e => {
+      const ms = isoMs(e.date);
+      const monday = msIso(ms - ((new Date(ms).getUTCDay() + 6) % 7) * 86400000);
+      if (!weeks.has(monday)) weeks.set(monday, []);
+      weeks.get(monday).push(e);
+    });
+  return [...weeks.entries()].map(([weekStart, evs]) => ({ weekStart, events: evs }));
 }
 
 export function mount(root, ctx) {
@@ -30,11 +65,11 @@ export function mount(root, ctx) {
   };
 
   /* ---------------- market light ---------------- */
-  const light = kit.section({ title: 'Market light', id: 'light', hint: 'breadth · index · momentum' });
+  const light = kit.section({ title: 'Market light', id: 'light', hint: 'index · momentum' });
   kit.autoLoad(light, {
     source: '/api/market-light',
     isEmpty: d => !isObj(d) || !d.status,
-    emptyText: 'No market-light snapshot yet. It is built once a day after the close from watchlist breadth, the index vs its 200-day average and 5-day momentum.',
+    emptyText: 'No market-light snapshot yet. It is built once a day after the close from the index vs its 200-day average and 5-day momentum.',
     render: (body, j) => {
       const L = LIGHT[String(j.status).toLowerCase()] || { cls: 'flat', word: str(j.status) };
       body.appendChild(h('div', { class: 'v-light' },
@@ -43,15 +78,29 @@ export function mount(root, ctx) {
           h('div', { class: 'v-light__word' }, L.word),
           h('div', { class: 'v-muted' }, (num(j.score) !== null ? 'score ' + Math.round(j.score) : '') + (j.date ? ' · ' + fmtDay(j.date) : ''),
             j.data_quality === 'limited' ? ' ' : null, j.data_quality === 'limited' ? chip('limited data', 'warn') : null))));
-      const dims = isObj(j.dimensions) ? Object.entries(j.dimensions) : [];
+      const dimMap = isObj(j.dims) ? j.dims : (isObj(j.dimensions) ? j.dimensions : {});
+      const order = ['index', 'momentum'];
+      const dims = Object.entries(dimMap).sort((a, b) => {
+        const ia = order.indexOf(a[0]), ib = order.indexOf(b[0]);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
       if (dims.length) {
-        const ul = h('ul', { class: 'v-dims' });
+        const ul = h('ul', { class: 'v-dims', id: 'v-light-dims' });
         dims.forEach(([name, d]) => {
           if (!isObj(d) || d.available === false) { ul.appendChild(h('li', {}, h('span', { class: 'v-label' }, name), chip('n/a', 'flat'))); return; }
           const L2 = LIGHT[String(d.status).toLowerCase()];
           ul.appendChild(h('li', {}, h('span', { class: 'v-label' }, name), chip(str(d.status, '–'), L2 ? L2.cls : 'flat'), d.detail ? h('span', { class: 'v-muted' }, str(d.detail)) : null));
         });
         body.appendChild(ul);
+      }
+      const ht = isObj(j.holdingsTrend) ? j.holdingsTrend : null;
+      if (ht) {
+        const have = ht.available !== false;
+        const frac = have && num(ht.above) !== null && num(ht.total) !== null
+          ? ht.above + '/' + ht.total + (num(ht.pct) !== null ? ' (' + Math.round(ht.pct) + '%)' : '')
+          : (have ? str(ht.detail, '–') : 'n/a');
+        body.appendChild(h('p', { class: 'v-muted v-small v-holdings-trend', id: 'v-light-holdings', title: str(ht.detail) },
+          str(ht.label, 'your holdings above MA' + str(ht.period, '20')) + ': ' + frac + ' — not part of the light'));
       }
       const reasons = Array.isArray(j.reasons) ? j.reasons : [];
       if (reasons.length) {
@@ -82,6 +131,14 @@ export function mount(root, ctx) {
       body.appendChild(dl);
     },
   }, 60000);
+
+  /* ---------------- events calendar ---------------- */
+  const evt = kit.section({ title: 'Events calendar', id: 'events', hint: 'next 60 days, by week', cls: 'v-span-2' });
+  kit.autoLoad(evt, {
+    source: '/api/events?days=60',
+    isEmpty: d => !isObj(d),
+    render: (body, d) => renderEvents(body, d),
+  }, 600000);
 
   /* ---------------- macro ---------------- */
   const macro = kit.section({ title: 'Macro', id: 'macro', hint: 'US Treasury curve · FRED · CFTC', cls: 'v-span-2' });
@@ -136,6 +193,40 @@ export function mount(root, ctx) {
     },
   }, 300000);
 
+  function renderEvents(body, d) {
+    const todayD = new Date();
+    const todayMs = Date.UTC(todayD.getFullYear(), todayD.getMonth(), todayD.getDate());
+    const thisMonday = todayMs - ((new Date(todayMs).getUTCDay() + 6) % 7) * 86400000;
+    const warnings = (Array.isArray(d.warnings) ? d.warnings : []).map(w => (isObj(w) ? str(w.message || w.code) : str(w))).filter(Boolean);
+    const weeks = groupEventsByWeek(d.events);
+    if (!weeks.length) body.appendChild(kit.empty('No calendar events in the next 60 days.'));
+    weeks.forEach(({ weekStart, events }) => {
+      const diff = Math.round((isoMs(weekStart) - thisMonday) / (7 * 86400000));
+      const rel = diff === 0 ? ' · this week' : diff === 1 ? ' · next week' : diff === -1 ? ' · last week' : '';
+      const hid = 'v-evt-wk-' + weekStart;
+      const list = h('ul', { class: 'v-events', 'aria-labelledby': hid });
+      events.forEach(e => {
+        const kind = EVENT_KIND[e.kind] || [str(e.kind, 'event'), 'flat'];
+        const ms = isoMs(e.date);
+        const url = safeUrl(e.url);
+        const src = str(e.source);
+        const li = h('li', { class: 'v-event v-event--' + (EVENT_KIND[e.kind] ? e.kind : 'other'), 'data-kind': str(e.kind), 'data-date': str(e.date) },
+          h('span', { class: 'v-event__date v-mono' }, WEEKDAY[(new Date(ms).getUTCDay() + 6) % 7] + ' ' + fmtDay(e.date), e.time ? h('span', { class: 'v-muted' }, ' ' + str(e.time)) : null),
+          chip(kind[0], kind[1]),
+          e.ticker ? h('span', { class: 'v-chip v-chip--ticker', title: 'ticker' }, str(e.ticker)) : null,
+          h('span', { class: 'v-event__title' }, str(e.title, kind[0])),
+          url ? h('a', { href: url, target: '_blank', rel: 'noopener noreferrer', class: 'v-link v-small' }, src || 'source')
+            : (src ? h('span', { class: 'v-muted v-small' }, src) : null));
+        list.appendChild(li);
+      });
+      body.appendChild(h('div', { class: 'v-block v-eventweek', 'data-week': weekStart },
+        h('h3', { class: 'v-h3', id: hid }, 'Week of ' + fmtDay(weekStart) + rel), list));
+    });
+    if (warnings.length) {
+      body.appendChild(h('ul', { class: 'v-warnings v-muted v-small', id: 'v-events-warnings', 'aria-label': 'Calendar warnings' },
+        ...warnings.map(w => h('li', {}, w))));
+    }
+  }
   function curveSvg(pts) {
     const W = 320, H = 110, P = 16;
     const vals = pts.map(p => Number(p[1]));
@@ -276,6 +367,6 @@ export function mount(root, ctx) {
     render: (body, d) => renderRings(kit, body, summarizeWorkers(d.bg, d.runs)),
   }, 60000);
 
-  grid.append(light.el, bench.el, macro.el, earn.el, ins.el, sv.el, fil.el, wk.el);
+  grid.append(light.el, bench.el, evt.el, macro.el, earn.el, ins.el, sv.el, fil.el, wk.el);
   return () => kit.dispose();
 }

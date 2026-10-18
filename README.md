@@ -14,8 +14,8 @@ on Bazzite (Fedora Atomic) with an RTX 5090.
 ![Portfolio Dashboard overview (demo data)](docs/media/screenshots/overview-dark.webp)
 
 <p align="center">
-  <img src="docs/media/video/walkthrough.gif" alt="Walkthrough: positions table, allocation, holding detail, chart ranges and indicator overlays" width="720"><br>
-  <sub>first 26 s · <a href="docs/media/video/walkthrough.mp4">full 60 s video (mp4)</a> also covers the alert center, digest, market, AI Ops and settings</sub>
+  <img src="docs/media/video/walkthrough.gif" alt="Walkthrough: positions table, allocation, holding detail, the performance, policy and risk cards, chart ranges and indicator overlays" width="720"><br>
+  <sub>first 26 s · <a href="docs/media/video/walkthrough.mp4">full 65 s video (mp4)</a> also covers the alert center, the digest with the v3 scoreboard, the market view with the events calendar, AI Ops and settings</sub>
 </p>
 
 | Holding detail | Alert center | Digest and scoreboard |
@@ -32,16 +32,19 @@ More: [overview](docs/features/overview.md) · [analysis and reports](docs/featu
 | Area | Details |
 |---|---|
 | **Valuation** | `shares × EUR listing price`; day P/L, total P/L against EUR cost basis, weights, max drawdown; positions without a known cost basis are valued but excluded from P/L and flagged. |
-| **Benchmark** | Portfolio vs S&P 500 (index converted to EUR with daily FX, because the ETF is unhedged), indexed to 0 % over 1M/3M/6M/1Y. |
-| **Prices** | One authoritative series per holding (the EUR listing via Yahoo). US live feeds (Twelve Data / Finnhub WebSocket) are shown only as a labelled `usLive` reference. Venue-aware market hours. |
-| **Alerts** | Session-move and gap-vs-previous-close alerts, user rules (EMA cross, RSI, volume spike, absolute level, earnings lead, short-ratio spike, market-light drop), news alerts with LLM triage, SEC Form 4 / 8-K insider alerts. |
-| **Notifications** | ntfy with a durable outbox (retry/backoff), severity filter, quiet hours, dedupe; an in-app **alert center** with unread count and ack. Approval buttons use per-approval HMAC tokens. |
-| **AI analysis** | In-process pipeline (analyst → research → trader → risk → PM) producing a structured decision (rating, action, score, confidence, battle plan). Quick / standard / deep modes; evidence pack where every field carries `as_of + source` or the literal `MISSING`. |
-| **Digest** | Twice-daily consolidated push per batch; rating-based change detection; retries and failure reporting. |
-| **Scoreboard** | Grades advice at T+5 / T+20 against the EUR-converted benchmark with Wilson intervals and an explicit "insufficient sample" rule. |
+| **Ledger and performance** | Optional dated buy/sell **lots** per holding (FIFO cost, fees included): when present, `shares` and `investedAmount` are derived from them. Gives time-weighted return (**TWR**) and money-weighted **XIRR**, history `basis` (`lots` vs `current_shares`), EUR-vs-local-vs-FX **attribution**, and a **risk** view (direct and look-through exposure, currency exposure, volatility, beta, drawdown, correlation, concentration). Ranges 1M / 3M / 6M / 1Y / **ALL**. |
+| **Benchmark** | Portfolio vs S&P 500 (index converted to EUR with daily FX, because the ETF is unhedged), indexed to 0 % over 1M/3M/6M/1Y/ALL. The **performance benchmark** (`performanceBenchmark`, e.g. `SXR8`) is the total-return comparison used for excess return, the advice probabilities and the scoreboard. |
+| **Prices and calendars** | One authoritative series per holding (the EUR listing via Yahoo). US live feeds (Twelve Data / Finnhub WebSocket) are shown only as a labelled `usLive` reference. Sessions, holidays and early closes come from `exchange_calendars` (XAMS, XETR, XNYS, ...; `.DE` listings are XETR). `prevClose` is the close of the previous *session* (see below). |
+| **Alerts** | **σ-scaled** session-move and opening-gap alerts (rules v3), user rules (EMA cross, RSI, volume spike, absolute level, earnings lead, short-ratio spike, market-light drop), news alerts with LLM triage, SEC Form 4 / 8-K insider alerts, and a daily policy watcher (drift bands, single-stock cap, monthly trend flips). |
+| **Notifications** | ntfy with a durable outbox (retry/backoff), severity filter, global **quiet hours**, **per-source daily caps**, a separate **ops topic** for infrastructure alerts, per-alert deep links (`#alerts/<id>`), dedupe; an in-app **alert center** with unread count and ack. Approval buttons use per-approval HMAC tokens. |
+| **AI analysis** | In-process pipeline (analyst → research → trader → risk → PM) producing a structured decision (rating, action, score, confidence, battle plan, plus `p_outperform_20d` and `expected_excess_20d_pct`). Quick / standard / deep modes; evidence pack where every field carries `as_of + source` or the literal `MISSING`, including `portfolio_context` and `policy_context`. |
+| **Digest** | Twice-daily consolidated push per batch, **trading days only**; rating changes use hysteresis (confirmed on repeat or a strong band move); draft lanes never publish; only confirmed changes are pushed (priority 3 or 4, never 5); event-driven deep runs (earnings, new filing, triage hit); CZ taxable tag on sell-family changes. |
+| **Scoreboard (v3)** | Grades advice at T+5 / T+20 against the EUR performance benchmark (total return) with Wilson intervals and an explicit "insufficient sample" rule, plus probabilistic scores (Brier, Brier skill score, log score, reliability bins, rank IC) and naive baselines (`always_hold`, `trend_10m`, `momentum_12_1`). |
+| **Policy and tax** | `investmentPolicy`: target weights with 5/25 bands, a single-stock cap, contribution water-filling and a monthly 10-month-SMA trend filter. For a Czech tax resident (`taxResidency: "CZ"`): 3-year time-test unlock dates per lot and the year-to-date gross sale proceeds vs the CZK 100,000 limit. Informational, not tax advice. |
+| **Events** | `/api/events`: earnings, ex-dividend / pay dates, exchange closures, official FOMC and ECB meeting dates, US CPI releases (FRED). |
 | **Chat assistant** | Streams from the active lane, grounded each turn on current quotes, position and latest advice. |
-| **Market view** | Market light, macro (yield curve, FRED, CFTC COT), earnings calendar, insider feed, FINRA short volume, filings. |
-| **AI Ops view** | Lane state (primary/fallback), LLM budget by purpose, worker health, job queue, triage log, approvals, evidence viewer. |
+| **Market view** | Market light (index + momentum; `holdingsTrend` is informational only), macro (yield curve, FRED, CFTC COT), earnings calendar, events calendar, insider feed, FINRA short volume, filings. |
+| **AI Ops view** | Lane state (primary/fallback, served from cache with `probedAt`), LLM budget by purpose, worker health, notification policy, job queue, triage log, approvals, evidence viewer. |
 
 ## Architecture
 ```
@@ -64,9 +67,9 @@ reports), Ollama (`:11434`), `host-dashboard` (`:8443`, GPU-lane control panel).
 depend on Ollama or Open WebUI to value the portfolio or send alerts.
 
 ### Internal modules
-`registry` (what a ticker *is*) → `prices`/`live_ws`/`forex` (data) → `portfolio` (valuation) →
-`rule_eval`/`price_alerts`/`news_alerts`/`edgar`/`market_light` (alert workers) → `notify` (outbox) →
-ntfy. `lane_client` + `ta_pipeline` + `digest` + `scoreboard` form the LLM side. Every background worker
+`registry` (what a ticker *is*) → `calendars` (sessions) → `prices`/`live_ws`/`forex` (data) → `portfolio`/`performance`/`risk` (valuation, TWR/XIRR, risk) →
+`rule_eval`/`price_alerts`/`news_alerts`/`edgar`/`market_light`/`policy` (alert workers) → `notify` (outbox) →
+ntfy. `tax` and `events` are read-only data views. `lane_client` + `ta_pipeline` + `digest` + `scoreboard` form the LLM side. Every background worker
 follows `start()/stop()/status()/close()` and is listed in `main.BACKGROUND_MODULES`. Details and
 contracts: [`AGENTS.md`](AGENTS.md).
 
@@ -80,11 +83,36 @@ read/written only via `config_store`, which keeps a last-good copy in `data/`:
                    "providers": { "yahoo": "ASML.AS", "twelvedata": "ASML", "finnhub": "ASML" },
                    "listing":   { "symbol": "ASML.AS", "venue": "XAMS", "currency": "EUR" } },
                  /* … SXR8 (etf), GSPC (index, role: benchmark; null providers = unsupported) */ ],
-  "portfolio": { "ASML": { "shares": 2.5, "investedAmount": 2500.00 } },  // EUR; investedAmount may be null
-  "alertRules": { "version": 2, "default": { "thresholdPct": 3.0, "hotPct": 5.0, "cooldownMin": 120 }, "perTicker": {} },
+  "portfolio": { "ASML": { "shares": 2.5, "investedAmount": 2500.00 } },  // EUR; investedAmount may be null; see "New config keys" for lots
+  "alertRules": { "version": 3, "default": { "mode": "sigma", "zAlert": 2.0, "zHot": 3.0, "rearmZ": 1.0, "minPct": 1.0,
+                  "gapWindowMin": 30, "cooldownMin": 120, "direction": "both", "thresholdPct": 3.0, "hotPct": 5.0 }, "perTicker": {} },
   "chatModel": "lane", "aliases": { "ASML": ["asml", "euv"] }
 }
 ```
+
+### New config keys (all optional, validated by `config_edit`, edited by the UI or by hand)
+```jsonc
+{
+  "portfolio": { "ASML": { "shares": 1.3, "investedAmount": 2000.0,         // derived from lots when lots is non-empty
+      "lots": [ { "date": "2024-03-14", "shares": 1.0, "priceEur": 600.0, "feesEur": 1.0, "side": "buy" },
+                { "date": "2025-02-10", "shares": 0.3, "priceEur": 900.0, "side": "buy" } ] } },
+  "performanceBenchmark": "SXR8",                       // watchlist id; default = the role benchmark (GSPC, a price index)
+  "exposureCurrency": { "NVDA": "USD", "SXR8": "USD" }, // underlying currency per id; default = listing currency
+  "lookThrough": { "SXR8": { "asOf": "2026-10-14", "source": "S&P 500 index weights (fund factsheet)",
+                             "weights": { "NVDA": 7.6 } } },   // % of the fund held in another watchlist id (sum <= 100)
+  "investmentPolicy": { "targets": { "ASML": 30, "NVDA": 20, "SXR8": 50 },   // %, must sum to 100 ± 0.5, holdings only
+                        "maxSingleStockPct": 35, "band": { "absPct": 5, "relPct": 25 },
+                        "monthlyContributionEur": 300, "trendFilter": true },
+  "taxResidency": "CZ"                                  // "CZ" or null
+}
+```
+- **`lots`**: each lot has an ISO `date` (not in the future), `shares > 0`, `priceEur > 0`, `feesEur >= 0` (default 0) and `side` `buy` or `sell`; a sell may not exceed the shares held on its date. Lots are stored sorted by date. The server derives `shares` (Σ buys − Σ sells) and `investedAmount` (**FIFO** cost of the remaining shares, buy fees included). A plain position save without a `lots` key keeps the stored lots; `"lots": []` drops them. Positions without lots behave as before.
+- **History `basis`**: `lots` when every included holding has dated lots, otherwise `current_shares` (today's share counts applied to the whole window, with warning `history_basis_current_shares`). `xirrPct` needs dated lots (warning `xirr_needs_dated_lots`). `ALL` without any dated lot is limited to 5 years.
+- **`performanceBenchmark`** is reported as kind `total_return` when it is an ETF watchlist entry and `price` otherwise (an index such as `GSPC` excludes dividends and flatters the comparison). Unset: the role benchmark, converted to EUR.
+- **`lookThrough`**: `exposure(id) = direct weight + Σ fund weight × weights[id] / 100`. The rows overlap, so they do not sum to 100. Weights older than 120 days are flagged in the risk notes.
+- **`investmentPolicy`**: half-width of a band = `min(absPct, target × relPct / 100)` (defaults 5 / 25). The single-stock cap counts equities only, never ETFs. The monthly contribution is water-filled toward the targets without selling. The trend filter compares the last completed month-end close with its 10-month SMA.
+- **`taxResidency`**: only `CZ` is implemented. Any other value or `null` disables the tax view.
+- **alertRules v3**: `mode` `sigma` (default) or `pct`. A v2 block is read as v3 (`mode: "sigma"`, new fields at their defaults) and is only rewritten when you save from the UI. See [alerts](docs/features/alerts.md#alert-rules).
 **`env.secrets`** (gitignored systemd `EnvironmentFile`; never print it): Basic-auth user/password,
 `APPROVAL_TOKEN`, `NTFY_PASS`, provider keys (`FINNHUB_API_KEY`, `TWELVE_DATA_API_KEY`, `FRED_API_KEY`),
 `OPEN_WEBUI_API_KEY`, and feature gates.
@@ -97,9 +125,18 @@ Feature gates / tuning (defaults in code; `=1` enables):
 | `NEWS_ALERTS_ENABLED` | off | news alerts (+ `TRIAGE_ENABLED`, default on, LLM triage) |
 | `KB_SYNC_ENABLED` | off | upload reports to the Open WebUI knowledge base |
 | `FILINGS_ENABLED`, `FUNDAMENTALS_ENABLED`, `MARKET_LIGHT_ENABLED`, `OPS_WATCH_ENABLED` | on | other workers |
+| `POLICY_WATCH_ENABLED` | on | daily policy worker (drift bands, single-stock cap, monthly trend flips; pushes at priority 3) |
 | `LANE_PREFERENCE` | `ninfer-nvfp4,exllama` | lane order |
 | `AUTONOMOUS_TURN_BUDGET` / `DIGEST_TURN_RESERVE` / `TRIAGE_TURN_CAP` | 30 / 16 / 10 | LLM turns per day |
 | `NOTIFY_MIN_SEVERITY`, `PRICE_ALERT_INTERVAL_S`, `NEWS_ALERTS_INTERVAL`, `EDGAR_POLL_INTERVAL` | see code | alert cadence |
+| `NOTIFY_QUIET_HOURS` | `22-7` | container-local window in which pushes are queued until it ends; `off` disables. Bypass: priority 5 from `price` or `policy`, and approval pushes |
+| `NOTIFY_SOURCE_CAPS` | `ops_watch=3,ops=3,triage=6,news=6,analysis=4,price=8,insider=6,policy=3,market_light=2` | pushes per source per rolling 24 h (persisted in `data/notify_caps.json`); over the cap nothing is pushed but the alert row is still stored. Approval pushes are never capped |
+| `NTFY_TOPIC_OPS` | `<NTFY_TOPIC>-ops` (`stocks-ops`) | topic for infrastructure sources `ops_watch` and `ops` (priority capped at 3). **Subscribe the phone to `stocks-ops` if you want infra alerts**; they no longer arrive on the main topic |
+| `DASHBOARD_PUBLIC_URL`, `NTFY_CLICK_URL` | unset | base URL for the per-alert deep link `<base>#alerts/<id>` and the approval buttons (`DASHBOARD_PUBLIC_URL` wins) |
+| `OPS_WATCH_REALERT_S` | `86400` | re-alert interval of a persisting ops finding (priority 3) |
+| `DIGEST_PUBLISH_LANES` | first lane of `LANE_PREFERENCE` | comma list of lanes whose answers may publish; any other lane's answer is a draft (logged for the scoreboard, never confirms or pushes) |
+| `DIGEST_PUSH_NO_CHANGE` | `0` | `1` also pushes batches without a confirmed change |
+| `PIPELINE_TEMPERATURE` | `0.2` | sampling temperature of the analysis stages (0-2); the JSON stages (PM, repair) stay at 0.1 |
 
 ## Run, build, deploy
 The unit files live in `ops/quadlet/` and are symlinked into `~/.config/containers/systemd/`.
@@ -126,7 +163,7 @@ directory, start the pod. Avoid `git clean -x`, which deletes ignored files.
 
 ## Development
 ```bash
-# unit tests (container-side; no pytest needed on the host)
+# unit tests (container-side; no pytest needed on the host). exchange_calendars (requirements.txt) is required.
 podman run --rm -v "$PWD:/src:z" -w /src -e HISTORY_DIR=/tmp/t -e TZ=Europe/Prague \
   docker.io/library/python:3.11-slim sh -c 'pip install -q -r requirements.txt pytest && python -m pytest tests/unit -q'
 # integration (needs the pod up; any Python env with `playwright` installed)
@@ -138,12 +175,23 @@ Frontend rules: strict CSP (no inline script/style), markdown only through `rend
 (DOMPurify, fail-closed), per-panel loading/error/stale states. Vendored libs: `static/VENDOR.md`.
 
 ## HTTP API (all behind Basic auth)
-`/api/portfolio`, `/api/portfolio/history?range=` · `/api/prices`, `/api/history/{id}`, `/api/ticker/{id}`,
+`/api/portfolio`, `/api/portfolio/history?range=1M|3M|6M|1Y|ALL`, `/api/portfolio/performance?range=` (TWR, XIRR, excess over the performance benchmark),
+`/api/portfolio/attribution?range=` (local / FX / cross return per holding), `/api/portfolio/risk` ·
+`/api/policy` (drift, cap, contribution, trend), `/api/tax` (CZ lots, unlock dates, YTD proceeds), `/api/events?days=` ·
+`/api/prices`, `/api/history/{id}`, `/api/ticker/{id}`,
 `/api/indicators/{id}`, `/stream` (SSE) · `/api/config` (GET/PUT), `/api/watchlist` · `/api/alerts`,
 `/api/alerts/ack`, `/api/alert-rules`, `/api/approvals` · `/api/analyse/{id}`, `/api/analysis/{job}`,
 `/api/jobs`, `/api/digest/run`, `/api/advice`, `/api/scoreboard`, `/api/evidence/{id}`, `/api/report/{id}`,
 `/api/chat`, `/api/lane-status`, `/api/models` · `/api/market-light`, `/api/macro`, `/api/earnings`,
 `/api/insider`, `/api/top-news`, `/api/alerts-news` · `/api/background`, `/api/worker-runs`, `/api/triage`.
+
+Behaviour worth knowing:
+- **Calendars.** `app/api/calendars.py` wraps `exchange_calendars` (XAMS, XETR, XNYS, XNAS, XPAR, XBRU, XMIL). Holidays and early closes are modelled (e.g. Amsterdam 24 Dec closes early); `.DE` listings map to XETR, indices to XNYS. Outside the library's date range it falls back to Mon-Fri with a single warning. The digest runs on trading days only: a slot where no analysable holding's venue has a session is recorded as `deferred: no session today`.
+- **`prevClose`** (in the listing quote, `prices.listing_quote()`, which feeds valuation, day change and alerts) is the close of `previous_session(quote_session(now))`, taken from that session's daily row, else from the last intraday bar of that session (`prevCloseSource` is `daily` or `intraday`), else `null`. It is computed from the clock and the venue calendar, never from the newest bar. This fixed bug F0: at the 09:00-09:15 open the daily fetch was empty and the intraday fallback ended a day early, so gap alerts compared against a close two sessions old. A `null` prevClose suppresses the gap alert.
+- **Price alerts (σ).** σ is the EWMA (λ = 0.94) daily volatility of log returns of the last year of daily closes, excluding today. A session move alerts when `|z| >= zAlert` and `|move| >= minPct`, and is hot (priority 5) at `|z| >= zHot`. After an alert the same direction re-alerts only at a higher integer level of `|z|` or on reaching hot; it re-arms below `rearmZ` or at the next session. The gap rule runs only within `gapWindowMin` minutes after the open, once per session per ticker. Without enough history the pass falls back to the percent thresholds.
+- **Alert center deep links.** A push carries `X-Click: <DASHBOARD_PUBLIC_URL or NTFY_CLICK_URL>#alerts/<id>`, which opens the alert center on that row.
+- **Events.** `/api/events` merges earnings (Nasdaq calendar), ex-dividend/pay dates (yfinance), `market_closed` weekday holidays (XAMS, XETR, XNYS; early closes are not listed), FOMC and ECB tables transcribed from the official pages (each event carries its source URL; FOMC dates are tentative until confirmed) and US CPI release dates from FRED (needs `FRED_API_KEY`). A failing source adds a warning instead of failing the endpoint.
+- **Lane status.** `/api/lane-status` answers from the last probe results (each candidate and the payload carry `probedAt`) and refreshes stale probes in one background task; only a never-probed lane is probed inline.
 
 ## Provenance
 This project began as a multi-container "AI stock stack" (Ollama, Open WebUI, OpenTrade/TradingAgents,
@@ -153,7 +201,8 @@ knowledge-sync became background workers, and OpenTrade was retired.
 
 ## Known caveats
 - Investment output is a research aid, not advice; the scoreboard exists to measure how much to trust it.
-- Exchange holidays are not modelled (a holiday shows up as stale data, not "closed").
+- Tax output (`/api/tax`, the digest tax tag) is informational bookkeeping from your own lots, not tax advice. Whether sales of time-test-exempt lots count toward the CZK 100,000 annual limit is **not** decided by the code: the headline figure conservatively counts all sales this calendar year, and a second figure counts only sales of lots younger than 3 years. Verify the rule with a tax adviser.
+- Calendars cover the venues listed above; an unknown venue code is treated as XNYS with a warning.
 - **Set `DASHBOARD_USER` and `DASHBOARD_PASS`** (in `env.secrets`). If either is unset the Basic-auth gate is
   open (dev mode) — fine on localhost, not on a network. The app is designed for a trusted LAN, behind a
   reverse proxy with TLS if exposed further; do not publish port 8601 to the internet.

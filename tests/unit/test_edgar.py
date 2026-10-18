@@ -1,5 +1,6 @@
 """edgar: a filing is marked seen only after its alert was accepted; a lost or
-corrupt seen file reseeds silently instead of flooding alerts."""
+corrupt seen file reseeds silently instead of flooding alerts; foreign private
+issuers' 6-K/20-F are remembered for the evidence pack but never alerted."""
 import asyncio
 import json
 import time
@@ -40,6 +41,7 @@ def sec(tmp_path, monkeypatch):
     """One US issuer 'XYZ' with one fresh Form 4 holding two notable trades."""
     monkeypatch.setattr(edgar, "SEEN_FILE", tmp_path / "seen.json")
     monkeypatch.setattr(edgar, "RECENT_FILE", tmp_path / "recent.json")
+    monkeypatch.setattr(edgar, "FILER_FILE", tmp_path / "filers.json")
     monkeypatch.setattr(edgar, "_watch_symbols", lambda: ["XYZ"])
 
     async def ciks(symbols):
@@ -129,3 +131,53 @@ def test_legacy_list_seen_file_is_still_understood(sec):
     edgar.SEEN_FILE.write_text(json.dumps([f"XYZ:{ACC}"]))
     asyncio.run(edgar.run_once())
     assert sec.calls == []
+
+
+def submissions_body(forms, dates):
+    n = len(forms)
+    return {"filings": {"recent": {
+        "form": forms, "filingDate": dates,
+        "accessionNumber": [f"0000000000-26-{i:06d}" for i in range(n)],
+        "items": [""] * n, "primaryDocument": ["doc.htm"] * n}}}
+
+
+def test_classify_filer_uses_the_newest_annual_form():
+    assert edgar.classify_filer(submissions_body(
+        ["10-Q", "10-K"], ["2026-08-01", "2026-02-20"])) == "domestic"
+    assert edgar.classify_filer(submissions_body(
+        ["6-K", "20-F"], ["2026-08-01", "2026-02-20"])) == "fpi"
+    assert edgar.classify_filer(submissions_body(
+        ["40-F/A"], ["2026-03-01"])) == "fpi"
+    # an issuer that moved from 20-F to 10-K is a domestic filer now
+    assert edgar.classify_filer(submissions_body(
+        ["20-F", "10-K"], ["2024-02-01", "2025-02-01"])) == "domestic"
+    assert edgar.classify_filer(submissions_body(
+        ["6-K", "4"], ["2026-08-01", "2026-08-02"])) is None
+
+
+def test_fpi_periodic_filings_are_remembered_but_never_alerted(sec, monkeypatch):
+    edgar.SEEN_FILE.write_text("{}")
+
+    async def submissions(cik, sym):          # ASML-style: weekly 6-K + one 20-F
+        return submissions_body(["6-K", "20-F", "6-K"], [TODAY, "2026-02-20", TODAY])
+    monkeypatch.setattr(edgar, "_submissions", submissions)
+    asyncio.run(edgar.run_once())
+    assert sec.calls == []                                   # no 6-K push, ever
+    assert seen_file() == {}                                 # nothing to mark seen either
+    assert edgar.filer_type("xyz") == "fpi"
+    assert [(r["form"], r["filed"]) for r in edgar.periodic("XYZ")] == [
+        ("6-K", TODAY), ("6-K", TODAY), ("20-F", "2026-02-20")]
+    assert edgar.filer_type("NOPE") is None and edgar.periodic("NOPE") == []
+
+
+def test_a_body_that_classifies_nothing_keeps_the_known_filer_type(sec, monkeypatch):
+    edgar.SEEN_FILE.write_text("{}")
+    bodies = [submissions_body(["20-F"], ["2026-02-20"]),
+              submissions_body(["4"], [TODAY])]
+
+    async def submissions(cik, sym):
+        return bodies.pop(0)
+    monkeypatch.setattr(edgar, "_submissions", submissions)
+    asyncio.run(edgar.run_once())
+    asyncio.run(edgar.run_once())
+    assert edgar.filer_type("XYZ") == "fpi"

@@ -5,6 +5,7 @@ Run inside the service image (see test_prices.py for the command).
 import asyncio
 import json
 import time
+import types
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ def fresh_forex(monkeypatch, tmp_path):
     monkeypatch.setattr(forex, "_daily", {})
     monkeypatch.setattr(forex, "_daily_fetched_at", 0.0)
     monkeypatch.setattr(forex, "_daily_span", 0)
+    monkeypatch.setattr(forex, "_eur_on", {})
     monkeypatch.setattr(forex, "_client", None)
     return tmp_path
 
@@ -195,3 +197,75 @@ def test_rate_on_carries_the_last_reference_day_over_weekends():
     assert forex.rate_on(rates, "2026-09-17") is None       # nothing earlier
     assert forex.rate_on(rates, "2026-12-01") is None       # beyond the lookback
     assert forex.rate_on(rates, "garbage") is None
+
+
+# ---------------------------------------------------------------- eur_rate_on
+
+def eur_on(monkeypatch, handler, *calls):
+    """Run ``forex.eur_rate_on(*args)`` for each args tuple against a mock transport."""
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            monkeypatch.setattr(forex, "_client_for_loop", lambda: c)
+            return [await forex.eur_rate_on(*args) for args in calls]
+    return run(go())
+
+
+def test_eur_rate_on_asks_frankfurter_v1_for_the_day_and_caches_it(monkeypatch):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        # a Saturday is answered with the previous reference day (Friday)
+        return httpx.Response(200, json={"amount": 1.0, "base": "EUR", "date": "2026-03-13",
+                                         "rates": {"CZK": 24.512}})
+
+    out = eur_on(monkeypatch, handler,
+                 ("czk", "2026-03-14"), ("CZK", "2026-03-14"), ("CZK", "2026-03-13"))
+    assert out == [24.512, 24.512, 24.512]
+    assert [r.url.path for r in seen] == ["/v1/2026-03-14", "/v1/2026-03-13"]   # 2nd call cached
+    assert seen[0].url.host == "api.frankfurter.dev"
+    assert dict(seen[0].url.params) == {"base": "EUR", "symbols": "CZK"}
+
+
+def test_eur_rate_on_failures_are_none_and_not_cached(monkeypatch):
+    replies = iter([httpx.Response(404), httpx.Response(200, json={"rates": {}}),
+                    httpx.Response(200, json={"rates": {"CZK": -3}}),
+                    httpx.Response(200, json={"rates": {"CZK": "x"}}),
+                    httpx.Response(200, json={"rates": {"CZK": 24.0}})])
+    out = eur_on(monkeypatch, lambda r: next(replies), *[("CZK", "2026-03-13")] * 5)
+    assert out == [None, None, None, None, 24.0]          # each failure retried, last one cached
+
+
+def test_eur_rate_on_never_raises(monkeypatch):
+    def boom(request):
+        raise httpx.ConnectError("down")
+
+    assert eur_on(monkeypatch, boom, ("CZK", "2026-03-13")) == [None]
+
+    def never(request):
+        raise AssertionError("no request for an invalid argument")
+    assert eur_on(monkeypatch, never, ("CZK", "garbage"), ("CZ", "2026-03-13"),
+                  (None, "2026-03-13"), ("CZK", None)) == [None, None, None, None]
+    assert eur_on(monkeypatch, never, ("eur", "2026-03-13")) == [1.0]
+
+
+def test_eur_rate_on_today_is_cached_only_for_an_hour(monkeypatch):
+    today = forex.datetime.datetime.now(forex.datetime.timezone.utc).date().isoformat()
+    clock = [1000.0]
+    monkeypatch.setattr(forex, "time", types.SimpleNamespace(time=lambda: clock[0]))
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, json={"rates": {"CZK": 24.0 + len(calls)}})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            monkeypatch.setattr(forex, "_client_for_loop", lambda: c)
+            a = await forex.eur_rate_on("CZK", today)
+            clock[0] += 60
+            b = await forex.eur_rate_on("CZK", today)
+            clock[0] += forex.EUR_ON_TODAY_TTL
+            c2 = await forex.eur_rate_on("CZK", today)
+            return a, b, c2
+    assert run(go()) == (25.0, 25.0, 26.0)

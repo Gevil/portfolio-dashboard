@@ -23,6 +23,10 @@ two concurrent probes of one lane), and a lane that failed its last probe is
 re-probed with a short timeout, so a blackholed lane costs seconds, not 35 s,
 per call.
 
+The status page (``lane_status``) never waits on a probe once it has an answer:
+it serves the last probe results with their ``probedAt`` and refreshes stale
+ones in one single-flight background task.
+
 A report must not mix models: ``pin()`` binds every call made inside it to one
 lane+model. If the pinned lane dies mid-job the pin falls back ONCE to the next
 preferred lane and records that (``Pin.fallbacks``).
@@ -313,6 +317,15 @@ async def _probe_lane(client: httpx.AsyncClient, lane: dict,
 _probe_cache: dict[str, tuple[float, str, str, tuple]] = {}
 _last_state: dict[str, str] = {}
 _probe_inflight: dict[str, asyncio.Task] = {}
+# The last answer per lane however old: ``lane_status`` serves from it while a
+# background refresh re-probes (name -> (wall-clock epoch, state, base, sig)).
+_probe_last: dict[str, tuple[float, str, str, tuple]] = {}
+_refresh_task: asyncio.Task | None = None
+
+
+def _wall() -> float:
+    """Wall-clock epoch for ``probedAt`` (a seam for tests)."""
+    return time.time()
 
 
 def _sig(lane: dict) -> tuple:
@@ -325,9 +338,12 @@ def _probe_ttl(state: str) -> float:
 
 def reset_probe_cache() -> None:
     """Forget every cached probe (tests; a manual 'recheck now')."""
+    global _refresh_task
     _probe_cache.clear()
     _last_state.clear()
     _probe_inflight.clear()
+    _probe_last.clear()
+    _refresh_task = None
 
 
 def _invalidate(name: str) -> None:
@@ -335,6 +351,9 @@ def _invalidate(name: str) -> None:
     'ok' and make the next probe the short one."""
     _probe_cache.pop(name, None)
     _last_state[name] = "down"
+    last = _probe_last.get(name)
+    if last is not None:                    # the status page must not keep saying 'ok'
+        _probe_last[name] = (_wall(), "down", "", last[3])
 
 
 async def _probe_once(lane: dict) -> tuple[str, str]:
@@ -354,6 +373,7 @@ async def _probe_and_store(lane: dict) -> tuple[str, str]:
                         type(e).__name__, e)
             state, base = "down", ""
         _probe_cache[name] = (time.monotonic(), state, base, _sig(lane))
+        _probe_last[name] = (_wall(), state, base, _sig(lane))
         _last_state[name] = "down" if state == "down" else "up"
         return state, base
     finally:
@@ -514,21 +534,73 @@ async def active_lane() -> dict | None:
             "role": _role(lane["name"])}
 
 
+def _known(lane: dict) -> tuple | None:
+    """The last probe answer for this lane (any age), if it was for the same
+    health URL + model id."""
+    hit = _probe_last.get(lane["name"])
+    return hit if hit and hit[3] == _sig(lane) else None
+
+
+def _is_fresh(lane: dict) -> bool:
+    hit = _probe_cache.get(lane["name"])
+    return bool(hit and hit[3] == _sig(lane)
+                and time.monotonic() - hit[0] < _probe_ttl(hit[1]))
+
+
+async def _refresh_probes(stale: list[dict]) -> None:
+    """Background re-probe of the stale lanes (``_probe_cached`` is already
+    single-flight per lane); never raises."""
+    global _refresh_task
+    try:
+        await asyncio.gather(*(_probe_cached(l) for l in stale),
+                             return_exceptions=True)
+    finally:
+        if _refresh_task is asyncio.current_task():
+            _refresh_task = None
+
+
+def _schedule_refresh(stale: list[dict]) -> bool:
+    """Start ONE background refresh unless one is already running (single
+    flight: a UI polling the status page cannot stack up probe rounds)."""
+    global _refresh_task
+    if _refresh_task is None or _refresh_task.done():
+        _refresh_task = asyncio.ensure_future(_refresh_probes(stale))
+    return True
+
+
 async def lane_status() -> dict:
     """Payload of ``GET /api/lane-status``: the serving lane (old keys kept),
-    its role, the preference order, every lane's probe state and the budget."""
+    its role, the preference order, every lane's probe state and the budget.
+
+    Answers from the LAST probe results immediately, so a blackholed lane
+    cannot stall the status page: each candidate (and the payload) carries
+    ``probedAt`` (epoch seconds; the payload's is the oldest lane's), and
+    probes older than their TTL are refreshed in the background by one
+    single-flight task (``refreshing``). Only a lane that has never been
+    probed (the first call after boot or a lanes.conf change) is probed
+    synchronously."""
     all_lanes = lanes()
     order = order_lanes(all_lanes, preference())
-    results = await asyncio.gather(*(_probe_cached(l) for l in order))
-    candidates = [{"name": l["name"], "model_id": l["model_id"], "state": st}
-                  for l, (st, _) in zip(order, results)]
-    candidates += [{"name": l["name"], "model_id": "", "state": "no_model"}
+    cold = [l for l in order if _known(l) is None]
+    if cold:
+        await asyncio.gather(*(_probe_cached(l) for l in cold))
+    stale = [l for l in order if not _is_fresh(l)]
+    if stale:
+        _schedule_refresh(stale)
+    known = [_known(l) or (None, "down", "", ()) for l in order]
+    candidates = [{"name": l["name"], "model_id": l["model_id"], "state": k[1],
+                   "probedAt": k[0]} for l, k in zip(order, known)]
+    candidates += [{"name": l["name"], "model_id": "", "state": "no_model",
+                    "probedAt": None}
                    for l in all_lanes if not l.get("model_id")]
-    serving = next(((l, base) for l, (st, base) in zip(order, results)
-                    if st == "ok"), None)
+    serving = next(((l, k[2]) for l, k in zip(order, known)
+                    if k[1] == "ok"), None)
+    stamps = [k[0] for k in known if k[0] is not None]
     out = {"lane": None, "serving_model": False, "model": None,
            "base_url": None, "role": None, "preference": preference(),
-           "candidates": candidates, "budget": budget_state()}
+           "candidates": candidates, "budget": budget_state(),
+           "probedAt": min(stamps) if stamps else None,
+           "refreshing": bool(_refresh_task and not _refresh_task.done())}
     if serving is not None:
         lane, base = serving
         out.update(lane=lane["name"], serving_model=True,

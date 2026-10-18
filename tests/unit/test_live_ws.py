@@ -4,6 +4,8 @@ policy, tick gating and session helpers (no sockets).
 Run inside the service image (see test_prices.py for the command).
 """
 import asyncio
+import json
+import sys
 import time as real_time
 import types
 
@@ -28,8 +30,10 @@ def reg(monkeypatch):
     monkeypatch.setattr(registry, "_raw_watchlist", lambda: state["raw"])
     monkeypatch.setattr(registry, "_memo_raw", None)
     live_ws.live_prices.clear()
+    live_ws._parked.clear()
     yield state
     live_ws.live_prices.clear()
+    live_ws._parked.clear()
 
 
 # ---------------------------------------------------------------- subscription set
@@ -77,6 +81,73 @@ def test_feed_sync_starts_restarts_and_stops_feeds(monkeypatch, reg):
     left = asyncio.run(go())
     assert started == [{"ASML": "ASML", "NVDA": "NVDA"}, {"ASML": "ASML"}]
     assert left == {}
+
+
+def test_twelvedata_with_every_symbol_rejected_is_parked_for_24h_per_symbol_set(monkeypatch, reg, caplog):
+    clock = {"t": 1_800_000_000}
+    started = []
+    real_loop = live_ws._twelvedata_ws_loop
+
+    class RejectingWS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def send(self, _msg):
+            pass
+
+        async def recv(self):
+            return json.dumps({"event": "subscribe-status", "status": "error", "success": [],
+                               "fails": [{"symbol": "ASML"}, {"symbol": "NVDA"}]})
+
+    monkeypatch.setitem(sys.modules, "websockets",
+                        types.SimpleNamespace(connect=lambda url: RejectingWS()))
+    monkeypatch.setattr(live_ws, "TWELVE_DATA_API_KEY", "k")
+    monkeypatch.setattr(live_ws, "FINNHUB_API_KEY", "")
+    monkeypatch.setattr(live_ws, "_running", True)
+    monkeypatch.setattr(live_ws, "_current_ts", lambda: clock["t"])
+    monkeypatch.setattr(live_ws, "_after_session", lambda *a: (0, 1, 0))
+    monkeypatch.setattr(live_ws, "_feed_tasks", {})
+
+    async def go():
+        sub_map = live_ws._desired("twelvedata")
+        with caplog.at_level("WARNING", logger=live_ws.log.name):
+            await real_loop(sub_map)                       # every symbol rejected -> parks, returns
+        sig = frozenset(sub_map.items())
+        assert live_ws._parked["twelvedata"] == (sig, clock["t"] + 24 * 3600)
+
+        async def fake_loop(sm):
+            started.append(dict(sm))
+            await asyncio.sleep(3600)
+        monkeypatch.setattr(live_ws, "_twelvedata_ws_loop", fake_loop)
+
+        clock["t"] += 3600
+        await live_ws._sync_feeds_once()
+        await asyncio.sleep(0)
+        assert started == []                               # same set, still parked
+        clock["t"] += 23 * 3600 - 1
+        await live_ws._sync_feeds_once()
+        assert started == []                               # 1 s before expiry
+        clock["t"] += 1
+        await live_ws._sync_feeds_once()
+        await asyncio.sleep(0)
+        assert started == [sub_map] and "twelvedata" not in live_ws._parked   # expired -> restarts
+        await live_ws._cancel(live_ws._feed_tasks["twelvedata"][1])
+        live_ws._feed_tasks.clear()
+
+        live_ws._parked["twelvedata"] = (sig, clock["t"] + 24 * 3600)
+        reg["raw"].append({"id": "AMD", "kind": "equity",
+                           "providers": {"yahoo": "AMD.DE", "twelvedata": "AMD", "finnhub": None},
+                           "listing": {"symbol": "AMD.DE", "venue": "XETR", "currency": "EUR"}})
+        await live_ws._sync_feeds_once()                   # signature changed -> park does not apply
+        await asyncio.sleep(0)
+        assert started[-1] == {"ASML": "ASML", "NVDA": "NVDA", "AMD": "AMD"}
+        assert "twelvedata" not in live_ws._parked
+        await live_ws._cancel(live_ws._feed_tasks["twelvedata"][1])
+    asyncio.run(go())
+    assert sum("parking this symbol set for 24 h" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_feed_sync_drops_ticks_of_removed_symbols(monkeypatch, reg):

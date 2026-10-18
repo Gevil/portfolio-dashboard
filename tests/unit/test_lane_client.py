@@ -108,6 +108,61 @@ def test_lane_status_shape(env):
     assert st["role"] is None and st["base_url"] is None
 
 
+def test_lane_status_serves_cached_probes_and_refreshes_in_the_background(env, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(lc, "_wall", lambda: clock["t"])
+
+    async def go():
+        first = await lc.lane_status()              # nothing cached yet: probes synchronously
+        probed = len(env["calls"])
+        env["probe"]["ninfer-nvfp4"] = ("down", "")  # the primary dies; the cache expires
+        monkeypatch.setattr(lc, "PROBE_OK_TTL_S", 0.0)
+        clock["t"] = 1060.0
+        second = await lc.lane_status()
+        assert len(env["calls"]) == probed          # answered without probing
+        refreshing = lc._refresh_task
+        await refreshing
+        third = await lc.lane_status()
+        await lc._refresh_task
+        return first, second, third, refreshing
+    first, second, third, refreshing = asyncio.run(go())
+    assert first["probedAt"] == 1000.0 and first["lane"] == "ninfer-nvfp4"
+    assert second["lane"] == "ninfer-nvfp4" and second["probedAt"] == 1000.0
+    assert second["refreshing"] is True and refreshing is not None
+    assert {c["name"]: c["probedAt"] for c in second["candidates"]} == {
+        "ninfer-nvfp4": 1000.0, "exllama": 1000.0, "vllm": None}
+    # the background probe landed: the next answer shows the lane down, newly stamped
+    assert third["lane"] == "exllama" and third["probedAt"] == 1060.0
+    assert {c["name"]: c["state"] for c in third["candidates"]}["ninfer-nvfp4"] == "down"
+
+
+def test_stale_lane_status_refresh_is_single_flight(env, monkeypatch):
+    async def go():
+        await lc.lane_status()
+        env["calls"].clear()
+        monkeypatch.setattr(lc, "PROBE_OK_TTL_S", 0.0)
+        await lc.lane_status()
+        t1 = lc._refresh_task
+        await lc.lane_status()
+        t2 = lc._refresh_task
+        assert t1 is t2
+        await t1
+    asyncio.run(go())
+    assert sorted(env["calls"]) == ["exllama", "ninfer-nvfp4"]    # one probe per lane, not two
+
+
+def test_failed_call_marks_the_cached_status_down_at_once(env):
+    async def go():
+        await lc.lane_status()
+        lc._invalidate("ninfer-nvfp4")              # a transport failure on a real call
+        st = await lc.lane_status()
+        await lc._refresh_task
+        return st
+    st = asyncio.run(go())
+    assert {c["name"]: c["state"] for c in st["candidates"]}["ninfer-nvfp4"] == "down"
+    assert st["lane"] == "exllama"
+
+
 # --------------------------------------------------------------- probe cache
 
 def test_probe_cache_positive_and_negative(env):

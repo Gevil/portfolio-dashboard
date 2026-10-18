@@ -1,5 +1,5 @@
-// Status bar behaviour: data-age chip, EU/US session pills, alerts bell + unread badge,
-// neutral lane dot, chat/settings buttons, view tabs.
+// Status bar behaviour: quote-age chip (oldest held quote), SSE liveness dot, EU/US session pills,
+// alerts bell + unread badge, neutral lane dot, chat/settings buttons, view tabs.
 import { slot, subscribe, get } from './store.js';
 import { fmtTime24, fmtDateTime24, ageSeconds, isNum, toDate } from './util.js';
 
@@ -25,19 +25,32 @@ export function isSessionOpen(key, date = new Date()) {
   return mins >= s.open[0] * 60 + s.open[1] && mins < s.close[0] * 60 + s.close[1];
 }
 
-/** Newest real price tick in unix seconds: max(position priceAsOf, last SSE price event). */
-export function lastTickSec() {
-  let best = 0;
+/** Held positions' quote ages, oldest first: [{id, label, ts (unix s), age (s), source}]. */
+export function quoteAges() {
   const p = slot('portfolio').data;
-  if (p && Array.isArray(p.positions)) {
-    for (const pos of p.positions) {
-      const d = toDate(pos.priceAsOf);
-      if (d) best = Math.max(best, d.getTime() / 1000);
-    }
+  const out = [];
+  if (!p || !Array.isArray(p.positions)) return out;
+  for (const pos of p.positions) {
+    if (isNum(pos.shares) && pos.shares <= 0) continue;
+    const d = toDate(pos.priceAsOf);
+    if (!d) continue;
+    out.push({ id: pos.id, label: pos.label || pos.id, ts: d.getTime() / 1000, age: ageSeconds(d), source: pos.priceSource || 'unknown' });
   }
-  const sse = get('sse');
-  if (sse && isNum(sse.lastTickTs)) best = Math.max(best, sse.lastTickTs / 1000);
-  return best || null;
+  return out.sort((a, b) => b.age - a.age);
+}
+
+/** EU session open per the clock, unless every held quote's venue reports itself closed (holidays). */
+function euOpenNow(ages) {
+  if (!isSessionOpen('eu')) return false;
+  const prices = slot('prices').data;
+  if (!Array.isArray(prices)) return true;
+  const held = new Set(ages.map(a => a.id));
+  const known = prices.filter(p => p && held.has(p.ticker) && typeof p.marketOpen === 'boolean');
+  return !(known.length && known.every(p => p.marketOpen === false));
+}
+
+function ageText(sec) {
+  return sec < 90 ? `${Math.round(sec)} s` : sec < 5400 ? `${Math.round(sec / 60)} min` : sec < 172800 ? `${Math.round(sec / 3600)} h` : `${Math.round(sec / 86400)} d`;
 }
 
 function setChip(node, cls, text, title) {
@@ -48,21 +61,47 @@ function setChip(node, cls, text, title) {
   node.title = title || '';
 }
 
+const SSE_TEXT = {
+  live: 'Live stream: connected',
+  connecting: 'Live stream: connecting',
+  down: 'Live stream: down (prices refresh by polling)',
+};
+
+/** SSE liveness is its own signal: it never feeds the quote-age chip. */
+function sseLine() {
+  const s = get('sse');
+  return SSE_TEXT[s && s.state] || 'Live stream: unknown';
+}
+
+function paintSse() {
+  const node = document.getElementById('sb-sse');
+  const s = get('sse');
+  const state = s && s.state;
+  node.className = 'dot sb-sse' + (state === 'live' ? ' dot-ok' : state === 'down' ? ' dot-err' : state === 'connecting' ? ' dot-warn' : '');
+  node.title = sseLine();
+  node.setAttribute('aria-label', sseLine());
+}
+
 function paintDataChip() {
   const node = document.getElementById('sb-data');
   const pf = slot('portfolio');
-  const tick = lastTickSec();
+  const ages = quoteAges();
   if (pf.error && !pf.data) return setChip(node, 'chip-err', 'Data unavailable', pf.error);
-  if (!tick) return setChip(node, '', pf.loading ? 'Loading\u2026' : 'No ticks yet', '');
-  const age = ageSeconds(tick);
-  const euOpen = isSessionOpen('eu');
-  const when = age > 86400 ? fmtDateTime24(tick) : fmtTime24(tick);
-  const rel = age < 90 ? `${Math.round(age)} s` : age < 5400 ? `${Math.round(age / 60)} min` : `${Math.round(age / 3600)} h`;
-  if (pf.error) return setChip(node, 'chip-warn', `Refresh failing \u00b7 ${rel}`, `Last tick ${when}. ${pf.error}`);
-  if (!euOpen) return setChip(node, '', `Closed \u00b7 last ${when}`, 'EU session closed; showing the last tick');
-  if (age < 180) return setChip(node, 'chip-ok', `Live \u00b7 ${rel}`, `Last tick ${when}`);
-  if (age < 900) return setChip(node, 'chip-warn', `Delayed \u00b7 ${rel}`, `Last tick ${when}`);
-  return setChip(node, 'chip-err', `Stale \u00b7 ${rel}`, `Last tick ${when}; the EU session is open`);
+  if (!ages.length) return setChip(node, '', pf.loading ? 'Loading\u2026' : 'No quotes yet', '');
+  const oldest = ages[0];
+  const newest = ages[ages.length - 1];
+  const age = oldest.age;
+  const lines = ages.map(a => `${a.label}: ${ageText(a.age)} old \u00b7 ${a.source}`);
+  lines.push(sseLine());
+  const tip = lines.join('\n');
+  if (pf.error) return setChip(node, 'chip-warn', `Refresh failing \u00b7 ${ageText(age)}`, `${pf.error}\n${tip}`);
+  if (!euOpenNow(ages)) {
+    const sameDay = new Date(newest.ts * 1000).toDateString() === new Date().toDateString();
+    return setChip(node, '', `Closed \u00b7 last ${sameDay ? fmtTime24(newest.ts) : fmtDateTime24(newest.ts)}`, `EU session closed; showing the last quote\n${tip}`);
+  }
+  if (age < 600) return setChip(node, 'chip-ok', `Live \u00b7 ${Math.round(age)}s`, `Oldest held quote\n${tip}`);
+  if (age <= 1800) return setChip(node, 'chip-warn', 'Delayed ~15 min (Yahoo EU)', `Oldest held quote is ${ageText(age)} old\n${tip}`);
+  return setChip(node, 'chip-err', `Stale \u00b7 ${Math.round(age / 60)} min`, `The EU session is open but the oldest held quote is ${ageText(age)} old\n${tip}`);
 }
 
 function paintSessions() {
@@ -116,7 +155,7 @@ function paintTabs(view) {
 export function initStatusBar(handlers) {
   const unsub = [];
   const repaint = () => { paintDataChip(); paintSessions(); };
-  unsub.push(subscribe('portfolio', paintDataChip), subscribe('sse', paintDataChip));
+  unsub.push(subscribe('portfolio', paintDataChip), subscribe('prices', paintDataChip), subscribe('sse', () => { paintSse(); paintDataChip(); }));
   unsub.push(subscribe('alerts', paintBell), subscribe('lane', paintLane));
   unsub.push(subscribe('view', paintTabs));
   unsub.push(subscribe('chatOpen', open => {
@@ -131,7 +170,7 @@ export function initStatusBar(handlers) {
   document.getElementById('btn-alerts').addEventListener('click', () => handlers.onAlerts());
   document.getElementById('btn-chat').addEventListener('click', () => handlers.onChat());
   document.getElementById('btn-lane').addEventListener('click', () => handlers.onLane());
-  repaint(); paintBell(); paintLane(); paintTabs(get('view'));
+  repaint(); paintSse(); paintBell(); paintLane(); paintTabs(get('view'));
   const timer = setInterval(() => { if (!document.hidden) repaint(); }, 15000);
   const onVis = () => { if (!document.hidden) repaint(); };
   document.addEventListener('visibilitychange', onVis);

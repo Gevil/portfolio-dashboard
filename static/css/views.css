@@ -132,10 +132,21 @@
 .v-tl { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; font-size: var(--fs-sm); }
 .v-tl__date { font-family: var(--font-mono); color: var(--ink-3); min-width: 3.5rem; }
 
+.v-card--draft { border-style: dashed; border-left-style: dashed; }
+.v-card__badges { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.v-card__prob { font-size: var(--fs-xs); }
 /* ---- scoreboard interval bar ---- */
 .v-wilson { position: relative; display: inline-block; width: 6rem; height: 0.5rem; border-radius: 999px; background: var(--panel-3); }
 .v-wilson__fill { position: absolute; top: 0; bottom: 0; background: var(--blue); opacity: 0.6; border-radius: 999px; }
 .v-wilson__mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink); }
+
+/* ---- scoreboard v3: probabilistic blocks, baselines ---- */
+.v-probgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: var(--space-4); align-items: start; margin-bottom: var(--space-3); }
+.v-prob { border: 1px solid var(--line); border-radius: var(--radius); padding: var(--space-3) var(--space-4); background: var(--panel-2); min-width: 0; }
+.v-prob .v-h3 { margin-top: 0; }
+.v-prob .v-kv { margin-bottom: var(--space-2); }
+.v-table--rel { font-size: var(--fs-xs); }
+.v-table--baselines tbody th { white-space: nowrap; }
 
 /* ---- market ---- */
 .v-light { display: flex; align-items: center; gap: var(--space-4); margin-bottom: var(--space-3); }
@@ -152,6 +163,19 @@
 .v-curve__pt { fill: var(--chart-line); }
 .v-curve__lbl { fill: var(--chart-axis); font-size: 9px; font-family: var(--font-mono); }
 .v-spark { width: 5.5rem; height: 1.5rem; }
+.v-holdings-trend { margin-top: var(--space-3); }
+
+/* ---- events calendar ---- */
+.v-events, .v-warnings { list-style: none; margin: 0; padding: 0; }
+.v-events { display: grid; }
+.v-event { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-1) var(--space-3); padding: var(--space-2) 0; border-bottom: 1px solid var(--line); font-size: var(--fs-sm); }
+.v-event:last-child { border-bottom: 0; }
+.v-event__date { min-width: 6.5rem; color: var(--ink-2); }
+.v-event__title { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
+.v-event--market_closed .v-event__title { color: var(--ink-3); }
+.v-chip--ticker { color: var(--ink); background: var(--panel-3); font-weight: 700; }
+.v-eventweek .v-h3 { margin-top: 0; }
+.v-warnings { display: grid; gap: var(--space-1); margin-top: var(--space-3); }
 .v-sv { display: grid; gap: var(--space-2); }
 .v-sv li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); font-size: var(--fs-sm); }
 
@@ -168,6 +192,8 @@
 .v-dot--ok { background: var(--up); }
 .v-dot--bad { background: var(--down); }
 .v-dot--none { background: transparent; border: 1px dashed var(--ink-3); }
+.v-dot--deferred { background: transparent; border: 1px solid var(--ink-3); }
+.v-ringcard--deferred { border-style: dashed; }
 
 .v-md { overflow-wrap: anywhere; }
 .v-runmsg { font-size: var(--fs-sm); margin-top: var(--space-2); }

@@ -5,7 +5,7 @@ rows into DURABLE outcome rows in ``data/outcomes.json`` (never pruned by the
 advice log's cap: the outcome store is the long-term record, capped separately
 and very large) and grades each at T+5 and T+20 TRADING days.
 
-Grading (``decision-signal-v2``), all constants below:
+Grading (``decision-signal-v3``), all constants below:
 
 * Anchor: the price the advice was given at (``priceAtAdvice``, the held EUR
   listing, with the session day of its ``priceAsOf``). Rows without one (older
@@ -13,30 +13,55 @@ Grading (``decision-signal-v2``), all constants below:
   advice's own date - never the advice-date close, which the advice could not
   have traded.
 * Own series: the EUR listing's daily closes (``prices.listing_bars``).
-* Benchmark: ``registry.benchmark_id()`` (^GSPC, USD index points) CONVERTED TO
-  EUR day by day with ``forex.daily_rates`` (EUR per USD), so EUR-quoted
-  holdings are compared with a EUR benchmark return. A missing benchmark, FX
-  rate or price makes a row ``unable`` with that reason (retried) - it is never
-  graded against nothing.
+* Benchmark: the EUR listing series of the config key ``performanceBenchmark``
+  (read raw via ``config_store.read()``; an EUR listing such as SXR8 needs NO
+  FX; kind ``total_return`` for an ETF, ``price`` for an index). When the key
+  is unset, the role benchmark (``registry.benchmark_id()``, ^GSPC, USD index
+  points) CONVERTED TO EUR day by day with ``forex.daily_rates`` (EUR per USD)
+  is used instead. A missing benchmark, FX rate or price makes a row ``unable``
+  with that reason (retried) - it is never graded against nothing.
 * Horizons are graded separately (a row can be graded at T+5 and still pending
   at T+20). Cells count GRADED rows of one horizon only; there is no
   "T+20 else T+5" mixing anywhere.
 * Verdict band: ``band_pct = max(BAND_FLOOR_PCT, BAND_K * sigma_d * sqrt(h))``
   where ``sigma_d`` is the ticker's own daily volatility (sample stdev of the
   last ``VOL_LOOKBACK`` daily % returns BEFORE the anchor day, no lookahead).
-  buy/add: excess > band hit, < -band miss, else neutral. sell/reduce/avoid use
-  the SIGN-ADJUSTED excess (a stock that fell vs the benchmark is a hit).
-  hold/watch: |excess| <= band hit, else miss.
-* Statistics use one row per ticker per advice day (the day's latest call);
-  hit rate is hits/(hits+misses) with a Wilson 95% interval; a cell with fewer
-  than ``MIN_SAMPLES`` graded rows is flagged ``insufficient_sample``. A
-  buy-and-hold baseline (every graded row treated as a long position, same
-  band) sits beside the real cells, and every row records the lane/model that
-  gave the advice so quality can be stratified per model.
+  buy/add: excess > band hit, < -band miss, else neutral. sell/reduce/avoid/trim
+  use the SIGN-ADJUSTED excess (a stock that fell vs the benchmark is a hit).
+  hold/watch (and unknown actions) are NOT hit/miss graded: ``verdict`` is None
+  and ``graded_as`` is ``"probabilistic_only"``; hit rates cover directional
+  actions only. A horizon counts as graded once its ``excess`` is stored.
+* Statistics use one row per ticker per advice day (the day's latest call) and
+  only rows graded under the current engine; hit rate is hits/(hits+misses) with
+  a Wilson 95% interval; a cell with fewer than ``MIN_SAMPLES`` graded rows is
+  flagged ``insufficient_sample``. A buy-and-hold baseline (every graded
+  directional row treated as a long position, same band) sits beside the real
+  cells, and every row records the lane/model that gave the advice (and whether
+  it was a ``draft``) so quality can be stratified.
 * Consecutive daily rows of a ticker have overlapping windows; ``nIndependent``
   thins each cell to rows at least one horizon apart so the overlap is visible.
+* Probabilistic block (per horizon, from the row's ``p20`` = P(stock beats the
+  benchmark over 20 sessions); outcome y = 1 when the horizon's excess > 0):
+  ``brier`` = mean (p-y)^2; ``brierRef`` = Brier of the constant forecast equal
+  to the base rate of the same rows; ``bss`` = 1 - brier/brierRef;
+  ``logScore`` = mean negative log-likelihood (lower is better, p clipped to
+  [1e-6, 1-1e-6]); ``reliability`` = five bins of width 0.2 (last bin closed at
+  1.0); ``ic`` = Spearman (average ranks for ties) of ``score`` (fallback
+  ``expExcess20Pct``) against the realised excess. Rows without ``p20`` are
+  excluded and counted in ``n_without_p``.
+* Baselines on the same anchor rows at the primary horizon, signals from
+  ``prices.daily_closes(id, "2y")``: ``trend_10m`` (BUY when the anchor close is
+  above the 210-session SMA, else SELL; p 0.55/0.45), ``momentum_12_1`` (BUY
+  when the t-252..t-21 return is > 0, else SELL; p 0.55/0.45) and
+  ``always_hold`` (p 0.5, never hit/miss, no avgExcessPct). Rows with too little
+  history for a signal are left out of that baseline's n.
+* Regrade: a row stored under an older engine is reset and regraded; its prior
+  results are kept under ``row["v2"]`` (no data loss). ``engine_version`` is
+  recorded per row; ``p20``/``expExcess20Pct``/``draft`` are copied from the
+  advice row.
 """
 import asyncio
+import copy
 import datetime as dt
 import logging
 import math
@@ -44,12 +69,12 @@ import os
 import pathlib
 import time
 
-from app.api import forex, jsonstore, macro, prices, registry, runlog
+from app.api import config_store, forex, jsonstore, macro, prices, registry, runlog
 
 log = logging.getLogger("scoreboard")
 
 SCALE_VERSION = "ds-v1"
-ENGINE_VERSION = "decision-signal-v2"
+ENGINE_VERSION = "decision-signal-v3"
 HORIZONS = (5, 20)
 PRIMARY_HORIZON = 20            # the flat cell fields in summary/calibration
 MIN_SAMPLES = 30                # graded rows per cell before a rate means anything
@@ -66,6 +91,12 @@ FX_DAYS = 420
 RETRY_S = 20 * 3600             # below the nightly cadence, or a retry skips a night
 HISTORY_RANGE = "1Y"
 SCOREBOARD_FEEDBACK_MAX = 1000
+PROB_EDGES = (0.2, 0.4, 0.6, 0.8)   # reliability bin edges (5 bins over 0..1)
+P_CLIP = 1e-6                       # log-score clip
+TREND_SESSIONS = 210                # trend_10m SMA length (sessions)
+MOM_LONG, MOM_SKIP = 252, 21        # momentum_12_1: return from t-252 to t-21
+P_BULL, P_BEAR, P_NEUTRAL = 0.55, 0.45, 0.5
+DAILY_CLOSES_PERIOD = "2y"
 
 DATA_DIR = pathlib.Path(os.getenv("HISTORY_DIR", "/app/data"))
 ADVICE_LOG = DATA_DIR / "advice_log.json"
@@ -73,7 +104,7 @@ OUTCOMES = DATA_DIR / "outcomes.json"
 FEEDBACK = DATA_DIR / "advice_feedback.json"
 
 BUYISH = frozenset({"buy", "add"})
-SELLISH = frozenset({"sell", "reduce", "avoid"})
+SELLISH = frozenset({"sell", "reduce", "avoid", "trim"})
 HOLDISH = frozenset({"hold", "watch"})
 _RATING_ACTION = {"BUY": "buy", "SELL": "sell", "HOLD": "hold"}
 # Verdicts are singular ("hit"); the cell counters are plural ("hits").
@@ -125,16 +156,20 @@ def edge(action: str, excess: float | None) -> float | None:
 
 
 def verdict(action: str, excess: float | None, band: float) -> str | None:
-    """hit / miss / neutral for one graded horizon; None when ungradable."""
+    """hit / miss / neutral for one graded horizon; None when ungradable.
+    hold/watch and unknown actions have no direction -> always None."""
     if excess is None:
         return None
-    act = (action or "").lower()
-    if act in HOLDISH:
-        return "hit" if abs(excess) <= band else "miss"
-    e = edge(act, excess)
+    e = edge((action or "").lower(), excess)
     if e is None:
         return None
     return "hit" if e > band else ("miss" if e < -band else "neutral")
+
+
+def graded_as(action: str | None) -> str:
+    """``directional`` (hit/miss graded) or ``probabilistic_only``."""
+    act = (action or "").lower()
+    return "directional" if act in BUYISH or act in SELLISH else "probabilistic_only"
 
 
 # --------------------------------------------------------------------------
@@ -198,6 +233,35 @@ class _Series:
         return math.sqrt(var)
 
 
+def _benchmark_spec() -> dict:
+    """-> {id, kind, fx, reason}: the benchmark the scoreboard grades against.
+
+    ``performanceBenchmark`` (raw config) names a watchlist id whose own
+    listing series is used; no FX when that listing is EUR. Unset -> the role
+    benchmark, a USD index price series converted to EUR."""
+    try:
+        cfg = config_store.read()
+    except Exception as e:
+        log.warning("scoreboard: config read failed: %s", e)
+        cfg = {}
+    raw = cfg.get("performanceBenchmark") if isinstance(cfg, dict) else None
+    ident = str(raw).strip() if raw else ""
+    if not ident:
+        return {"id": registry.benchmark_id(), "kind": "price", "fx": True,
+                "reason": ""}
+    entry = registry.get(ident)
+    if not entry:
+        return {"id": ident.upper(), "kind": "price", "fx": False,
+                "reason": "unknown_performance_benchmark"}
+    ccy = str((entry.get("listing") or {}).get("currency")
+              or entry.get("quoteCurrency") or "EUR").upper()
+    kind = "total_return" if entry.get("kind") == "etf" else "price"
+    spec = {"id": entry["id"], "kind": kind, "fx": ccy == "USD", "reason": ""}
+    if ccy not in ("EUR", "USD"):
+        spec["reason"] = "unsupported_benchmark_currency"
+    return spec
+
+
 class _Ctx:
     """Per-pass caches: series per symbol, the FX table, the EUR benchmark."""
 
@@ -205,6 +269,8 @@ class _Ctx:
         self.series: dict[str, _Series] = {}
         self.rates: dict[str, float] = {}
         self.bench_id: str | None = None
+        self.bench_kind = "price"
+        self.bench_fx = True            # False: the benchmark series is already EUR
         self.bench: _Series | None = None
         self.bench_reason = ""          # why the benchmark cannot be used
 
@@ -220,13 +286,20 @@ class _Ctx:
         return self.series[symbol]
 
     async def load_benchmark(self) -> None:
-        self.bench_id = registry.benchmark_id()
+        spec = _benchmark_spec()
+        self.bench_id, self.bench_kind = spec["id"], spec["kind"]
+        self.bench_fx = spec["fx"]
         if not self.bench_id:
             self.bench_reason = "no_benchmark_configured"
+            return
+        if spec["reason"]:
+            self.bench_reason = spec["reason"]
             return
         self.bench = await self.load_series(self.bench_id)
         if not self.bench:
             self.bench_reason = "missing_benchmark_price"
+            return
+        if not self.bench_fx:
             return
         try:
             self.rates = await forex.daily_rates(FX_DAYS) or {}
@@ -237,13 +310,20 @@ class _Ctx:
             self.bench_reason = "missing_fx_rates"
 
     def bench_eur(self, day: dt.date) -> float | None:
-        """Benchmark close on/before ``day`` converted to EUR; None if the
-        benchmark, its price or the FX rate of that day is unavailable."""
-        if self.bench_reason or not self.bench or not self.rates:
+        """Benchmark close on/before ``day`` in EUR (converted day by day only
+        when the series is not already EUR); None if the benchmark, its price
+        or the FX rate of that day is unavailable."""
+        if self.bench_reason or not self.bench:
             return None
         hit = self.bench.close_on_or_before(day)
+        if hit is None:
+            return None
+        if not self.bench_fx:
+            return hit[1]
+        if not self.rates:
+            return None
         rate = forex.rate_on(self.rates, day.isoformat())
-        if hit is None or rate is None:
+        if rate is None:
             return None
         return hit[1] * rate
 
@@ -307,6 +387,56 @@ def _anchor(advice: dict, market: str) -> tuple[dt.date | None, float | None, st
     return macro.advance_trading_days(market, advice_day, 1), None, "next_close"
 
 
+def _num(value) -> float | None:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _prob(value) -> float | None:
+    """A usable probability: finite and strictly inside (0, 1)."""
+    v = _num(value)
+    return v if v is not None and 0.0 < v < 1.0 else None
+
+
+def _carry_advice_fields(row: dict, advice: dict) -> None:
+    """Copy p20 / expExcess20Pct / draft from the advice row (contract C5)
+    into the outcome row. The advice row is the source of truth: a value it
+    carries replaces the row's (a fresh row defaults ``draft`` to False, which
+    must not shadow the real flag); a field the advice lacks leaves the row's
+    value alone."""
+    for key, val in (("p20", _prob(advice.get("p20"))),
+                     ("expExcess20Pct", _num(advice.get("expExcess20Pct")))):
+        if val is not None:
+            row[key] = val
+    if "draft" in advice:
+        row["draft"] = bool(advice.get("draft"))
+
+
+_GRADING_FIELDS = ("engine_version", "horizons", "eval_status", "unable_reason",
+                   "retry_at")
+
+
+def _regrade(row: dict) -> dict:
+    """Reset a row stored under an older engine for v3 grading. The prior
+    results are kept under ``v2`` (never dropped); the anchor facts do not
+    depend on the engine and are kept."""
+    out = dict(row)
+    if not isinstance(out.get("v2"), dict):
+        out["v2"] = copy.deepcopy({k: row[k] for k in _GRADING_FIELDS if k in row})
+    out["horizons"] = {}
+    out["engine_version"] = ENGINE_VERSION
+    out["graded_as"] = graded_as(out.get("action"))
+    if out.get("anchor_date"):
+        out["eval_status"], out["unable_reason"], out["retry_at"] = (
+            "pending", None, 0.0)
+    else:
+        out["eval_status"], out["unable_reason"] = "unable", "missing_anchor_date"
+    return out
+
+
 def _fresh_row(key: str, ts: float, sym: str, advice: dict) -> dict:
     market = macro.market_for_ticker(sym)
     anchor_day, anchor_price, basis = _anchor(advice, market)
@@ -332,6 +462,10 @@ def _fresh_row(key: str, ts: float, sym: str, advice: dict) -> dict:
         "targets": {},
         "horizons": {}, "eval_status": "pending", "unable_reason": None,
         "retry_at": 0.0, "engine_version": ENGINE_VERSION,
+        "graded_as": graded_as(action),
+        "p20": _prob(advice.get("p20")),
+        "expExcess20Pct": _num(advice.get("expExcess20Pct")),
+        "draft": bool(advice.get("draft")),
     }
     if anchor_day is None:
         row["eval_status"] = "unable"
@@ -352,7 +486,7 @@ def _matured(row: dict, today: dt.date) -> list[int]:
     """Ungraded horizons whose target session is strictly in the past."""
     out = []
     for h in HORIZONS:
-        if (row.get("horizons") or {}).get(str(h), {}).get("verdict"):
+        if (row.get("horizons") or {}).get(str(h), {}).get("excess") is not None:
             continue
         try:
             target = dt.date.fromisoformat(row["targets"][str(h)])
@@ -417,17 +551,18 @@ async def _grade(row: dict, ctx: _Ctx, today: dt.date) -> int:
         bench_ret = (b / b0 - 1) * 100
         excess = ret - bench_ret
         band = band_pct(sigma, h)
+        e = edge(row.get("action"), excess)
         horizons[str(h)] = {
             "ret": round(ret, 2), "bench": round(bench_ret, 2),
             "excess": round(excess, 2),
-            "edge": (None if edge(row.get("action"), excess) is None
-                     else round(edge(row.get("action"), excess), 2)),
+            "edge": None if e is None else round(e, 2),
             "band": round(band, 2), "sigma_d": round(sigma, 3),
             "verdict": verdict(row.get("action"), excess, band),
+            "graded_as": graded_as(row.get("action")),
             "as_of": own_hit[0].isoformat(),
         }
         graded += 1
-    done = sum(1 for h in horizons.values() if h.get("verdict"))
+    done = sum(1 for h in horizons.values() if h.get("excess") is not None)
     if done == len(HORIZONS):
         row["eval_status"], row["unable_reason"], row["retry_at"] = (
             "completed", None, 0.0)
@@ -454,13 +589,26 @@ async def run_pass(force: bool = False) -> dict:
         rows = [r for r in (store.get("rows") or []) if isinstance(r, dict)]
         by_key = {r.get("key"): r for r in rows if r.get("key")}
 
+        advice_by_key: dict[str, dict] = {}
         for sym, ts, advice in _advice_rows():
             key = _key(ts, sym)
-            existing = by_key.get(key)
-            if (existing and existing.get("engine_version") == ENGINE_VERSION
-                    and existing.get("anchor_date") and not force):
-                continue
-            by_key[key] = _fresh_row(key, ts, sym, advice)
+            advice_by_key[key] = advice
+            if key not in by_key:
+                by_key[key] = _fresh_row(key, ts, sym, advice)
+
+        for key, row in list(by_key.items()):
+            advice = advice_by_key.get(key)
+            if row.get("engine_version") != ENGINE_VERSION:
+                row = _regrade(row)                    # v2 results -> row["v2"]
+            elif advice and (force or not row.get("anchor_date")):
+                fresh = _fresh_row(key, row.get("advice_ts") or 0,
+                                   row.get("ticker") or "", advice)
+                if row.get("v2"):
+                    fresh["v2"] = row["v2"]
+                row = fresh
+            if advice:
+                _carry_advice_fields(row, advice)
+            by_key[key] = row
 
         rows = list(by_key.values())
         rows.sort(key=lambda r: (r.get("eval_status") != "unable",
@@ -495,6 +643,7 @@ async def run_pass(force: bool = False) -> dict:
         store["last_pass"] = {
             "ts": started, "due": len(due), "graded": graded,
             "unable_reasons": reasons, "benchmark": ctx.bench_id,
+            "benchmark_kind": ctx.bench_kind,
             "benchmark_ok": (not ctx.bench_reason) if due else None,
             "benchmark_reason": ctx.bench_reason}
         if not jsonstore.save(OUTCOMES, store):
@@ -729,6 +878,225 @@ def _flat(by_h: dict[str, dict], extra: dict | None = None) -> dict:
     return out
 
 
+# --------------------------------------------------------------------------
+# probabilistic metrics, IC, baselines
+# --------------------------------------------------------------------------
+
+def _graded(row: dict, horizon: int) -> dict | None:
+    """The row's stored horizon result when it was graded (excess known)."""
+    h = (row.get("horizons") or {}).get(str(horizon))
+    if isinstance(h, dict) and _num(h.get("excess")) is not None:
+        return h
+    return None
+
+
+def prob_metrics(pairs: list[tuple[float, int]]) -> dict:
+    """Brier, constant-base-rate reference, BSS, log score and reliability bins
+    for ``(p, y)`` pairs (p = forecast probability, y in {0, 1})."""
+    n = len(pairs)
+    bounds = (0.0,) + PROB_EDGES + (1.0,)
+    bins = [{"lo": bounds[i], "hi": bounds[i + 1], "n": 0, "sum_p": 0.0,
+             "sum_y": 0} for i in range(len(bounds) - 1)]
+    out = {"n": n, "brier": None, "brierRef": None, "bss": None,
+           "logScore": None}
+    if n:
+        base = sum(y for _, y in pairs) / n
+        brier = sum((p - y) ** 2 for p, y in pairs) / n
+        ref = sum((base - y) ** 2 for _, y in pairs) / n
+        ll = 0.0
+        for p, y in pairs:
+            q = min(max(p, P_CLIP), 1 - P_CLIP)
+            ll -= math.log(q) if y else math.log(1 - q)
+            b = bins[sum(1 for e in PROB_EDGES if p >= e)]
+            b["n"] += 1
+            b["sum_p"] += p
+            b["sum_y"] += y
+        out.update(brier=round(brier, 4), brierRef=round(ref, 4),
+                   bss=None if ref == 0 else round(1 - brier / ref, 4),
+                   logScore=round(ll / n, 4))
+    out["reliability"] = [
+        {"lo": b["lo"], "hi": b["hi"], "n": b["n"],
+         "meanP": round(b["sum_p"] / b["n"], 4) if b["n"] else None,
+         "observed": round(b["sum_y"] / b["n"], 4) if b["n"] else None}
+        for b in bins]
+    return out
+
+
+def _ranks(values: list[float]) -> list[float]:
+    """1-based ranks; tied values share the average of their positions."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    return ranks
+
+
+def spearman(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman rank correlation (average ranks for ties); None below 3 pairs
+    or when either side is constant."""
+    if len(xs) != len(ys) or len(xs) < 3:
+        return None
+    rx, ry = _ranks(xs), _ranks(ys)
+    mx, my = sum(rx) / len(rx), sum(ry) / len(ry)
+    sxx = sum((a - mx) ** 2 for a in rx)
+    syy = sum((b - my) ** 2 for b in ry)
+    if sxx == 0 or syy == 0:
+        return None
+    sxy = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    return round(sxy / math.sqrt(sxx * syy), 4)
+
+
+def _probabilistic(rows: list[dict], horizon: int) -> dict:
+    """P block of contract C6 for one horizon over the deduped daily rows."""
+    pairs: list[tuple[float, int]] = []
+    without = 0
+    xs: list[float] = []
+    ys: list[float] = []
+    for r in rows:
+        h = _graded(r, horizon)
+        if h is None:
+            continue
+        excess = float(h["excess"])
+        p = _prob(r.get("p20"))
+        if p is None:
+            without += 1
+        else:
+            pairs.append((p, 1 if excess > 0 else 0))
+        s = _num(r.get("score"))
+        if s is None:
+            s = _num(r.get("expExcess20Pct"))
+        if s is not None:
+            xs.append(s)
+            ys.append(excess)
+    out = prob_metrics(pairs)
+    out["n_without_p"] = without
+    out["ic"] = {"spearman": spearman(xs, ys), "n": len(xs)}
+    return out
+
+
+def _anchor_index(closes: list[tuple[str, float]], anchor_day) -> int | None:
+    """Index of the last close on/before the anchor day (within the bar slack)."""
+    day = str(anchor_day or "")[:10]
+    idx = None
+    for i, (d, _) in enumerate(closes):
+        if d > day:
+            break
+        idx = i
+    if idx is None:
+        return None
+    try:
+        gap = (dt.date.fromisoformat(day)
+               - dt.date.fromisoformat(closes[idx][0])).days
+    except ValueError:
+        return None
+    return idx if gap <= BAR_SLACK_DAYS else None
+
+
+def baseline_signals(closes: list[tuple[str, float]], anchor_day) -> dict:
+    """``{"trend_10m", "momentum_12_1"}`` -> "BUY" / "SELL" / None (history too
+    short) from ``(iso_date, close)`` pairs, oldest first, as of the anchor.
+
+    trend_10m: BUY when the anchor close is above the TREND_SESSIONS-session SMA
+    (anchor included). momentum_12_1: BUY when close[t-21] / close[t-252] - 1 > 0."""
+    out = {"trend_10m": None, "momentum_12_1": None}
+    i = _anchor_index(closes, anchor_day)
+    if i is None:
+        return out
+    if i + 1 >= TREND_SESSIONS:
+        window = [c for _, c in closes[i - TREND_SESSIONS + 1:i + 1]]
+        out["trend_10m"] = ("BUY" if closes[i][1] > sum(window) / len(window)
+                            else "SELL")
+    if i >= MOM_LONG:
+        out["momentum_12_1"] = ("BUY" if closes[i - MOM_SKIP][1]
+                                / closes[i - MOM_LONG][1] - 1 > 0 else "SELL")
+    return out
+
+
+_BASELINE_P = {"BUY": P_BULL, "SELL": P_BEAR, "HOLD": P_NEUTRAL}
+
+
+def _baseline_cell(rows: list[dict], signal_for, horizon: int) -> dict:
+    """B of contract C6 over ``rows`` for one horizon. ``signal_for(row)`` ->
+    BUY / SELL / HOLD / None (None: no signal, row left out). HOLD is never
+    hit/miss graded and has no avgExcessPct."""
+    n = hits = misses = neutral = edge_n = 0
+    brier = edge_sum = 0.0
+    for r in rows:
+        h = _graded(r, horizon)
+        sig = signal_for(r) if h is not None else None
+        if sig not in _BASELINE_P:
+            continue
+        excess = float(h["excess"])
+        n += 1
+        brier += (_BASELINE_P[sig] - (1 if excess > 0 else 0)) ** 2
+        if sig == "HOLD":
+            continue
+        act = sig.lower()
+        band = _num(h.get("band"))
+        v = verdict(act, excess, BAND_FLOOR_PCT if band is None else band)
+        if v == "hit":
+            hits += 1
+        elif v == "miss":
+            misses += 1
+        else:
+            neutral += 1
+        edge_sum += edge(act, excess)
+        edge_n += 1
+    decided = hits + misses
+    interval = wilson(hits, decided)
+    return {"n": n, "hits": hits, "misses": misses, "neutral": neutral,
+            "hitRatePct": round(hits / decided * 100, 1) if decided else None,
+            "wilson95": list(interval) if interval else None,
+            "brier": round(brier / n, 4) if n else None,
+            "avgExcessPct": round(edge_sum / edge_n, 2) if edge_n else None,
+            "horizon": horizon}
+
+
+def _baselines(rows: list[dict], closes_by_ticker: dict) -> dict:
+    """Baselines on the same anchor rows (graded at the primary horizon)."""
+    def signal(name):
+        return lambda r: baseline_signals(
+            closes_by_ticker.get(r.get("ticker")) or [],
+            r.get("anchor_date"))[name]
+    return {
+        "always_hold": _baseline_cell(rows, lambda r: "HOLD", PRIMARY_HORIZON),
+        "trend_10m": _baseline_cell(rows, signal("trend_10m"), PRIMARY_HORIZON),
+        "momentum_12_1": _baseline_cell(rows, signal("momentum_12_1"),
+                                        PRIMARY_HORIZON),
+    }
+
+
+async def _load_closes(rows: list[dict]) -> dict[str, list[tuple[str, float]]]:
+    """``prices.daily_closes(id, "2y")`` per ticker of the rows graded at the
+    primary horizon; a failure leaves that ticker without baseline signals."""
+    out: dict[str, list[tuple[str, float]]] = {}
+    tickers = {r.get("ticker") for r in rows
+               if r.get("ticker") and _graded(r, PRIMARY_HORIZON)}
+    for t in sorted(tickers):
+        try:
+            data = await prices.daily_closes(t, DAILY_CLOSES_PERIOD)
+        except Exception as e:
+            log.warning("scoreboard: daily closes for %s failed: %s", t, e)
+            data = []
+        series = []
+        for item in data or []:
+            try:
+                day, close = item
+                close = float(close)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(day, str) and math.isfinite(close) and close > 0:
+                series.append((day[:10], close))
+        out[t] = sorted(series)
+    return out
+
+
 def _entry(r: dict, fb: dict) -> dict:
     h5 = (r.get("horizons") or {}).get("5") or {}
     h20 = (r.get("horizons") or {}).get("20") or {}
@@ -752,6 +1120,10 @@ def _entry(r: dict, fb: dict) -> dict:
         # ``verdict`` is the T+20 verdict ONLY; T+5 lives in verdictT5.
         "verdict": h20.get("verdict"),
         "horizons": r.get("horizons") or {},
+        "graded_as": r.get("graded_as") or graded_as(r.get("action")),
+        "engine_version": r.get("engine_version"),
+        "p20": r.get("p20"), "expExcess20Pct": r.get("expExcess20Pct"),
+        "draft": r.get("draft"),
         "feedback": fb.get((sym, ats)),
     }
 
@@ -768,18 +1140,28 @@ async def scoreboard() -> dict:
     all_rows = [r for r in (store.get("rows") or []) if isinstance(r, dict)]
     all_rows.sort(key=lambda r: r.get("advice_ts") or 0, reverse=True)
     votes = _feedback_map()
-    daily = _dedupe_daily(all_rows)
-    bench_id = registry.benchmark_id()
+    # Statistics only use rows graded under the current engine; older rows wait
+    # in the store for the next pass to regrade them (their v2 results are kept).
+    current = [r for r in all_rows if r.get("engine_version") == ENGINE_VERSION]
+    legacy_n = len(all_rows) - len(current)
+    daily = _dedupe_daily(current)
+    spec = _benchmark_spec()
+    bench_id = spec["id"]
     last_pass = store.get("last_pass") if isinstance(
         store.get("last_pass"), dict) else {}
 
     by_rating = _grouped(daily, lambda r: r.get("rating") or "OTHER", votes)
     advice_n: dict[str, int] = {}
+    directional_n: dict[str, int] = {}
     for r in daily:
-        advice_n[r.get("rating") or "OTHER"] = advice_n.get(
-            r.get("rating") or "OTHER", 0) + 1
-    summary = {rating: _flat(by_rating.get(rating, {}),
-                             {"advice": advice_n.get(rating, 0)})
+        rating = r.get("rating") or "OTHER"
+        advice_n[rating] = advice_n.get(rating, 0) + 1
+        if graded_as(r.get("action")) == "directional":
+            directional_n[rating] = directional_n.get(rating, 0) + 1
+    summary = {rating: _flat(by_rating.get(rating, {}), {
+                   "advice": advice_n.get(rating, 0),
+                   "graded_as": ("directional" if directional_n.get(rating)
+                                 else "probabilistic_only")})
                for rating in advice_n}
     baseline = _grouped(daily, lambda r: "BASELINE", votes, baseline=True)
     if baseline:
@@ -803,9 +1185,8 @@ async def scoreboard() -> dict:
                      r.get("action") or "")
         by_horizon_cells[str(h)] = _finish(c, h)
 
-    graded_rows = {str(h): sum(1 for r in daily
-                               if ((r.get("horizons") or {}).get(str(h)) or {}
-                                   ).get("verdict")) for h in HORIZONS}
+    graded_rows = {str(h): sum(1 for r in daily if _graded(r, h))
+                   for h in HORIZONS}
     unable: dict[str, int] = {}
     for r in all_rows:
         if r.get("eval_status") == "unable":
@@ -822,10 +1203,14 @@ async def scoreboard() -> dict:
         why = (", ".join(f"{k}={v}" for k, v in sorted(unable.items()))
                or "nothing has matured past T+5 yet")
         warnings.append(f"0 graded rows of {len(all_rows)} ({why})")
+    probabilistic = {str(h): _probabilistic(daily, h) for h in HORIZONS}
+    baselines = _baselines(daily, await _load_closes(daily))
     return {
         "ts": time.time(), "benchmark": bench_id or "none",
-        "benchmark_currency": "EUR (index converted with forex.daily_rates)",
-        "engine_version": store.get("engine_version") or ENGINE_VERSION,
+        "benchmark_kind": spec["kind"],
+        "benchmark_currency": ("EUR (listing series, no FX)" if not spec["fx"]
+                               else "EUR (index converted with forex.daily_rates)"),
+        "engine_version": ENGINE_VERSION,
         "scale_version": SCALE_VERSION,
         "horizons": list(HORIZONS), "primary_horizon": PRIMARY_HORIZON,
         "min_samples": MIN_SAMPLES,
@@ -837,6 +1222,7 @@ async def scoreboard() -> dict:
             "unable": unable,
             "benchmark_available": not bench_reason,
             "benchmark_reason": bench_reason,
+            "regrade_pending": legacy_n,
             "last_pass": last_pass},
         "warnings": warnings,
         "entries": [_entry(r, votes) for r in all_rows[:100]],
@@ -849,6 +1235,8 @@ async def scoreboard() -> dict:
             "baseline": {h: _finish(cell, int(h)) for h, cell in
                          (baseline.get("BASELINE") or {}).items()},
         },
+        "probabilistic": probabilistic,
+        "baselines": baselines,
         "feedback_counts": feedback_counts(),
     }
 

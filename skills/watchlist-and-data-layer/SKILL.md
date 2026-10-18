@@ -11,7 +11,11 @@ quoteCurrency, providers:{yahoo,twelvedata,finnhub}, listing:{symbol,venue,curre
 - `providers.<x> = null` means **unsupported**: `registry.provider_symbol(id, "x")` returns `None` and
   callers **skip** — no request, no negative-cache entry, no fallback to the raw id.
 - `listing` is the single venue/currency whose series drives valuation, charts and stored history.
-  Venue hours come from the `VENUES` table (MIC → tz/open/close). Holidays are not modelled.
+  Venue tz/region come from the `VENUES` table (MIC → tz/open/close); **sessions, holidays and early closes come from
+  `app/api/calendars.py`** (`exchange_calendars`, XAMS/XETR/XNYS/XNAS/XPAR/XBRU/XMIL). The registry's market-hours
+  helpers (open now, session window) and the `macro` trading-day helpers delegate to it. `calendars.mic_for(id)` gives the listing's
+  MIC (`.DE` → XETR, `.AS` → XAMS, index/unknown → XNYS). An unknown MIC is XNYS with one warning; dates outside the
+  library's range degrade to Mon–Fri with one warning. Never hand-roll weekday/holiday logic.
 - Defaults by kind: equity → alertable + analyzeable; etf → alertable only; index → neither.
   Benchmarks (`role: benchmark`) are never in the portfolio, never alerted, never analysed.
 - `normalize_entry()` raises `ValueError` with a readable message; it **preserves unknown keys** so a UI
@@ -27,7 +31,7 @@ quoteCurrency, providers:{yahoo,twelvedata,finnhub}, listing:{symbol,venue,curre
 3. Add the position in **Settings → Positions**: `shares` (> 0) and `investedAmount` = EUR cost basis
    (`null` = unknown → valued, excluded from P/L, warning `cost_missing`). A position id must be a
    `holding` on the watchlist; removing a watchlist entry that still has a position is rejected (400)
-   so cost basis is never silently dropped.
+   so cost basis is never silently dropped. Optionally give dated `lots` instead (see "Lots and the ledger").
 4. New tickers trigger history seeding automatically on save. Check
    `GET /api/history/<id>?range=1M` and `GET /api/portfolio`.
 
@@ -53,8 +57,39 @@ per reference day for converting the benchmark bar-by-bar (weekends absent → c
 `snapshot()` (async, ≤30 s cache, invalidated on config change) → totals, positions, benchmark, fx,
 warnings. `position_for(id)` is **sync** and reads that cache — async callers `await snapshot()` first.
 Warning codes: `cost_missing`, `stale_price`, `fx_stale`. Every number carries `priceAsOf`/`priceSource`/`stale`.
-`/api/portfolio/history` indexes portfolio and the EUR-converted benchmark to 0 % at the first common date.
+`/api/portfolio/history?range=1M|3M|6M|1Y|ALL` indexes portfolio, the EUR-converted role benchmark and the performance
+benchmark to 0 % at the first common date.
+
+## prevClose (the F0 fix)
+`prices._prev_close` takes the close of `calendars.previous_session(mic, calendars.quote_session(mic, now))`, computed
+from the clock and the venue calendar, **never from the newest bar's date** (at the 09:00–09:15 open the 1d fetch is
+empty and the 15m fallback ends yesterday; the old code then used a close two sessions old and fired false gap alerts).
+Chain: that exact date's daily row (`5d`, then one retry with `1mo`); else the close of the last intraday bar of that
+session (stored listing history, then a 5d/15m fetch); else `None`. `listing_quote()` carries `prevClose` and
+`prevCloseSource` (`daily` | `intraday` | null). The cache key is `(id, expected date)`; a `None` is cached for 300 s
+only. Consumers must treat `prevClose is None` as "unknown" (the gap alert is skipped, not guessed).
+`prices.daily_closes(id, period)` returns raw unadjusted `(local ISO date, close)` rows (cached 6 h, never raises,
+never writes the listing store); σ, the scoreboard baselines, the policy trend filter and the `ALL` range use it.
+
+## Lots and the ledger (`performance.py`, `risk.py`, `config_edit.py`)
+- `portfolio[id].lots = [{date, shares, priceEur, feesEur, side}]` (validated in `config_edit`: date not in the future,
+  `shares > 0`, `priceEur > 0`, `feesEur >= 0`, `side` buy|sell, a sell may not exceed the shares held on its date).
+  With lots the server derives and stores `shares` (Σbuy − Σsell) and `investedAmount` (FIFO cost of the remaining
+  shares, buy fees included). A plain save without a `lots` key keeps them; `"lots": []` drops them.
+- `GET /api/portfolio/history` adds `basis` (`lots` | `current_shares`, warning `history_basis_current_shares`),
+  `perfBenchmark`, `indexed.perfBenchmark` and, with basis `lots`, `invested` and `twr`.
+- `GET /api/portfolio/performance?range=`: `twrPct`, `xirrPct` (null without dated lots, warning
+  `xirr_needs_dated_lots`), `perfBenchmarkPct`, `excessPct`, `netFlowsEur`. TWR links daily returns with flows at
+  day end; XIRR is bisection with a sign check (no sign change → null, never a guess).
+- `GET /api/portfolio/attribution?range=`: per holding `eurReturnPct`, `localReturnPct`, `fxReturnPct`, `crossPct`
+  (local = (1 + eur) / (1 + fx) − 1 against `exposureCurrency`, default the listing currency; EUR → fx 0).
+- `GET /api/portfolio/risk`: direct / look-through / currency exposure, 1Y volatility, beta, drawdown on the TWR index,
+  correlation, concentration. Look-through = direct weight + Σ fund weight × `lookThrough[fund].weights[id]` / 100.
+- Config keys (all optional; ids are checked against the same update's watchlist): `performanceBenchmark`,
+  `exposureCurrency`, `lookThrough`, `investmentPolicy`, `taxResidency`; examples in `README.md`.
+  `performanceBenchmark` kind is `total_return` for an ETF entry, else `price`; unset = the role benchmark.
+- `ALL` uses `daily_closes` (period chosen from the oldest lot); without any dated lot it is limited to 5 years.
 
 ## Tests to run after changes
-`tests/unit/test_registry.py test_prices.py test_forex.py test_live_ws.py test_portfolio.py test_config_edit.py
+`tests/unit/test_registry.py test_calendars.py test_prices.py test_forex.py test_live_ws.py test_portfolio.py test_config_edit.py
 test_config_store.py` (see `skills/testing`).

@@ -19,16 +19,15 @@ def env(tmp_path, monkeypatch):
     stored = []
     outcomes = {}
 
-    async def push(title, body, severity="warning", **kw):
-        pushes.append((title, body, kw))
-        return outcomes.get(title.split()[0], notify.Delivery(notify.SENT))
+    async def alert(ticker, source, title, body, **kw):
+        pushes.append((title, body, {**kw, "ticker": ticker,
+                                     "source": source}))
+        outcome = outcomes.get(title.split()[0], notify.Delivery(notify.SENT))
+        if outcome:                  # notify.alert stores accepted rows
+            stored.append((ticker, title, kw.get("store_body") or body))
+        return outcome
 
-    def store(ticker, source, title, body="", **kw):
-        stored.append((ticker, title, body))
-        return "id"
-
-    monkeypatch.setattr(news_alerts.notify, "push", push)
-    monkeypatch.setattr(news_alerts.notify, "store", store)
+    monkeypatch.setattr(news_alerts.notify, "alert", alert)
     return type("Env", (), {"pushes": pushes, "stored": stored,
                             "outcomes": outcomes})
 
@@ -142,3 +141,10 @@ def test_headlines_are_sanitised_before_push_and_store(env):
     assert "\u202e" not in body and "\x00" not in body
     assert "evil.test" not in body
     assert "evil.test" not in env.stored[-1][2]
+
+
+def test_alert_goes_out_as_the_news_source_with_the_first_item_url(env):
+    assert run_ticker([item("Nvidia earnings beat")]) == 1
+    _, _, kw = env.pushes[0]
+    assert kw["source"] == "news" and kw["ticker"] == "NVDA"
+    assert kw["url"] == "https://x.test/a"

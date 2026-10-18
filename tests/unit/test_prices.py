@@ -56,6 +56,7 @@ class FakeYF:
         self.calls = []
         self.bars = {}      # (symbol, interval) -> list | None
         self.daily = {}     # symbol -> [(iso_date, close)] | None
+        self.daily_by_period = {}   # (symbol, period) -> rows | None, wins over `daily`
         self.info = {}      # symbol -> dict | None
 
     async def __call__(self, key, fn, *args):
@@ -64,6 +65,8 @@ class FakeYF:
             sym, interval = args[0], args[1]
             return self.bars.get((sym, interval))
         if fn is prices._yf_daily_blocking:
+            if (args[0], args[1]) in self.daily_by_period:
+                return self.daily_by_period[(args[0], args[1])]
             return self.daily.get(args[0])
         if fn is prices._yf_info_blocking:
             return self.info.get(args[0])
@@ -322,6 +325,215 @@ def test_listing_quote_without_data_sets_a_negative_entry_and_skips_next_time(fa
     assert len(fake_yf.calls) == n
 
 
+def at(monkeypatch, t):
+    """Freeze prices' clock at epoch ``t``."""
+    monkeypatch.setattr(prices, "time", types.SimpleNamespace(time=lambda: t))
+
+
+def daily_calls(fake_yf, period=None):
+    return [a for n, a in fake_yf.calls
+            if n == "_yf_daily_blocking" and (period is None or a[1] == period)]
+
+
+# ---------------------------------------------------------------- prevClose (F0)
+
+def test_prev_close_is_yesterdays_close_while_the_1d_fetch_is_still_empty(fake_yf, monkeypatch):
+    """(a) 09:05 on a session day: Yahoo EU is ~15 min late, the 1m fetch is empty and the
+    15m fallback ends yesterday. The old code took the close BEFORE the newest bar's day."""
+    t = ts(2025, 7, 14, 7, 5)                                  # Mon 09:05 CEST
+    at(monkeypatch, t)
+    fake_yf.bars[("ASML.AS", "1m")] = []
+    fri_close = ts(2025, 7, 11, 15, 30)
+    fake_yf.bars[("ASML.AS", "15m")] = [pt(fri_close - i * 900, 1790.0 + i) for i in range(5, -1, -1)]
+    fake_yf.daily["ASML.AS"] = [("2025-07-10", 1780.0), ("2025-07-11", 1790.0)]
+    q = run(prices.listing_quote("ASML"))
+    assert q["asOf"] == fri_close and q["price"] == 1790.0     # the fallback still supplies the price
+    assert q["prevClose"] == 1790.0                            # ... but not the prevClose date
+    assert ("ASML", "2025-07-11") in prices._prev_close_cache
+
+
+def test_prev_close_survives_cache_expiry_for_the_whole_session_day(fake_yf, monkeypatch):
+    """(b) the value is recomputed from the clock after the 1 h TTL and never taken from
+    another expected date's cache entry."""
+    fake_yf.daily["ASML.AS"] = [("2025-07-10", 1780.0), ("2025-07-11", 1790.0),
+                                ("2025-07-14", 1805.0)]
+    for hour_utc, minute in ((7, 5), (9, 30), (11, 0), (15, 20)):   # 09:05 ... 17:20 CEST
+        at(monkeypatch, ts(2025, 7, 14, hour_utc, minute))
+        before = len(daily_calls(fake_yf))
+        assert run(prices._prev_close("ASML", "ASML.AS")) == 1790.0
+        assert len(daily_calls(fake_yf)) == before + 1              # TTL expired: refetched
+    at(monkeypatch, ts(2025, 7, 14, 15, 40))
+    before = len(daily_calls(fake_yf))
+    assert run(prices._prev_close("ASML", "ASML.AS")) == 1790.0
+    assert len(daily_calls(fake_yf)) == before                      # inside the TTL: cached
+    assert set(prices._prev_close_cache) == {("ASML", "2025-07-11")}
+
+
+def test_prev_close_changes_with_the_expected_date_not_with_the_cache(fake_yf, monkeypatch):
+    """(c) the Monday after a Friday. Before the Monday open the quote still belongs to Friday,
+    so the previous session is Thursday; at the open it flips to Friday - no stale reuse."""
+    fake_yf.daily["ASML.AS"] = [("2025-07-09", 1770.0), ("2025-07-10", 1780.0),
+                                ("2025-07-11", 1790.0)]
+    at(monkeypatch, ts(2025, 7, 14, 6, 0))                     # Mon 08:00 CEST, before the open
+    assert run(prices._prev_close("ASML", "ASML.AS")) == 1780.0
+    at(monkeypatch, ts(2025, 7, 14, 7, 1))                     # Mon 09:01 CEST, 1 minute later
+    assert run(prices._prev_close("ASML", "ASML.AS")) == 1790.0
+    at(monkeypatch, ts(2025, 7, 13, 12, 0))                    # Sunday: last session is Friday
+    assert run(prices._prev_close("ASML", "ASML.AS")) == 1780.0
+
+
+def test_prev_close_the_day_after_an_exchange_holiday(fake_yf, monkeypatch):
+    """(d) 2026-05-04 on XETR: 1 May is a holiday, so the previous session is 2026-04-30."""
+    fake_yf.daily["SXR8.DE"] = [("2026-04-29", 100.0), ("2026-04-30", 101.0),
+                                ("2026-05-04", 102.0)]
+    at(monkeypatch, ts(2026, 5, 4, 8, 0))                      # Mon 10:00 CEST
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 101.0
+    at(monkeypatch, ts(2026, 5, 1, 10, 0))                     # on the holiday itself
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 100.0
+
+
+def test_prev_close_missing_exact_row_is_none_and_is_retried_with_1mo(fake_yf, monkeypatch):
+    """(e) a neighbouring row is never substituted; None is cached for 300 s only."""
+    at(monkeypatch, ts(2025, 7, 14, 8, 0))
+    fake_yf.daily["ASML.AS"] = [("2025-07-10", 1780.0), ("2025-07-14", 1805.0)]   # no 07-11
+    assert run(prices._prev_close("ASML", "ASML.AS")) is None
+    assert [a[1] for a in daily_calls(fake_yf)] == ["5d", "1mo"]
+    at(monkeypatch, ts(2025, 7, 14, 8, 4))                     # +240 s: the None is still cached
+    assert run(prices._prev_close("ASML", "ASML.AS")) is None
+    assert len(daily_calls(fake_yf)) == 2
+    fake_yf.daily["ASML.AS"] = [("2025-07-11", 1790.0)]
+    at(monkeypatch, ts(2025, 7, 14, 8, 6))                     # +360 s: the None expired
+    assert run(prices._prev_close("ASML", "ASML.AS")) == 1790.0
+
+
+def test_prev_close_1mo_retry_finds_a_row_the_5d_window_lacks(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 5, 4, 8, 0))
+    fake_yf.daily_by_period[("SXR8.DE", "5d")] = [("2026-05-04", 102.0)]
+    fake_yf.daily_by_period[("SXR8.DE", "1mo")] = [("2026-04-30", 101.0), ("2026-05-04", 102.0)]
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 101.0
+    assert [a[1] for a in daily_calls(fake_yf)] == ["5d", "1mo"]
+
+
+def test_prev_close_failure_keeps_only_the_same_dates_value(fake_yf, monkeypatch):
+    fake_yf.daily["ASML.AS"] = [("2025-07-11", 1790.0)]
+    at(monkeypatch, ts(2025, 7, 14, 8, 0))
+    assert run(prices._prev_close("ASML", "ASML.AS")) == 1790.0
+    fake_yf.daily["ASML.AS"] = None                            # yahoo failing / backing off
+    at(monkeypatch, ts(2025, 7, 14, 12, 0))                    # TTL expired, same expected date
+    assert run(prices._prev_close("ASML", "ASML.AS")) == 1790.0
+    at(monkeypatch, ts(2025, 7, 15, 12, 0))                    # next day: expected date changed
+    assert run(prices._prev_close("ASML", "ASML.AS")) is None
+
+
+# prevClose intraday fallback: the daily series lacks the expected date's row.
+# 2026-10-15 10:00 CEST on XETR -> expected date 2026-10-14 (session ends 17:30 CEST = 15:30 UTC).
+
+def _sxr8_intraday(fake_yf, extra=()):
+    bars = [pt(ts(2026, 10, 14, 15, 0), 750.0), pt(ts(2026, 10, 14, 15, 15), 751.24)]
+    fake_yf.bars[("SXR8.DE", "15m")] = bars + list(extra)
+    fake_yf.daily["SXR8.DE"] = [("2026-10-13", 740.0), ("2026-10-15", 760.0)]   # no 10-14
+
+
+def test_prev_close_falls_back_to_the_last_intraday_bar_of_the_expected_date(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    _sxr8_intraday(fake_yf)
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.24
+    assert prices._prev_close_src["SXR8"] == "intraday"
+    assert prices._prev_close_cache[("SXR8", "2026-10-14")][0] == 751.24
+    q = {"price": 755.0, "asOf": NOW, "fetchedAt": NOW, "currency": "EUR", "prevClose": 751.24}
+    assert prices._quote_view("SXR8", q, True)["prevCloseSource"] == "intraday"
+
+
+def test_prev_close_never_uses_a_bar_dated_after_the_expected_date(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    _sxr8_intraday(fake_yf, extra=[pt(ts(2026, 10, 14, 15, 45), 790.0),   # after the 17:30 close
+                                   pt(ts(2026, 10, 15, 7, 0), 800.0)])   # next day
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.24
+    fake_yf.bars[("SXR8.DE", "15m")] = [pt(ts(2026, 10, 15, 7, 0), 800.0),
+                                       pt(ts(2026, 10, 13, 15, 15), 741.0)]
+    prices._prev_close_cache.clear()
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) is None
+    assert "SXR8" not in prices._prev_close_src
+
+
+def test_prev_close_prefers_the_stored_history_over_a_fetch(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    fake_yf.daily["SXR8.DE"] = [("2026-10-13", 740.0)]
+    prices.history_store["SXR8"] = [pt(ts(2026, 10, 14, 15, 29), 751.0),
+                                    pt(ts(2026, 10, 14, 15, 30), 751.24),
+                                    pt(ts(2026, 10, 15, 7, 1), 770.0)]
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.24
+    assert prices._prev_close_src["SXR8"] == "intraday"
+    assert not [c for c in fake_yf.calls if c[0] == "_yf_bars_blocking"]
+
+
+def test_prev_close_daily_row_wins_and_is_reported_as_daily(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    _sxr8_intraday(fake_yf)
+    fake_yf.daily["SXR8.DE"] = [("2026-10-14", 751.0)]
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) == 751.0
+    assert prices._prev_close_src["SXR8"] == "daily"
+    q = {"price": 755.0, "asOf": NOW, "fetchedAt": NOW, "currency": "EUR", "prevClose": 751.0}
+    assert prices._quote_view("SXR8", q, True)["prevCloseSource"] == "daily"
+
+
+def test_prev_close_none_when_daily_and_intraday_are_both_missing(fake_yf, monkeypatch):
+    at(monkeypatch, ts(2026, 10, 15, 8, 0))
+    fake_yf.daily["SXR8.DE"] = [("2026-10-13", 740.0)]
+    fake_yf.bars[("SXR8.DE", "15m")] = []
+    assert run(prices._prev_close("SXR8", "SXR8.DE")) is None
+    assert "SXR8" not in prices._prev_close_src
+
+
+# ---------------------------------------------------------------- daily_closes (C2)
+
+def test_daily_closes_returns_the_listing_series_and_caches_per_ticker_and_period(fake_yf, monkeypatch):
+    at(monkeypatch, NOW)
+    rows = [("2025-07-10", 1780.0), ("2025-07-11", 1790.0)]
+    fake_yf.daily["ASML.AS"] = rows
+    fake_yf.daily["^GSPC"] = [("2025-07-11", 6200.0)]
+    assert run(prices.daily_closes("ASML", "1y")) == rows
+    assert run(prices.daily_closes("asml", "1y")) == rows
+    assert len(daily_calls(fake_yf)) == 1                      # 6 h cache
+    assert run(prices.daily_closes("ASML")) == rows            # default 2y is its own key
+    assert [a[1] for a in daily_calls(fake_yf)] == ["1y", "2y"]
+    assert run(prices.daily_closes("GSPC", "6mo")) == [("2025-07-11", 6200.0)]   # index: native symbol
+    at(monkeypatch, NOW + 6 * 3600 + 1)
+    fake_yf.daily["ASML.AS"] = [("2025-07-11", 1791.0)]
+    assert run(prices.daily_closes("ASML", "1y")) == [("2025-07-11", 1791.0)]    # cache expired
+    assert "ASML" not in prices.history_store                  # never touches the listing store
+
+
+def test_daily_closes_failure_returns_last_cached_value_or_empty(fake_yf, monkeypatch):
+    at(monkeypatch, NOW)
+    assert run(prices.daily_closes("ASML", "1y")) == []        # yahoo down, nothing cached
+    fake_yf.daily["ASML.AS"] = [("2025-07-11", 1790.0)]
+    assert run(prices.daily_closes("ASML", "1y")) == [("2025-07-11", 1790.0)]
+    fake_yf.daily["ASML.AS"] = None
+    at(monkeypatch, NOW + 7 * 3600)
+    assert run(prices.daily_closes("ASML", "1y")) == [("2025-07-11", 1790.0)]
+
+
+def test_daily_closes_unknown_unsupported_or_bad_period_asks_yahoo_nothing(fake_yf):
+    for tk, period in (("NOPE", "1y"), ("NOLIST", "1y"), ("ASML", "10d"), ("", "1y")):
+        assert run(prices.daily_closes(tk, period)) == []
+    assert fake_yf.calls == []
+
+
+def test_yfinance_no_data_log_line_is_filtered_out():
+    import logging
+    yf_log = logging.getLogger("yfinance")
+    assert sum(isinstance(f, prices._YfNoDataFilter) for f in yf_log.filters) == 1
+    prices._install_yf_log_filter()                            # idempotent
+    assert sum(isinstance(f, prices._YfNoDataFilter) for f in yf_log.filters) == 1
+
+    def rec(msg):
+        return logging.LogRecord("yfinance", logging.ERROR, __file__, 1, msg, None, None)
+    flt = prices._YfNoDataFilter()
+    assert not flt.filter(rec("$ASML.AS: possibly delisted; no price data found  (period=1d)"))
+    assert flt.filter(rec("something else failed"))
+
+
 def test_price_item_carries_listing_currency_and_labelled_us_reference(monkeypatch):
     live_ws.live_prices["ASML"] = {"price": 2010.0, "ts": NOW - 5, "source": "finnhub", "currency": "USD"}
 
@@ -333,6 +545,7 @@ def test_price_item_carries_listing_currency_and_labelled_us_reference(monkeypat
     item = run(prices._price_item("ASML"))
     assert item["price"] == 1850.0 and item["priceCurrency"] == "EUR"
     assert item["previousClose"] == 1800.0 and item["change24h"] == 2.78
+    assert "prevCloseSource" in item
     assert item["usLive"]["currency"] == "USD" and item["usLive"]["price"] == 2010.0
     assert item["price"] != item["usLive"]["price"]       # never merged
     assert "status" not in item
@@ -615,3 +828,18 @@ def test_ensure_history_backfills_a_thin_series_once_per_cooldown(fake_yf):
     run(prices.ensure_history("ASML"))                              # healthy now
     assert len(fake_yf.calls) == n
     assert run(prices.ensure_history("NOLIST")) is False
+
+
+def test_empty_1d_fetch_logs_one_info_outside_the_first_20_minutes(fake_yf, monkeypatch, caplog):
+    import logging
+    fake_yf.bars[("ASML.AS", "1m")] = []
+    fake_yf.bars[("ASML.AS", "15m")] = []
+    with caplog.at_level(logging.INFO, logger=prices.log.name):
+        at(monkeypatch, ts(2025, 7, 14, 7, 10))                # 09:10 CEST: lag is expected
+        prices._note_empty_1d("ASML")
+        assert not [r for r in caplog.records if "1d fetch empty" in r.getMessage()]
+        at(monkeypatch, ts(2025, 7, 14, 7, 21))                # 09:21 CEST: worth one line
+        prices._note_empty_1d("ASML")
+        prices._note_empty_1d("ASML")                          # same session: deduped
+    lines = [r for r in caplog.records if "1d fetch empty" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO

@@ -15,10 +15,16 @@ is never presented as a market rate.
 ``daily_rates(days)`` gives one EUR-per-USD rate per ECB reference day so a
 series is converted bar by bar with the rate valid for that bar's day instead
 of re-converting a whole window at today's rate.
+
+``eur_rate_on(ccy, iso_date)`` gives units of ``ccy`` per 1 EUR on one past
+day (ECB reference rate of that day, else the latest earlier reference day),
+cached in memory per (ccy, date); None on any failure, never raises. It backs
+the Czech CZK tax figures, which need the rate of each sale date.
 """
 import asyncio
 import datetime
 import logging
+import math
 import os
 import time
 
@@ -297,3 +303,51 @@ def rate_on(rates: dict[str, float], iso_date: str, max_lookback: int = 7) -> fl
         if rate is not None:
             return rate
     return None
+
+
+# ------------------------------------------------------------------ per-date EUR rate
+
+EUR_ON_TODAY_TTL = 3600       # today / future dates may still be superseded
+_eur_on: dict[tuple[str, str], tuple[float, float]] = {}    # key -> (rate, expires)
+
+
+async def eur_rate_on(ccy: str, iso_date: str) -> float | None:
+    """Units of ``ccy`` per 1 EUR on ``iso_date`` (Frankfurter v1
+    ``/v1/{date}?base=EUR&symbols=CCY`` answers the latest reference day on or
+    before the date, so weekends and holidays carry the previous rate).
+
+    Cached per (ccy, date): permanently for past dates, one hour for today or
+    later. Failures are not cached. Never raises; None when no valid rate.
+    """
+    try:
+        code = str(ccy or "").strip().upper()
+        day = datetime.date.fromisoformat(str(iso_date))
+        if len(code) != 3 or not code.isalpha():
+            return None
+        if code == "EUR":
+            return 1.0
+        key = (code, day.isoformat())
+        now = time.time()
+        hit = _eur_on.get(key)
+        if hit is not None and hit[1] > now:
+            return hit[0]
+        r = await _client_for_loop().get(
+            f"{FRANKFURTER_URL}/v1/{key[1]}",
+            params={"base": "EUR", "symbols": code})
+        if r.status_code != 200:
+            log.warning("frankfurter %s %s non-2xx: %d", code, key[1], r.status_code)
+            return None
+        payload = r.json()
+        rates = payload.get("rates") if isinstance(payload, dict) else None
+        rate = (rates or {}).get(code) if isinstance(rates, dict) else None
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+            return None
+        rate = float(rate)
+        if not math.isfinite(rate) or rate <= 0:
+            return None
+        past = day < datetime.datetime.now(datetime.timezone.utc).date()
+        _eur_on[key] = (rate, float("inf") if past else now + EUR_ON_TODAY_TTL)
+        return rate
+    except Exception as e:
+        log.warning("eur_rate_on(%s, %s) failed: %s", ccy, iso_date, e)
+        return None

@@ -8,7 +8,8 @@ description: How to run and write tests for the portfolio-dashboard (container-s
 ## Run
 ```bash
 cd ~/Work/Personal/portfolio-dashboard
-# Unit tests — in a throwaway python:3.11 container (matches the image; no pytest on the host)
+# Unit tests — in a throwaway python:3.11 container (matches the image; no pytest on the host).
+# They import `exchange_calendars` (pinned in requirements.txt), so the pip install below is required.
 podman run --rm -v "$PWD:/src:z" -w /src -e HISTORY_DIR=/tmp/t -e TZ=Europe/Prague \
   docker.io/library/python:3.11-slim sh -c 'pip install -q -r requirements.txt pytest && python -m pytest tests/unit -q'
 # one file / one test
@@ -16,7 +17,7 @@ podman run --rm -v "$PWD:/src:z" -w /src -e HISTORY_DIR=/tmp/t -e TZ=Europe/Prag
 # Integration — needs the pod up; creds come from env or env.secrets; ~2 min
 python -m pytest tests/integration -q            # in a Python env that has `playwright` installed
 ```
-Baseline at the time of writing: 376 unit tests, 29 integration tests, all passing.
+Baseline at the time of writing: 884 unit tests (needs `exchange_calendars`, installed from `requirements.txt`), 29 integration tests, all passing.
 
 ## Unit-test rules
 - Deterministic, isolated, no network, no sleeps, no GPU lane calls. Use `tmp_path`, set `HISTORY_DIR`/`CONFIG_PATH`

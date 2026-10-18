@@ -25,8 +25,10 @@ hard-coded ticker set.
 """
 import copy
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
+
+from app.api import calendars
 
 log = logging.getLogger(__name__)
 
@@ -35,8 +37,8 @@ KINDS = ("equity", "etf", "index")
 ROLES = ("holding", "benchmark")
 CURRENCIES = ("EUR", "USD")
 
-# MIC -> trading session. Weekends are closed; exchange holidays are not
-# modelled (the data layer reports such a day as stale instead).
+# MIC -> venue record. tz/region live here; the session calendar (holidays,
+# early closes) is ``calendars``. The open/close tuples are the regular hours.
 VENUES: dict[str, dict] = {
     "XAMS": {"tz": "Europe/Amsterdam", "open": (9, 0), "close": (17, 30), "region": "EU"},
     "XPAR": {"tz": "Europe/Paris", "open": (9, 0), "close": (17, 30), "region": "EU"},
@@ -330,17 +332,12 @@ def is_eu(ident) -> bool:
 
 
 # ------------------------------------------------------------------ sessions
-
-def _session_bounds(v: dict, day) -> tuple[datetime, datetime]:
-    tz = ZoneInfo(v["tz"])
-    oh, om = v["open"]
-    ch, cm = v["close"]
-    return (datetime(day.year, day.month, day.day, oh, om, tzinfo=tz),
-            datetime(day.year, day.month, day.day, ch, cm, tzinfo=tz))
-
+# Session days, holidays and early closes come from ``calendars`` (exchange
+# calendars per MIC); the VENUES table only supplies tz/region.
 
 def market_open(ident, now: float | None = None) -> bool:
-    """True while the entry's listing venue is inside its regular session."""
+    """True while the entry's listing venue is inside its session (holidays
+    and early closes honoured)."""
     v = venue(ident)
     if not v:
         return False
@@ -351,29 +348,24 @@ def venue_open(v: dict, now: float | None = None) -> bool:
     import time as _t
     ts = _t.time() if now is None else now
     local = datetime.fromtimestamp(ts, ZoneInfo(v["tz"]))
-    if local.weekday() >= 5:
+    bounds = calendars.session_bounds(v["mic"], local.date())
+    if bounds is None:
         return False
-    start, end = _session_bounds(v, local.date())
-    return start <= local <= end
+    return bounds[0] <= local <= bounds[1]
 
 
 def session_window(ident, now: float | None = None) -> tuple[int, int] | None:
     """(open_ts, close_ts) of the latest session that has started.
 
     Mid-session or after the close that is today's session; before the open,
-    or on a weekend, it is the previous weekday's. None without a listing.
+    on a weekend or on an exchange holiday it is the previous session's (its
+    early close included). None without a listing.
     """
     import time as _t
     v = venue(ident)
     if not v:
         return None
     ts = _t.time() if now is None else now
-    local = datetime.fromtimestamp(ts, ZoneInfo(v["tz"]))
-    day = local.date()
-    start, _ = _session_bounds(v, day)
-    if day.weekday() >= 5 or local < start:
-        day -= timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    start, end = _session_bounds(v, day)
+    day = calendars.quote_session(v["mic"], ts)
+    start, end = calendars.session_bounds(v["mic"], day)
     return int(start.timestamp()), int(end.timestamp())

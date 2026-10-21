@@ -13,6 +13,7 @@ data/
 results/
 tests/
 ops/
+!ops/paper_universe_seed.json
 skills/
 *.md
 *.bundle

@@ -17,7 +17,9 @@ except ``taxResidency`` where ``null`` is a value):
 * ``performanceBenchmark`` (watchlist id), ``exposureCurrency`` (id -> ISO
   currency code), ``lookThrough`` (fund id -> ``{asOf, source, weights}``),
   ``investmentPolicy`` (targets, single-stock cap, rebalancing band, monthly
-  contribution, trend filter), ``taxResidency`` (``"CZ"`` or null).
+  contribution, trend filter), ``taxResidency`` (``"CZ"``, ``"NL"`` or null),
+  ``taxNL`` (NL box 3 inputs: ``fiscalPartner``, ``otherAssets`` per year,
+  ``dividendTaxWithheldEur`` per year; unknown keys rejected).
 
 Ids in these keys are checked against the watchlist of the SAME update; a
 later watchlist edit that removes a referenced id does not rewrite them, so
@@ -34,7 +36,10 @@ _EPS = 1e-9
 _SIDES = ("buy", "sell")
 _TARGET_SUM_TOL = 0.5
 _WEIGHT_SUM_MAX = 100.5
-_RESIDENCIES = ("CZ",)
+_RESIDENCIES = ("CZ", "NL")
+_TAX_NL_KEYS = ("fiscalPartner", "otherAssets", "dividendTaxWithheldEur")
+_TAX_NL_ASSET_KEYS = ("bankEur", "otherEur", "debtsEur")
+_TAX_NL_YEARS = (2020, 2100)
 _PAPER_MODES = ("off", "shadow", "demo")
 _PAPER_LIVE_MODES = ("live-approve", "live-auto")
 _PAPER_WEIGHT_KINDS = ("equity", "etf", "index")
@@ -378,7 +383,62 @@ def _tax_residency(value):
         return None
     if isinstance(value, str) and value.strip().upper() in _RESIDENCIES:
         return value.strip().upper()
-    raise ConfigInvalid("taxResidency must be 'CZ' or null")
+    raise ConfigInvalid("taxResidency must be 'CZ', 'NL' or null")
+
+
+def _tax_nl_year(key, ctx: str) -> str:
+    text = str(key).strip() if isinstance(key, (str, int)) and not isinstance(key, bool) else ""
+    if not (text.isascii() and text.isdigit()
+            and _TAX_NL_YEARS[0] <= int(text) <= _TAX_NL_YEARS[1]):
+        raise ConfigInvalid(f"{ctx}: year must be {_TAX_NL_YEARS[0]}..{_TAX_NL_YEARS[1]}, "
+                            f"got {key!r}")
+    return str(int(text))
+
+
+def _tax_nl_amount(value, ctx: str) -> float:
+    v = _number(value, ctx)
+    if v < 0:
+        raise ConfigInvalid(f"{ctx} must be >= 0")
+    return v
+
+
+def _tax_nl(raw, roles: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise ConfigInvalid("taxNL must be an object")
+    unknown = sorted(str(k) for k in raw if k not in _TAX_NL_KEYS)
+    if unknown:
+        raise ConfigInvalid("taxNL: unknown key(s) " + ", ".join(unknown))
+    out = {}
+    if raw.get("fiscalPartner") is not None:
+        if not isinstance(raw["fiscalPartner"], bool):
+            raise ConfigInvalid("taxNL.fiscalPartner must be true or false")
+        out["fiscalPartner"] = raw["fiscalPartner"]
+    if raw.get("otherAssets") is not None:
+        assets_raw = raw["otherAssets"]
+        if not isinstance(assets_raw, dict):
+            raise ConfigInvalid("taxNL.otherAssets must be an object keyed by year")
+        assets = {}
+        for key, row in assets_raw.items():
+            year = _tax_nl_year(key, "taxNL.otherAssets")
+            if not isinstance(row, dict):
+                raise ConfigInvalid(f"taxNL.otherAssets.{year} must be an object")
+            bad = sorted(str(k) for k in row if k not in _TAX_NL_ASSET_KEYS)
+            if bad:
+                raise ConfigInvalid(f"taxNL.otherAssets.{year}: unknown key(s) "
+                                    + ", ".join(bad))
+            assets[year] = {k: _tax_nl_amount(row[k], f"taxNL.otherAssets.{year}.{k}")
+                            for k in _TAX_NL_ASSET_KEYS if row.get(k) is not None}
+        out["otherAssets"] = assets
+    if raw.get("dividendTaxWithheldEur") is not None:
+        div_raw = raw["dividendTaxWithheldEur"]
+        if not isinstance(div_raw, dict):
+            raise ConfigInvalid("taxNL.dividendTaxWithheldEur must be an object "
+                                "keyed by year")
+        out["dividendTaxWithheldEur"] = {
+            _tax_nl_year(k, "taxNL.dividendTaxWithheldEur"):
+            _tax_nl_amount(v, f"taxNL.dividendTaxWithheldEur.{k}")
+            for k, v in div_raw.items()}
+    return out
 
 
 def _paper_max_weight_pct(raw) -> dict:
@@ -655,6 +715,7 @@ def apply_update(cfg: dict, body: dict) -> list[str]:
     _set_optional(cfg, body, "lookThrough", _look_through, roles)
     _set_optional(cfg, body, "investmentPolicy", _investment_policy, roles)
     _set_optional(cfg, body, "paperTrading", _paper_trading, roles)
+    _set_optional(cfg, body, "taxNL", _tax_nl, roles)
     if "taxResidency" in body:
         cfg["taxResidency"] = _tax_residency(body["taxResidency"])
 

@@ -332,7 +332,7 @@ def test_absent_new_keys_are_left_untouched():
     ({"investmentPolicy": {"monthlyContributionEur": -5}},
      "monthlyContributionEur must be >= 0"),
     ({"investmentPolicy": {"trendFilter": "yes"}}, "trendFilter must be true"),
-    ({"taxResidency": "DE"}, "'CZ' or null"),
+    ({"taxResidency": "DE"}, "'CZ', 'NL' or null"),
 ])
 def test_bad_new_keys_are_rejected(body, text):
     bad(body, text)

@@ -6,7 +6,7 @@
    collectRules, ...) is exported separately from the DOM code so it can be unit-tested in Node.
    Everything stateful lives in the openSettings closure: there is no module-level DOM state.
    Server contracts: app/api/registry.py normalize_entry, app/api/config_edit.py (lots,
-   investmentPolicy, lookThrough, exposureCurrency, performanceBenchmark, taxResidency),
+   investmentPolicy, lookThrough, exposureCurrency, performanceBenchmark, taxResidency, taxNL),
    app/api/rules.py (alert rules v3). */
 import { el, clear, fmtEur, fmtDateTime24 } from '../util.js';
 import { apiGet, apiSend, latestRequest } from '../api.js';
@@ -599,11 +599,32 @@ function canon(v) {
 }
 const same = (a, b) => JSON.stringify(canon(a)) === JSON.stringify(canon(b));
 
+export const NL_YEAR_MIN = 2020;
+export const NL_YEAR_MAX = 2100;
+
+/**
+ * config.taxNL -> editable model for the current and the next year (strings for inputs). Other stored years are not
+ * edited here; validatePolicy keeps them as they are.
+ */
+export function nlFromConfig(raw, year) {
+  const nl = isObj(raw) ? raw : {};
+  const assets = isObj(nl.otherAssets) ? nl.otherAssets : {};
+  const withheld = isObj(nl.dividendTaxWithheldEur) ? nl.dividendTaxWithheldEur : {};
+  const text = v => (v == null ? '' : String(v));
+  return {
+    partner: nl.fiscalPartner === true,
+    years: [year, year + 1].map(y => {
+      const a = isObj(assets[String(y)]) ? assets[String(y)] : {};
+      return { year: y, bank: text(a.bankEur), other: text(a.otherEur), debts: text(a.debtsEur), divTax: text(withheld[String(y)]) };
+    }),
+  };
+}
+
 /**
  * GET /api/config -> editable policy model (strings for inputs). `orig` keeps the stored values so unknown keys survive
  * and validatePolicy sends only what changed.
  */
-export function polFromConfig(cfg) {
+export function polFromConfig(cfg, year = new Date().getFullYear()) {
   const c = isObj(cfg) ? cfg : {};
   const ip = isObj(c.investmentPolicy) ? c.investmentPolicy : null;
   const band = ip && isObj(ip.band) ? ip.band : {};
@@ -628,19 +649,22 @@ export function polFromConfig(cfg) {
       policy: ip, bench: c.performanceBenchmark == null ? null : String(c.performanceBenchmark),
       exp: isObj(c.exposureCurrency) ? c.exposureCurrency : null, look: isObj(c.lookThrough) ? c.lookThrough : null,
       tax: c.taxResidency == null || c.taxResidency === '' ? null : String(c.taxResidency),
+      nl: isObj(c.taxNL) ? c.taxNL : null,
     },
     targets, maxSingle: ip ? text(ip.maxSingleStockPct) : '',
     absPct: band.absPct == null ? '5' : String(band.absPct), relPct: band.relPct == null ? '25' : String(band.relPct),
     contrib: ip ? text(ip.monthlyContributionEur) : '', trend: !!(ip && ip.trendFilter),
     bench: text(c.performanceBenchmark), exp, look,
     tax: c.taxResidency == null || c.taxResidency === '' ? 'none' : String(c.taxResidency),
+    nl: nlFromConfig(c.taxNL, year),
   };
 }
 
 /**
  * Validate the policy model like config_edit.py and build only the CHANGED PUT /api/config keys.
  * ctx: {holdings:[{id, currency}], watchIds:[id], today}. -> {errors:[{key, message}], body}
- * body keys: investmentPolicy (null removes it), performanceBenchmark (null removes), exposureCurrency, lookThrough (null removes), taxResidency (null = none).
+ * body keys: investmentPolicy (null removes it), performanceBenchmark (null removes), exposureCurrency, lookThrough (null removes), taxResidency (null = none),
+ * taxNL (only while the residency is NL; null resets it).
  * Targets must sum to 100 +- 0.5; error keys are pol:<field> for the UI.
  */
 export function validatePolicy(pol, ctx) {
@@ -751,6 +775,40 @@ export function validatePolicy(pol, ctx) {
   /* ---- taxResidency ---- */
   const tax = pol.tax === 'none' || !pol.tax ? null : pol.tax;
   if (tax !== (orig.tax == null ? null : orig.tax)) body.taxResidency = tax;
+
+  /* ---- taxNL: only while the residency is NL (the inputs are hidden otherwise and the stored values stay) ---- */
+  if (tax === 'NL' && pol.nl) {
+    const origNl = isObj(orig.nl) ? orig.nl : {};
+    const nlStart = errors.length;
+    const assets = { ...(isObj(origNl.otherAssets) ? origNl.otherAssets : {}) };
+    const withheld = { ...(isObj(origNl.dividendTaxWithheldEur) ? origNl.dividendTaxWithheldEur : {}) };
+    /** blank -> null; invalid -> undefined (error recorded); else the number */
+    const amount = (raw, key, label) => {
+      if (trim(raw) === '') return null;
+      const v = parseNumber(raw);
+      if (v === null || v < 0) { err(key, `${label} must be a number of 0 or more.`); return undefined; }
+      return v;
+    };
+    for (const y of pol.nl.years) {
+      const k = f => `pol:nl:${y.year}:${f}`;
+      const key = String(y.year);
+      if (y.year < NL_YEAR_MIN || y.year > NL_YEAR_MAX) { err(k('bank'), `Year must be ${NL_YEAR_MIN} to ${NL_YEAR_MAX}.`); continue; }
+      const bank = amount(y.bank, k('bank'), 'Bank balances');
+      const other = amount(y.other, k('other'), 'Other assets');
+      const debts = amount(y.debts, k('debts'), 'Debts');
+      const div = amount(y.divTax, k('divTax'), 'Dividend tax withheld');
+      // A year with any asset figure sends all three (a blank one counts as 0); an all-blank year is removed.
+      if (bank === null && other === null && debts === null) delete assets[key];
+      else assets[key] = { ...(isObj(assets[key]) ? assets[key] : {}), bankEur: bank || 0, otherEur: other || 0, debtsEur: debts || 0 };
+      if (div === null) delete withheld[key]; else withheld[key] = div || 0;
+    }
+    const next = { ...origNl };
+    if (pol.nl.partner) next.fiscalPartner = true;
+    else if (Object.hasOwn(origNl, 'fiscalPartner')) next.fiscalPartner = false;
+    if (Object.keys(assets).length) next.otherAssets = assets; else delete next.otherAssets;
+    if (Object.keys(withheld).length) next.dividendTaxWithheldEur = withheld; else delete next.dividendTaxWithheldEur;
+    if (errors.length === nlStart && !same(next, origNl)) body.taxNL = Object.keys(next).length ? next : null;
+  }
 
   return { errors, body };
 }
@@ -1173,8 +1231,8 @@ export function openSettings({ tab } = {}) {
         el('h4', { class: 'st-lots-title', text: 'Dated lots' }),
         el('span', { class: 'muted st-lots-count', text: has ? `${p.lots.length} lot${p.lots.length === 1 ? '' : 's'}` : 'none \u2013 plain shares and cost above' })),
       el('p', { class: 'muted st-intro', text: has
-        ? 'Shares and cost basis are derived from these lots (FIFO) and saved as lots. Dates unlock time-weighted return and the 3-year tax test.'
-        : 'Optional. Record each buy and sell with its date to get time-weighted return, XIRR and the 3-year tax test. Adding a lot switches this position to lots.' }),
+        ? `Shares and cost basis are derived from these lots (FIFO) and saved as lots. Dates unlock time-weighted return${S.pol && S.pol.tax === 'NL' ? '.' : ' and the 3-year tax test.'}`
+        : `Optional. Record each buy and sell with its date to get time-weighted return, XIRR${S.pol && S.pol.tax === 'NL' ? '.' : ' and the 3-year tax test.'} Adding a lot switches this position to lots.` }),
       listErr ? el('div', { class: 'field-error', role: 'alert', text: listErr }) : null,
       rows,
       el('div', { class: 'st-lots-actions' },
@@ -1417,15 +1475,46 @@ export function openSettings({ tab } = {}) {
         btn('Add fund', () => { P.look.push(newLookFund()); rerenderPolicy('#st-pol-lookthrough .st-fund:last-child select'); }, 'btn-sm st-add-fund')));
   }
 
+  const TAX_NOTE_CZ = 'Czech Republic: a sale of securities held for more than 3 years (the time test) is exempt from income tax, and so are a year\u2019s sales up to CZK 100,000 in gross proceeds. With CZ set, the dashboard tracks each lot\u2019s unlock date and tags advice with the tax status of a sale. This is an aid, not tax advice.';
+  const TAX_NOTE_NL = 'Netherlands: an informational box 3 estimate (forfait against the actual-return rebuttal) is shown as a card on the Real overview. Parameters that are provisional or only proposed are labelled. This is an aid, not tax advice.';
+
+  /** Netherlands inputs: fiscal partner and, per year, the 1 January assets the dashboard cannot see. */
+  function nlFields(P) {
+    const nl = P.nl;
+    const partner = el('input', { type: 'checkbox', checked: nl.partner, id: 'st-pol-nl-partner', onchange: e => { nl.partner = e.target.checked; } });
+    const money = (y, field, label, help) => fieldWrap(label,
+      el('input', { type: 'number', min: '0', step: 'any', inputmode: 'decimal', value: y[field], id: `st-pol-nl-${y.year}-${field}`, oninput: e => { y[field] = e.target.value; } }),
+      `pol:nl:${y.year}:${field}`, { help });
+    const yearSet = (y, i) => el('fieldset', { class: 'st-nl-year', id: `st-pol-nl-${y.year}`, dataset: { year: String(y.year) } },
+      el('legend', { class: 'st-nl-legend', text: `${y.year} (${i === 0 ? 'current' : 'next'} year, value on 1 January)` }),
+      el('div', { class: 'st-grid' },
+        money(y, 'bank', 'Bank balances, EUR', 'Savings and cash outside this dashboard.'),
+        money(y, 'other', 'Other assets, EUR', 'Anything else you own, excluding the holdings tracked here.'),
+        money(y, 'debts', 'Debts, EUR'),
+        money(y, 'divTax', 'Dutch dividend tax withheld, EUR', 'Optional. Credited against the estimate.')));
+    return el('div', { class: 'st-nl', id: 'st-pol-nl', hidden: P.tax !== 'NL' },
+      el('label', { class: 'st-check' }, partner, el('span', { text: 'Fiscal partner (joint box 3 base, doubled tax-free amount)' })),
+      el('p', { class: 'muted st-intro', text: 'The dashboard only knows the holdings it tracks. Enter your other assets per year so the estimate covers your whole box 3 base; without them it is labelled investments only. With a fiscal partner enter the joint amounts. A blank field counts as 0 once another asset field of that year is filled.' }),
+      nl.years.map(yearSet));
+  }
+
   function taxCard(P) {
-    const opts = [['none', 'None / not set'], ['CZ', 'Czech Republic (CZ)']];
+    const opts = [['none', 'None / not set'], ['CZ', 'Czech Republic (CZ)'], ['NL', 'Netherlands (NL)']];
     if (!opts.some(o => o[0] === P.tax)) opts.push([P.tax, P.tax]);
-    const sel = selectInput(opts, P.tax, v => { P.tax = v; });
+    const note = el('p', { class: 'muted st-intro', id: 'st-pol-tax-note' });
+    const nlHost = nlFields(P);
+    const paintTax = () => {
+      nlHost.hidden = P.tax !== 'NL';
+      note.textContent = P.tax === 'NL' ? TAX_NOTE_NL : TAX_NOTE_CZ;
+    };
+    const sel = selectInput(opts, P.tax, v => { P.tax = v; paintTax(); });
     sel.id = 'st-pol-tax';
+    paintTax();
     return el('section', { class: 'st-sec card', id: 'st-pol-taxcard' },
       el('h3', { class: 'card-title', text: 'Tax residency' }),
       fieldWrap('Tax residency', sel, 'pol:tax'),
-      el('p', { class: 'muted st-intro', id: 'st-pol-tax-note', text: 'Czech Republic: a sale of securities held for more than 3 years (the time test) is exempt from income tax, and so are a year\u2019s sales up to CZK 100,000 in gross proceeds. With CZ set, the dashboard tracks each lot\u2019s unlock date and tags advice with the tax status of a sale. This is an aid, not tax advice.' }));
+      note,
+      nlHost);
   }
 
   function renderPolicy() {
@@ -1838,6 +1927,7 @@ export function openSettings({ tab } = {}) {
   const fpPolicy = P => (!P ? '' : JSON.stringify([
     [...P.targets].filter(([, v]) => trim(v) !== ''), P.maxSingle, P.absPct, P.relPct, P.contrib, P.trend, P.bench,
     [...P.exp], P.look.map(f => [f.fund, f.asOf, f.source, f.rows.map(r => [r.id, r.pct])]), P.tax,
+    P.nl ? [P.nl.partner, P.nl.years.map(y => [y.year, y.bank, y.other, y.debts, y.divTax])] : null,
   ]));
   function fpMain() {
     return JSON.stringify([
@@ -1868,7 +1958,7 @@ export function openSettings({ tab } = {}) {
         tab = 'positions';
       }
     }
-    if (!tab && /investmentPolicy|lookThrough|exposureCurrency|performanceBenchmark|taxResidency/.test(text)) {
+    if (!tab && /investmentPolicy|lookThrough|exposureCurrency|performanceBenchmark|taxResidency|taxNL/.test(text)) {
       S.err.set('pol:server', text);
       tab = 'policy';
     }

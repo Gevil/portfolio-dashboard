@@ -153,6 +153,49 @@ async def _dividend_dates(ident: str) -> dict:
     return value
 
 
+def _yf_dividends_blocking(sym: str) -> list[tuple[datetime.date, float]]:
+    """Executor only: [(ex-date, gross cash dividend per share in the listing
+    currency)] oldest first, from ``Ticker.dividends`` (raw, not adjusted)."""
+    import yfinance as yf
+    series = yf.Ticker(sym).dividends
+    out = []
+    for stamp, amount in (series.items() if series is not None else []):
+        day = _as_date(stamp)
+        try:
+            value = float(amount)
+        except (TypeError, ValueError):
+            continue
+        if day is not None and value == value and value > 0:
+            out.append((day, value))
+    out.sort()
+    return out
+
+
+_divhist_cache: dict[str, tuple[float, list | None]] = {}
+
+
+async def dividend_history(ident: str) -> list[tuple[datetime.date, float]]:
+    """Past ex-dividend dates and per-share amounts of one holding (yfinance,
+    cached like ``_dividend_dates``); raises when the fetch failed."""
+    hit = _divhist_cache.get(ident)
+    if hit and _fresh(*hit):
+        if hit[1] is None:
+            raise RuntimeError("recent failure")
+        return list(hit[1])
+    sym = registry.listing_symbol(ident)
+    if not sym:
+        return []
+    try:
+        loop = asyncio.get_running_loop()
+        value = await asyncio.wait_for(
+            loop.run_in_executor(None, _yf_dividends_blocking, sym), YF_TIMEOUT_S)
+    except Exception:
+        _divhist_cache[ident] = (time.time(), None)
+        raise
+    _divhist_cache[ident] = (time.time(), value)
+    return list(value)
+
+
 async def _dividend_events(start, end) -> tuple[list[dict], list[str]]:
     ids = [i for i in registry.holdings()
            if registry.listing_symbol(i) and registry.kind(i) == "equity"]

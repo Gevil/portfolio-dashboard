@@ -15,7 +15,7 @@ import * as store from '../store.js';
 import {
   openDialog, confirmDialog, toast, renderState, stamp, usePolling, setMarkdown,
 } from '../ui.js';
-import { configPositionOf, entryOf, labelOf, positionOf, priceItemOf, refreshPortfolio } from '../data.js';
+import { configPositionOf, entryOf, labelOf, positionOf, priceItemOf, refreshPortfolio, taxResidencyOf } from '../data.js';
 import { createPriceChart } from '../charts.js';
 import { daysFromToday, shortDate } from './_common.js';
 import { capsOf, subscribeBook } from '../book.js';
@@ -1286,7 +1286,7 @@ export function mountDetail(root, { onClose } = {}) {
     if (isNum(a.p20)) facts.push(el('span', { class: 'num', text: `p(beat ${bench} in 20d) ${Math.round(a.p20 * 100)}%` }));
     if (isNum(a.expExcess20Pct)) facts.push(el('span', { class: 'num', text: `expected excess ${fmtPct(a.expExcess20Pct)} (20d)` }));
     if (a.trigger) facts.push(chip(`trigger: ${a.trigger}`, 'chip-info'));
-    if (a.taxTag && capsOf().tax) facts.push(chip(String(a.taxTag), '', 'Tax note'));
+    if (a.taxTag && czTaxUi()) facts.push(chip(String(a.taxTag), '', 'Tax note'));
     dom.advice.append(head);
     if (facts.length) dom.advice.append(el('div', { class: 'dt-advice-facts' }, facts));
     dom.advice.hidden = false;
@@ -1360,12 +1360,18 @@ export function mountDetail(root, { onClose } = {}) {
     return capsOf().lots && c && Array.isArray(c.lots) ? c.lots : []; // capabilities.lots === false hides the lots card
   }
 
+  /** CZ time-test affordances (unlock dates, tax columns, /api/tax lots) are off in Practice and for an NL residency. */
+  function czTaxUi() {
+    return capsOf().tax && taxResidencyOf() !== 'NL';
+  }
+
   async function loadTax() {
     const s = S;
-    if (!s || !capsOf().tax || !lotsOf(s.id).length) return; // capabilities.tax === false: no /api/tax call
+    if (!s || !czTaxUi() || !lotsOf(s.id).length) return; // capabilities.tax === false or NL: no /api/tax call
     const t = lr.tax.begin();
     const res = await apiGet('/api/tax', { signal: t.signal });
     if (s !== S || destroyed || !t.current() || res.aborted) return;
+    if (!czTaxUi()) return; // the residency changed to NL while the request was in flight
     if (!res.ok || !res.data || typeof res.data !== 'object') {
       s.taxError = res.error || 'Unexpected response';
       dom.lots.stamp.setTs(s.taxTs, true);
@@ -1381,7 +1387,12 @@ export function mountDetail(root, { onClose } = {}) {
 
   function ensureTax() {
     const s = S;
-    if (!s || s.taxAsked || !capsOf().tax || !lotsOf(s.id).length) return;
+    if (!s) return;
+    if (taxResidencyOf() === 'NL') { // the CZ payload does not apply: drop it so a later switch back refetches
+      s.tax = null; s.taxError = null; s.taxAsked = false;
+      return;
+    }
+    if (s.taxAsked || !czTaxUi() || !lotsOf(s.id).length) return;
     s.taxAsked = true;
     loadTax();
   }
@@ -1394,7 +1405,7 @@ export function mountDetail(root, { onClose } = {}) {
     if (!lots.length) return;
     const taxRows = s.tax && Array.isArray(s.tax.lots) ? s.tax.lots.filter(r => r.id === s.id) : [];
     const used = new Set();
-    const showTax = capsOf().tax; // capabilities.tax === false: lots without age / unlock / tax columns
+    const showTax = czTaxUi(); // capabilities.tax === false (Practice) or an NL residency: lots without age / unlock / tax columns
     const body = el('tbody');
     for (const l of [...lots].sort((a, b) => String(a.date).localeCompare(String(b.date)))) {
       const sell = l.side === 'sell';
@@ -1422,7 +1433,7 @@ export function mountDetail(root, { onClose } = {}) {
       body);
     setContent(dom.lots.body,
       el('div', { class: 'tbl-wrap' }, table),
-      s.taxError ? el('p', { class: 'dt-note warn-ink', role: 'status', text: `Tax status unavailable: ${s.taxError}` }) : null);
+      showTax && s.taxError ? el('p', { class: 'dt-note warn-ink', role: 'status', text: `Tax status unavailable: ${s.taxError}` }) : null);
   }
 
   /** Cards that depend on the holding being a position / having lots. */

@@ -89,6 +89,13 @@ export function configPositionOf(id) {
   return c && c.portfolio ? c.portfolio[id] : undefined;
 }
 
+/** Tax residency from the config slot, upper-case ('CZ' | 'NL' | ...); null when unset or the config is not loaded. */
+export function taxResidencyOf() {
+  const c = slot('config').data;
+  const r = c && typeof c.taxResidency === 'string' ? c.taxResidency.trim().toUpperCase() : '';
+  return r || null;
+}
+
 /** Select a holding (null = back to overview). */
 export function selectHolding(id) {
   setStore('selectedId', id || null);

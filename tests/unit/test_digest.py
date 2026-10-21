@@ -761,6 +761,7 @@ def test_tax_tag_on_a_confirmed_move_into_sell_for_a_cz_resident(h, tmp_path, mo
 @pytest.mark.parametrize("name,residency,status,prior,answer", [
     ("residency not CZ", None, TAXABLE, {}, SELL_NOW),
     ("other residency", "DE", TAXABLE, {}, SELL_NOW),
+    ("NL residency (no sale-based tax)", "NL", TAXABLE, {}, SELL_NOW),
     ("taxable False", "CZ", {**TAXABLE, "taxable": False}, {}, SELL_NOW),
     ("taxable unknown", "CZ", {**TAXABLE, "taxable": None}, {}, SELL_NOW),
     ("no status at all", "CZ", None, {}, SELL_NOW),

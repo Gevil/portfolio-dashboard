@@ -21,7 +21,9 @@ Rules (all of them in this module, so a change is one edit):
   years on the sale date. Whether time-test-exempt sales count toward the CZK
   100,000 limit is NOT decided here (see ``notes``): the warning at >= 80 % of
   the limit uses the conservative all-sales total.
-- A residency other than ``CZ`` gets an empty payload (``lots: []``, null YTD
+- ``NL`` is dispatched to ``tax_nl`` (box 3 estimate); ``sell_tax_status`` then
+  carries ``statusText`` and ``taxable`` None (sales are not taxed individually).
+  Any other residency gets an empty payload (``lots: []``, null YTD
   figures): the rules above are Czech.
 
 ``tax_payload()`` backs ``GET /api/tax``. ``sell_tax_status()`` is the sync
@@ -37,6 +39,8 @@ from app.api import config_store, forex
 log = logging.getLogger("tax")
 
 RESIDENCY_CZ = "CZ"
+RESIDENCY_NL = "NL"
+NL_SELL_STATUS = "NL box 3: sales are not taxed individually; assessed on 1 Jan value"
 THRESHOLD_CZK = 100_000
 WARN_PCT = 80.0
 TIME_TEST_YEARS = 3
@@ -173,6 +177,9 @@ async def tax_payload() -> dict:
     residency = _residency(cfg)
     today = _today()
     out = _empty(residency, today.year)
+    if residency == RESIDENCY_NL:
+        from app.api import tax_nl      # lazy: tax_nl imports this module
+        return await tax_nl.payload()
     if residency != RESIDENCY_CZ:
         return out
 
@@ -265,6 +272,8 @@ def sell_tax_status(ident, shares=None) -> dict:
     out = {"taxable": None, "youngestLotDate": None, "unlockDate": None,
            "exemptShares": 0.0, "taxableShares": 0.0,
            "residency": _residency(cfg), "lotsKnown": False}
+    if out["residency"] == RESIDENCY_NL:
+        out["statusText"] = NL_SELL_STATUS
     pos = _portfolio(cfg).get(pid)
     lots = _parse_lots(pos.get("lots")) if isinstance(pos, dict) else []
     if not lots:

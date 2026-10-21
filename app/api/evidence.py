@@ -604,12 +604,15 @@ async def _policy_context(sym: str) -> dict | None:
     else:
         notes.append("no investmentPolicy configured: state no target, band or "
                      "contribution figure")
-    if residency == tax.RESIDENCY_CZ:
+    if residency in (tax.RESIDENCY_CZ, tax.RESIDENCY_NL):
         out["tax"] = tax.sell_tax_status(sym)
         sources.append("tax.sell_tax_status (config lots, FIFO)")
-        notes.append("tax: taxable true = a full sale touches a lot younger than 3 "
-                     "years (FIFO); lotsKnown false = no dated lots, taxability unknown; "
-                     "informational, not tax advice")
+        if residency == tax.RESIDENCY_NL:
+            notes.append("tax: " + tax.NL_SELL_STATUS + "; informational, not tax advice")
+        else:
+            notes.append("tax: taxable true = a full sale touches a lot younger than 3 "
+                         "years (FIFO); lotsKnown false = no dated lots, taxability unknown; "
+                         "informational, not tax advice")
     out.update(notes=notes, as_of=as_of, source=" + ".join(sources) or
                "config (investmentPolicy / lots / taxResidency read via config_store)")
     return out

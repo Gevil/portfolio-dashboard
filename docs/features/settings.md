@@ -46,7 +46,10 @@ All of these are optional keys of `config/config.json` (validated on save; a bad
 "lookThrough": { "SXR8": { "asOf": "2026-10-14", "source": "fund factsheet", "weights": { "NVDA": 7.6 } } },
 "investmentPolicy": { "targets": { "ASML": 30, "NVDA": 20, "SXR8": 50 }, "maxSingleStockPct": 35,
                       "band": { "absPct": 5, "relPct": 25 }, "monthlyContributionEur": 300, "trendFilter": true },
-"taxResidency": "CZ"
+"taxResidency": "CZ",                 // "CZ", "NL" or null
+"taxNL": { "fiscalPartner": false,    // NL only, all optional
+           "otherAssets": { "2025": { "bankEur": 20000, "otherEur": 0, "debtsEur": 0 } },
+           "dividendTaxWithheldEur": { "2025": 31.5 } }
 ```
 
 - **Performance benchmark** (`performanceBenchmark`): the watchlist entry you measure yourself and the advice scoreboard
@@ -67,7 +70,7 @@ All of these are optional keys of `config/config.json` (validated on save; a bad
     of completed month-end closes.
   - A daily **policy worker** (`POLICY_WATCH_ENABLED`, default on) pushes band, cap and trend-flip edges; see
     [Alerts](alerts.md#alert-rules). The numbers are served by `/api/policy`.
-- **Tax residency** (`taxResidency`, only `CZ` is implemented). For a Czech tax resident, securities held for **more than
+- **Tax residency** (`taxResidency`, `CZ` or `NL`). For a Czech tax resident, securities held for **more than
   3 years** are exempt (the *time test*). From the dated lots (FIFO matching of sales to purchases) the dashboard shows each
   lot's **unlock date = purchase date + 3 years + 1 day**, whether it is exempt today, and the year-to-date **gross sale
   proceeds in CZK** (ECB EUR/CZK rate of each sale date, no fee deduction) against the **CZK 100,000** annual limit, with a
@@ -75,6 +78,27 @@ All of these are optional keys of `config/config.json` (validated on save; a bad
   **Caveat for your tax adviser:** whether sales of time-test-exempt lots count toward the CZK 100,000 limit is not decided
   by the dashboard. The headline figure conservatively counts *all* sales of the year; a second figure counts only sales of
   lots younger than 3 years. This is bookkeeping from your own lots, not tax advice.
+- **Dutch box 3** (`taxResidency: "NL"`, `taxNL`): informational estimate per tax year, served by `/api/tax` (module
+  `app/api/tax_nl.py`, spec in `docs/research/nl-tax.md`). Sales are not taxed individually, so there is no sale-based tax
+  tag in the digest and the policy context says *"NL box 3: sales are not taxed individually; assessed on 1 Jan value"*.
+  - **Forfait**: the 1 Jan value of the dashboard's investments is `shares held at the start of 1 Jan (from the lots) x last
+    close on or before 31 Dec of the year before`. A position without lots uses its current shares for the current year only
+    (warning `history_basis_current_shares`); for earlier years it is left out (warning `lots_missing`). Bank, other assets
+    and debts come only from `taxNL.otherAssets[year]` (`bankEur`, `otherEur`, `debtsEur`); without them the result is
+    labelled "investments only" (warning `other_assets_missing`). `fiscalPartner` doubles the heffingvrij vermogen and the
+    debt threshold.
+  - **Tegenbewijs**: `max(0, end value - start value - deposits + withdrawals + dividends)`, no heffingvrij, no cost
+    deduction. Deposits/withdrawals are the buy/sell lot amounts (`shares x price`, fees ignored); dividends are the gross
+    per-share yfinance dividends with an ex-date in the year x shares held before the ex-date. The current year is year to
+    date at today's value (estimate). `applies` names the smaller of forfait and tegenbewijs.
+  - **Dividendbelasting**: for Dutch stocks (watchlist `isin` starting `NL`, else an Amsterdam `.AS` equity listing) 15 % of
+    the gross dividends is credited as an estimate unless `taxNL.dividendTaxWithheldEur[year]` gives the real amount.
+    Foreign withholding is not credited.
+  - **Parameters** (in code, no env override; each with status and source URLs in the payload): 2025 final (5.88 % overige
+    unverified), 2026 bank/debt provisional, 2027 law 6.37 % / proposal 7.87 % with heffingvrij EUR 59,357 / EUR 30,846;
+    the other 2027 values are carried over from 2026 as an assumption. No 2028+ formula exists, so there is no projection
+    beyond next year. The next-year projection (law and proposal scenarios) is always an estimate.
+  - The payload also carries an aangifte checklist and a disclaimer.
 
 ## Appearance
 

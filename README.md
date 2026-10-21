@@ -40,7 +40,7 @@ More: [overview](docs/features/overview.md) · [analysis and reports](docs/featu
 | **AI analysis** | In-process pipeline (analyst → research → trader → risk → PM) producing a structured decision (rating, action, score, confidence, battle plan, plus `p_outperform_20d` and `expected_excess_20d_pct`). Quick / standard / deep modes; evidence pack where every field carries `as_of + source` or the literal `MISSING`, including `portfolio_context` and `policy_context`. |
 | **Digest** | Twice-daily consolidated push per batch, **trading days only**; rating changes use hysteresis (confirmed on repeat or a strong band move); draft lanes never publish; only confirmed changes are pushed (priority 3 or 4, never 5); event-driven deep runs (earnings, new filing, triage hit); CZ taxable tag on sell-family changes. |
 | **Scoreboard (v3)** | Grades advice at T+5 / T+20 against the EUR performance benchmark (total return) with Wilson intervals and an explicit "insufficient sample" rule, plus probabilistic scores (Brier, Brier skill score, log score, reliability bins, rank IC) and naive baselines (`always_hold`, `trend_10m`, `momentum_12_1`). |
-| **Policy and tax** | `investmentPolicy`: target weights with 5/25 bands, a single-stock cap, contribution water-filling and a monthly 10-month-SMA trend filter. For a Czech tax resident (`taxResidency: "CZ"`): 3-year time-test unlock dates per lot and the year-to-date gross sale proceeds vs the CZK 100,000 limit. Informational, not tax advice. |
+| **Policy and tax** | `investmentPolicy`: target weights with 5/25 bands, a single-stock cap, contribution water-filling and a monthly 10-month-SMA trend filter. For a Czech tax resident (`taxResidency: "CZ"`): 3-year time-test unlock dates per lot and the year-to-date gross sale proceeds vs the CZK 100,000 limit. For a Dutch resident (`"NL"`): a box 3 estimate per year (forfait vs tegenbewijs, 1 Jan values from the lots), a next-year projection and an aangifte checklist. Informational, not tax advice. |
 | **Events** | `/api/events`: earnings, ex-dividend / pay dates, exchange closures, official FOMC and ECB meeting dates, US CPI releases (FRED). |
 | **Chat assistant** | Streams from the active lane, grounded each turn on current quotes, position and latest advice. |
 | **Market view** | Market light (index + momentum; `holdingsTrend` is informational only), macro (yield curve, FRED, CFTC COT), earnings calendar, events calendar, insider feed, FINRA short volume, filings. |
@@ -103,7 +103,10 @@ read/written only via `config_store`, which keeps a last-good copy in `data/`:
   "investmentPolicy": { "targets": { "ASML": 30, "NVDA": 20, "SXR8": 50 },   // %, must sum to 100 ± 0.5, holdings only
                         "maxSingleStockPct": 35, "band": { "absPct": 5, "relPct": 25 },
                         "monthlyContributionEur": 300, "trendFilter": true },
-  "taxResidency": "CZ"                                  // "CZ" or null
+  "taxResidency": "CZ",                                 // "CZ", "NL" or null
+  "taxNL": { "fiscalPartner": false,                    // only with "NL"; all optional
+             "otherAssets": { "2025": { "bankEur": 20000, "otherEur": 0, "debtsEur": 0 } },
+             "dividendTaxWithheldEur": { "2025": 31.5 } }
 }
 ```
 - **`lots`**: each lot has an ISO `date` (not in the future), `shares > 0`, `priceEur > 0`, `feesEur >= 0` (default 0) and `side` `buy` or `sell`; a sell may not exceed the shares held on its date. Lots are stored sorted by date. The server derives `shares` (Σ buys − Σ sells) and `investedAmount` (**FIFO** cost of the remaining shares, buy fees included). A plain position save without a `lots` key keeps the stored lots; `"lots": []` drops them. Positions without lots behave as before.
@@ -111,7 +114,7 @@ read/written only via `config_store`, which keeps a last-good copy in `data/`:
 - **`performanceBenchmark`** is reported as kind `total_return` when it is an ETF watchlist entry and `price` otherwise (an index such as `GSPC` excludes dividends and flatters the comparison). Unset: the role benchmark, converted to EUR.
 - **`lookThrough`**: `exposure(id) = direct weight + Σ fund weight × weights[id] / 100`. The rows overlap, so they do not sum to 100. Weights older than 120 days are flagged in the risk notes.
 - **`investmentPolicy`**: half-width of a band = `min(absPct, target × relPct / 100)` (defaults 5 / 25). The single-stock cap counts equities only, never ETFs. The monthly contribution is water-filled toward the targets without selling. The trend filter compares the last completed month-end close with its 10-month SMA.
-- **`taxResidency`**: only `CZ` is implemented. Any other value or `null` disables the tax view.
+- **`taxResidency`**: `CZ` (time test, CZK limit) or `NL` (box 3 estimate, see [settings](docs/features/settings.md#portfolio-policy-and-tax)). Any other value or `null` disables the tax view. `taxNL` (NL only): `fiscalPartner`, `otherAssets` per year (`bankEur`, `otherEur`, `debtsEur`; years 2020 to 2100, unknown keys rejected) and `dividendTaxWithheldEur` per year.
 - **alertRules v3**: `mode` `sigma` (default) or `pct`. A v2 block is read as v3 (`mode: "sigma"`, new fields at their defaults) and is only rewritten when you save from the UI. See [alerts](docs/features/alerts.md#alert-rules).
 **`env.secrets`** (gitignored systemd `EnvironmentFile`; never print it): Basic-auth user/password,
 `APPROVAL_TOKEN`, `NTFY_PASS`, provider keys (`FINNHUB_API_KEY`, `TWELVE_DATA_API_KEY`, `FRED_API_KEY`),

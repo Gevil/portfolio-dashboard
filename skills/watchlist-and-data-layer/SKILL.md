@@ -86,8 +86,12 @@ never writes the listing store); σ, the scoreboard baselines, the policy trend 
 - `GET /api/portfolio/risk`: direct / look-through / currency exposure, 1Y volatility, beta, drawdown on the TWR index,
   correlation, concentration. Look-through = direct weight + Σ fund weight × `lookThrough[fund].weights[id]` / 100.
 - Config keys (all optional; ids are checked against the same update's watchlist): `performanceBenchmark`,
-  `exposureCurrency`, `lookThrough`, `investmentPolicy`, `taxResidency`; examples in `README.md`.
+  `exposureCurrency`, `lookThrough`, `investmentPolicy`, `taxResidency` (`CZ`/`NL`), `taxNL`; examples in `README.md`.
   `performanceBenchmark` kind is `total_return` for an ETF entry, else `price`; unset = the role benchmark.
+- `taxResidency` `NL` routes `GET /api/tax` to `app/api/tax_nl.py` (box 3 forfait vs tegenbewijs from the lots, the raw
+  `prices.daily_closes` 31 Dec closes and `events.dividend_history`; inputs in `taxNL`). Positions without lots use current
+  shares for the current year only (`history_basis_current_shares`). Parameters live in `tax_nl.PARAMS` (spec:
+  `docs/research/nl-tax.md`); `tax.sell_tax_status` returns `taxable: None` + `statusText` for NL, so the digest has no tax tag.
 - `ALL` uses `daily_closes` (period chosen from the oldest lot); without any dated lot it is limited to 5 years.
 
 ## Tests to run after changes

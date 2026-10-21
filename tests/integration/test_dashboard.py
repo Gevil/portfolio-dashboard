@@ -506,6 +506,90 @@ def test_risk_panel_collapses_and_policy_card_renders(browser):
     page.close()
 
 
+# Tax (NL box 3): the card, the settings inputs and the CZ-only lot columns follow config.taxResidency.
+# The live config is only READ (GET /api/config); nothing here saves it.
+
+def _residency():
+    _, cfg = api("/api/config")
+    return str(cfg.get("taxResidency") or "").strip().upper() or None
+
+
+def test_nl_tax_card_is_hidden_unless_residency_nl(browser):
+    residency = _residency()
+    page = open_overview(browser, DESKTOP)
+    page.wait_for_selector("#policy-card", timeout=30000)
+    page.wait_for_selector("#taxnl-card", state="attached", timeout=10000)
+    if residency == "NL":
+        page.wait_for_selector("#taxnl-card:not([hidden])", timeout=30000)
+        assert (page.text_content("#taxnl-title") or "").strip() == "Tax (NL box 3)"   # CSS uppercases titles
+        status, tax = api("/api/tax")
+        assert status == 200 and tax["residency"] == "NL", tax
+        page.wait_for_selector("#taxnl-disclaimer", timeout=30000)
+        if tax["years"]:
+            assert page.locator("#taxnl-table tbody tr").count() == len(tax["years"])
+        else:
+            assert page.locator("#taxnl-empty").count() == 1
+        missing = any(isinstance(w, dict) and w.get("code") == "other_assets_missing" for w in tax.get("warnings", []))
+        assert (page.locator("#taxnl-investments-only").count() == 1) == missing
+    else:
+        wait_js(page, "() => document.getElementById('taxnl-card').hidden")
+        assert page.locator("#taxnl-card:not([hidden])").count() == 0
+    # Practice never shows it, whatever the residency.
+    page.click('#book-switch .book-btn[data-book="practice"]')
+    wait_js(page, "() => document.documentElement.getAttribute('data-book') === 'practice'")
+    wait_js(page, "() => document.getElementById('taxnl-card').hidden")
+    page.close()
+
+
+def test_detail_lots_tax_columns_are_cz_only_not_nl(browser):
+    residency = _residency()
+    _, cfg = api("/api/config")
+    page = open_overview(browser, DESKTOP)
+    sym = first_symbol(page)
+    if not (cfg.get("portfolio", {}).get(sym) or {}).get("lots"):
+        page.close()
+        pytest.skip("the first holding has no dated lots")
+    page.locator(".pos-row .pos-btn").first.click()
+    page.wait_for_selector(".dt-pane .dt-lots:not([hidden]) .dt-lots-table", timeout=20000)
+    heads = [h.strip() for h in page.locator(".dt-lots-table thead th").all_text_contents()]   # DOM text, not CSS case
+    if residency == "NL":
+        assert heads == ["Date", "Side", "Shares", "Price"], heads
+    else:
+        assert heads == ["Date", "Side", "Shares", "Price", "Age (d)", "Unlocks", "Tax"], heads
+    page.close()
+
+
+def test_settings_tax_residency_offers_nl_and_shows_its_inputs_only_for_nl(browser):
+    residency = _residency()
+    original = residency or "none"
+    page = open_overview(browser, LAPTOP)
+    page.click("#btn-settings")
+    page.wait_for_selector("[role=dialog]:visible", timeout=10000)
+    page.click('.st-tab[data-tab="policy"]')
+    page.wait_for_selector("#st-pol-tax", timeout=20000)
+    options = page.locator("#st-pol-tax option").evaluate_all("els => els.map(e => e.value)")
+    assert options[:3] == ["none", "CZ", "NL"], options
+    assert page.locator("#st-pol-tax").input_value() == original
+    assert page.evaluate("document.getElementById('st-pol-nl').hidden") == (residency != "NL")
+    page.select_option("#st-pol-tax", "NL")
+    wait_js(page, "() => !document.getElementById('st-pol-nl').hidden")
+    year = datetime.date.today().year
+    for y in (year, year + 1):
+        for field in ("bank", "other", "debts", "divTax"):
+            assert page.locator(f"#st-pol-nl-{y}-{field}").count() == 1, (y, field)
+    assert page.get_attribute("#st-pol-nl-partner", "type") == "checkbox"
+    assert "Netherlands" in page.inner_text("#st-pol-tax-note")
+    page.select_option("#st-pol-tax", "CZ")
+    wait_js(page, "() => document.getElementById('st-pol-nl').hidden")
+    assert "Czech Republic" in page.inner_text("#st-pol-tax-note")
+    page.select_option("#st-pol-tax", original)  # back to the stored value: not dirty, closes without a prompt
+    page.keyboard.press("Escape")
+    wait_js(page, "() => [...document.querySelectorAll('[role=dialog]')]"
+                  ".every(d => d.hidden || d.getClientRects().length === 0)")
+    assert not page.collector.errors, page.collector.errors
+    page.close()
+
+
 def test_detail_attribution_lots_and_advice_blocks(browser):
     page = open_overview(browser, DESKTOP)
     sym = first_symbol(page)

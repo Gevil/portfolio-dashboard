@@ -15,6 +15,7 @@ import { buildBenchmarks, buildCompare, buildSeasonHistory } from './_compare.js
 import { PERF_RANGES, basisOf, baselineSeries, benchmarkChoices, buildBasisWarning, buildKpis, buildPracticeKpis, kindText, perfBenchmarkLabel } from './_perf.js';
 import { buildRisk } from './_risk.js';
 import { buildPolicy } from './_policy.js';
+import { buildTaxNl } from './_taxnl.js';
 import { createAgentPanel } from './_agent.js';
 import { createForecasterPanel } from './_forecaster.js';
 
@@ -72,6 +73,7 @@ export function mountOverview(root) {
   const compareCard = el('section', { class: 'card compare-card', id: 'compare-card', 'aria-labelledby': 'compare-title', hidden: true });
   const perfCard = el('section', { class: 'card perf-card', id: 'perf-card', 'aria-labelledby': 'perf-title' });
   const policyCard = el('section', { class: 'card policy-card', id: 'policy-card', 'aria-labelledby': 'policy-title' });
+  const taxCard = el('section', { class: 'card taxnl-card', id: 'taxnl-card', 'aria-labelledby': 'taxnl-title', hidden: true });
   const riskCard = el('section', { class: 'card risk-card', id: 'risk-card', 'aria-labelledby': 'risk-title' });
   const dock = el('aside', { class: 'ov-dock', 'aria-label': 'Holding detail', hidden: true });
   // Practice-only Forecaster + Candidates cards (own polling; started/stopped by renderForecaster()).
@@ -79,7 +81,7 @@ export function mountOverview(root) {
     heldIds: () => new Set((((slot('portfolio').data || {}).positions) || []).map(p => String(p.id).toUpperCase())),
   });
   cleanups.push(() => forecaster.destroy());
-  const main = el('div', { class: 'ov-main' }, el('div', { class: 'ov-left' }, posCard, agentCard, forecaster.forecasterNode, forecaster.candidatesNode, compareCard, perfCard, policyCard, riskCard), dock);
+  const main = el('div', { class: 'ov-main' }, el('div', { class: 'ov-left' }, posCard, agentCard, forecaster.forecasterNode, forecaster.candidatesNode, compareCard, perfCard, policyCard, taxCard, riskCard), dock);
   root.replaceChildren(el('div', { class: 'ov' }, sinceHost, heroHost, attnHost, main));
 
   // capabilities gate the practice-only panels (missing = all true, per contract §4; 'real' never carries capabilities).
@@ -606,6 +608,54 @@ export function mountOverview(root) {
     policyBody.removeAttribute('aria-busy');
   }
 
+  // ------------------------------------------------------------ Tax (NL box 3) card (Real book, residency NL only)
+  const TAX_REFRESH_MS = 600000;
+  const taxState = { data: null, error: null, ts: null, asked: false };
+  const taxBody = el('div', { class: 'taxnl-body', id: 'taxnl-body' });
+  const taxStamp = el('span', { class: 'taxnl-stamp' });
+  taxCard.append(
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'card-title', id: 'taxnl-title' }, 'Tax (NL box 3)'),
+      el('div', { class: 'card-tools' }, taxStamp)),
+    taxBody);
+  const taxReq = latestRequest();
+  cleanups.push(() => taxReq.abort());
+  /** Shown only for the Real context with taxResidency NL (the CZ affordances are the mirror image). */
+  const taxOn = () => get('book') !== 'practice' && capsOf().tax && data.taxResidencyOf() === 'NL';
+
+  async function loadTax() {
+    if (!taxOn()) return;
+    const t = taxReq.begin();
+    const res = await apiGet('/api/tax', { signal: t.signal, timeoutMs: 30000 });
+    if (!t.current() || res.aborted || !taxOn()) return;
+    if (res.ok && res.data && typeof res.data === 'object' && String(res.data.residency).toUpperCase() === 'NL') {
+      taxState.data = res.data; taxState.error = null; taxState.ts = Date.now();
+    } else {
+      taxState.error = res.ok ? 'The server did not answer with the NL tax payload.' : (res.error || 'invalid response');
+    }
+    renderTax();
+  }
+  cleanups.push(usePolling(loadTax, TAX_REFRESH_MS));
+
+  function renderTax() {
+    if (!taxOn()) {
+      taxCard.hidden = true;
+      taxReq.abort();
+      taxState.data = null; taxState.error = null; taxState.ts = null; taxState.asked = false;
+      return;
+    }
+    taxCard.hidden = false;
+    if (!taxState.asked) { taxState.asked = true; loadTax(); }
+    taxStamp.replaceChildren(taxState.ts ? stamp(taxState.ts, { stale: !!taxState.error }) : '');
+    if (!taxState.data) {
+      renderState(taxBody, taxState.error ? { error: `Tax estimate unavailable: ${taxState.error}`, retry: () => loadTax() } : { loading: 'Loading tax estimate' });
+      return;
+    }
+    taxBody.replaceChildren(...[...buildTaxNl(taxState.data, { onOpenSettings: () => openSettingsTab('policy') }),
+      taxState.error ? el('p', { class: 'pos-note warn-ink', role: 'status' }, `Refresh failed, showing older data: ${taxState.error}`) : null].filter(Boolean));
+    taxBody.removeAttribute('aria-busy');
+  }
+
   // ------------------------------------------------------------ agent card (practice book only)
   const agentBody = el('div', { class: 'agent-body' });
   const seasonHistoryHost = el('div', { class: 'agent-history-host' });
@@ -837,15 +887,18 @@ export function mountOverview(root) {
       if (todo.includes('pos')) renderPositions();
       if (todo.includes('risk')) renderRisk();
       if (todo.includes('policy')) renderPolicy();
+      if (todo.includes('tax')) renderTax();
       if (todo.includes('agent')) { renderAgent(); renderForecaster(); renderSeasonHistory(); }
       if (todo.includes('compare')) renderCompare();
     });
   }
   const sub = (key, ...parts) => cleanups.push(subscribe(key, () => schedule(...parts)));
-  sub('portfolio', 'hero', 'since', 'attn', 'pos', 'risk', 'policy', 'agent');
+  sub('portfolio', 'hero', 'since', 'attn', 'pos', 'risk', 'policy', 'tax', 'agent');
   sub('prices', 'pos');
   sub('alerts', 'since', 'attn');
-  sub('config', 'attn');
+  sub('config', 'attn', 'tax');
+  // A saved config (taxNL values, residency) changes the estimate: ask again on the next render.
+  cleanups.push(subscribe('config', () => { taxState.asked = false; }));
   sub('lane', 'attn');
   sub('marketLight', 'hero');
   sub('watchlist', 'pos', 'attn', 'risk', 'policy');
@@ -866,7 +919,8 @@ export function mountOverview(root) {
     paintPerf();
     loadPerf();
     loadCompare();
-    schedule('hero', 'pos', 'risk', 'policy', 'agent', 'compare');
+    taxState.data = null; taxState.error = null; taxState.ts = null; taxState.asked = false;
+    schedule('hero', 'pos', 'risk', 'policy', 'tax', 'agent', 'compare');
   }));
   // Bucket switch: stop the Agent panel (aborts its in-flight requests), drop the old bucket's figures and
   // reload; loadPerf/loadCompare begin new "latest" requests, which abort the old bucket's.
@@ -887,7 +941,7 @@ export function mountOverview(root) {
   cleanups.push(() => document.removeEventListener('visibilitychange', onVis));
 
   paintMode(); paintRiskOpen();
-  renderHero(); renderSince(); renderAttention(); renderPositions(); renderRisk(); renderPolicy(); renderAgent(); renderForecaster(); renderSeasonHistory(); renderCompare(); paintPerf(); paintRange();
+  renderHero(); renderSince(); renderAttention(); renderPositions(); renderRisk(); renderPolicy(); renderTax(); renderAgent(); renderForecaster(); renderSeasonHistory(); renderCompare(); paintPerf(); paintRange();
   loadPerf();
   loadCompare();
   if (get('selectedId')) syncDetail();

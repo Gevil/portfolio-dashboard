@@ -278,7 +278,9 @@ def test_paper_status_merges_halt_windows_universe_and_the_worker(monkeypatch, p
         "halt": {"halted": False}, "openIntents": 2, "lastReconcileAt": 5.0,
         "tradingWindow": {"XETR": {"open": True, "opensAt": 1, "closesAt": 2}},
         "worker": {"running": True},
-        "claude": {"enabled": False}, "forecaster": {"enabled": False, "running": False}}
+        "claude": {"enabled": False}, "forecaster": {"enabled": False, "running": False},
+        "liveRefs": body(r)["liveRefs"]}
+    assert set(body(r)["liveRefs"]) == {"finnhubSubscriptions", "usLeads", "reasons"}
 
 
 def test_paper_status_is_always_200_and_book_is_optional(monkeypatch, paper):
@@ -379,7 +381,8 @@ def test_mode_writes_through_paper_exec_and_returns_the_status_payload(paper):
     assert paper == [("mode", "shadow", "daily")]
     assert body(r) == {"enabled": True, "mode": "demo", "halt": {"halted": False},
                        "worker": {"running": True}, "claude": {"enabled": False},
-                       "forecaster": {"enabled": False, "running": False}}
+                       "forecaster": {"enabled": False, "running": False},
+                       "liveRefs": body(r)["liveRefs"]}
 
 
 @pytest.mark.parametrize("exc,status,payload", [

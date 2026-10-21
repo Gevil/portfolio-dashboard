@@ -842,3 +842,23 @@ def test_chain_goes_frankfurter_then_ecb_then_yahoo(monkeypatch):
     rate, source = run(go())
     assert source == "ecb" and rate == pytest.approx(0.8)
     assert seen == ["api.frankfurter.dev", "data-api.ecb.europa.eu"]
+
+
+def test_us_lead_names_get_their_xetra_quote_refreshed_only_during_the_overlap(env, monkeypatch):
+    # us_lead needs a Xetra quote <= 30 min old; nothing else quotes names the buckets do not hold.
+    import app.api.live_ws as lw
+    asked = []
+
+    async def quote(pid):
+        asked.append(pid)
+        return {"price": 1.0}
+    monkeypatch.setattr(paper_universe, "us_symbols", lambda: {"MSFT": "MSFT", "AAPL": "AAPL"})
+    monkeypatch.setattr(paper_universe, "listing_quote", quote)
+    open_ = {"v": False}
+    monkeypatch.setattr(lw, "_session_open", lambda mic, now: open_["v"])
+    assert run(data_feeds._step_us_quotes(NOW, NOW + 60, {})) is None and asked == []      # markets not both open
+    open_["v"] = True
+    assert run(data_feeds._step_us_quotes(NOW, NOW + 60, {})) == (2, 2, 0)
+    assert sorted(asked) == ["AAPL", "MSFT"]
+    assert run(data_feeds._step_us_quotes(NOW + 60, NOW + 120, {})) is None                 # spaced 5 minutes
+    assert run(data_feeds._step_us_quotes(NOW + data_feeds.US_QUOTES_EVERY_S, NOW + 999, {})) == (2, 2, 0)

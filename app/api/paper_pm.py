@@ -30,9 +30,9 @@ import math
 import time
 
 from app.api import (calendars, digest, evidence, events, indicators, jsonstore,
-                     lane_client, macro, market_light, paper_buckets, paper_eval, paper_exec,
-                     paper_ledger, paper_risk, paper_universe, price_alerts, prices, registry,
-                     scoreboard, ta_pipeline, textsafe)
+                     lane_client, live_ws, macro, market_light, paper_buckets, paper_eval,
+                     paper_exec, paper_ledger, paper_risk, paper_universe, price_alerts, prices,
+                     registry, scoreboard, ta_pipeline, textsafe)
 
 log = logging.getLogger("paper_pm")
 
@@ -749,6 +749,40 @@ async def _safe_bars(pid: str) -> list:
         return []
 
 
+US_LEAD_NOTE = ("reference only: the US listing's USD tick converted at the live EURUSD, "
+                "not a tradable XETRA price; gapPct = implied EUR vs the delayed XETRA quote")
+
+
+def _safe_us_lead(pid: str, now: float) -> dict | None:
+    try:
+        return live_ws.us_lead(pid, now)
+    except Exception as e:
+        log.warning("paper_pm: us lead %s failed: %s", pid, type(e).__name__)
+        return None
+
+
+def _live_price_section(t: dict, delayed) -> dict:
+    """A held name's Trading 212 price (read time of the positions call) and its gap to the delayed
+    Yahoo quote the rest of the entry uses (MISSING without a delayed price)."""
+    price = float(t["price"])
+    dp = _num((delayed or {}).get("price"))
+    gap = round((price / dp - 1.0) * 100.0, 2) if dp is not None and dp > 0 else MISSING
+    return {"price": round(price, 4), "asOf": _iso(t.get("asOf")) or MISSING,
+            "source": "t212", "gapPctVsDelayed": gap}
+
+
+def _us_lead_section(lead) -> dict | str:
+    """The US-lead reference of a US name; MISSING outside the overlapping sessions or
+    without a fresh US tick / forex rate / XETRA quote."""
+    if not isinstance(lead, dict):
+        return MISSING
+    out = {k: _num(lead.get(k)) for k in ("usPrice", "eurusd", "impliedEur", "xetraDelayedEur",
+                                          "gapPct", "ageS")}
+    if any(v is None for v in out.values()):
+        return MISSING
+    return {**out, "label": US_LEAD_NOTE, "source": "live_ws.us_lead (finnhub WS, forex)"}
+
+
 async def _collect_open(cfg: dict, season: dict, now: float, bucket: str) -> dict:
     """Everything the open-universe pack needs (each part degrades alone)."""
     universe = cfg["universe"]
@@ -794,7 +828,10 @@ async def _collect_open(cfg: dict, season: dict, now: float, bucket: str) -> dic
             "advice": advice, "f20": f20, "f5": f5, "closes": dict(zip(shown, closes)),
             "bars": dict(zip(shown, bars)),
             "events": ev, "perf": perf, "buy_hold_pct": buy_hold,
-            "last_prices": _last_slot_prices(bucket, today.isoformat()) if bucket != DAILY else {}}
+            "last_prices": _last_slot_prices(bucket, today.isoformat()) if bucket != DAILY else {},
+            "live_prices": ({pid: t for pid, t in (await paper_eval.held_prices(universe)).items()
+                             if pid in held} if bucket != DAILY else {}),
+            "us_lead": ({pid: _safe_us_lead(pid, now) for pid in shown} if bucket != DAILY else {})}
 
 
 def _open_entry(raw: dict, pid: str, excerpt_chars: int, compact: bool) -> dict:
@@ -813,6 +850,10 @@ def _open_entry(raw: dict, pid: str, excerpt_chars: int, compact: bool) -> dict:
     if raw["bucket_id"] != DAILY:
         entry["intraday"] = _intraday_section(raw["quotes"].get(pid), raw["last_prices"].get(pid))
         entry["intradayBars"] = _bars_section(raw["bars"].get(pid))
+        if paper_universe.us_symbol(pid):
+            entry["usLead"] = _us_lead_section((raw.get("us_lead") or {}).get(pid))
+        if isinstance(raw.get("live_prices"), dict) and pid in raw["live_prices"]:
+            entry["livePrice"] = _live_price_section(raw["live_prices"][pid], raw["quotes"].get(pid))
     if compact:
         return entry
     trend, momentum = _trend_and_momentum(raw["closes"].get(pid))

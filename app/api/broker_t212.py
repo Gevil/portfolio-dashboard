@@ -560,6 +560,27 @@ class T212Broker:
         return await self._get("positions", "/equity/positions", fresh=fresh,
                                map_fn=self._map_positions_list)
 
+    async def held_quotes(self, fresh: bool = False) -> dict[str, dict]:
+        """``{ticker: {price, asOf, source: "t212"}}`` for the open positions
+        that carry a usable ``currentPrice`` in EUR (the only currency the
+        dashboard values in). Rides the single-flight, throttled positions read.
+        ``asOf`` is the epoch second the broker answered that read (the API has
+        no per-price timestamp; a throttled call returns the cached read and so
+        its older time). A failed read gives ``{}``."""
+        rows = await self.positions(fresh=fresh)
+        if is_error(rows):
+            return {}
+        at = self._last_call.get("positions")
+        if at is None:
+            return {}
+        out: dict[str, dict] = {}
+        for p in rows:
+            price = p.current_price
+            if price is None or price <= 0 or p.currency != "EUR":
+                continue
+            out[p.ticker] = {"price": float(price), "asOf": int(at), "source": "t212"}
+        return out
+
     async def instruments(self) -> list[Instrument] | dict:
         now = self._clock()
         if self._instruments is not None and now - self._instruments_at < INSTRUMENTS_TTL_S:

@@ -629,6 +629,16 @@ def _paper_status_payload(bucket: str = paper_buckets.DAILY) -> dict:
     out["worker"] = paper_trader.status()
     out["claude"] = claude_client.status()
     out["forecaster"] = forecast_worker.status()
+    try:   # free real-time references: Finnhub US subscriptions and the current US leads (empty outside the overlap)
+        from collections import Counter
+        from app.api import live_ws, paper_universe as pu
+        subs = live_ws._desired_finnhub()
+        explained = {pid: live_ws.us_lead_explain(pid) for pid in pu.us_symbols()}
+        out["liveRefs"] = {"finnhubSubscriptions": len(subs),
+                           "usLeads": {k: v for k, (v, _) in explained.items() if v},
+                           "reasons": dict(Counter(r for _, r in explained.values()))}
+    except Exception as e:
+        out["liveRefs"] = {"error": type(e).__name__}
     return out
 
 

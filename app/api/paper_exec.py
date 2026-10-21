@@ -521,7 +521,7 @@ async def _kill_switch_locked(brk, errs: list, bucket: str = DAILY) -> None:
     if broker_mod.is_error(pos):
         errs.append(pos["error"])
         return
-    quotes = await paper_eval._quote_universe(cfg["universe"])
+    quotes = await paper_eval.valuation_quotes(cfg["universe"])
     state = paper_ledger.bucket_from_positions(
         positions=pos, account=None, universe=cfg["universe"],
         budget_eur=cfg["budgetEur"], prices_by_id=quotes,
@@ -837,18 +837,31 @@ async def _rebalance_body(cfg: dict, targets: dict, cash_pct: float | None, *,
     holdings = {pid: max(0.0, q) for pid, q in holdings.items()}
     wanted = [*targets, *(pid for pid, qty in holdings.items() if qty > 0)]
     quotes = {pid: q for pid, q in (await paper_eval.quotes_for(universe, wanted)).items() if q}
+    held_ids = [pid for pid, qty in holdings.items() if qty > 0]
+    held_prices = await paper_eval.held_prices(universe) if held_ids else {}
+    us_lead = {}
+    if cfg.get("universeSource") == "paper_universe":
+        from app.api import live_ws            # lazy: live_ws pulls in the websocket stack
+        for pid in targets:
+            try:
+                lead = live_ws.us_lead(pid)
+            except Exception:                  # a broken lead must never block a decision
+                lead = None
+            if lead:
+                us_lead[pid] = lead
     now = _now()
     orders_today, turnover = paper_ledger.day_usage(rows, _today(now))
     plan = paper_risk.plan_orders(
         targets=targets, cash_pct=cash_pct, holdings=holdings,
         cash_eur=(paper_ledger.ledger_cash(rows, cfg["budgetEur"])["cashEur"]
                   + paper_ledger.open_sell_proceeds(rows)),
-        quotes=quotes, universe=universe,
+        quotes=quotes, held_prices=held_prices, universe=universe,
         kinds={pid: paper_eval.kind_of(pid, spec) for pid, spec in universe.items()},
         limits=cfg["limits"], budget_eur=cfg["budgetEur"],
         decimals=paper_eval.decimals_by_id(universe), now=now,
         session_ok={pid: window_state(paper_eval.mic_of(pid), now)["open"] for pid in universe},
-        orders_today=orders_today, turnover_today_eur=turnover, exempt_caps=exempt_caps)
+        orders_today=orders_today, turnover_today_eur=turnover, exempt_caps=exempt_caps,
+        us_lead=us_lead or None)
     intents = plan["intents"]
     plan = {**plan, "intents": [dataclasses.asdict(i) for i in intents]}
     if dry_run:

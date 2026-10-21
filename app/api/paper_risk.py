@@ -117,6 +117,24 @@ def _apply_open_limits(clean: dict, *, lim: dict, universe: dict, held: dict, pr
             skipped.append({"id": id_, "reason": "max_positions"})
 
 
+US_LEAD_MAX_GAP_PCT = 1.5
+US_LEAD_MAX_AGE_S = 120
+T212_REF_MAX_AGE_S = 120    # a broker (t212) price this fresh may be a SELL's reference
+
+
+def _us_lead_blocks(us_lead: dict[str, dict] | None, id_: str) -> bool:
+    """True when a BUY of ``id_`` must be skipped: its US lead (``live_ws.us_lead``
+    result, passed in by the caller) shows |gapPct| > 1.5 and is <= 120 s old.
+    A missing, malformed or older lead never blocks (it is a reference only)."""
+    lead = (us_lead or {}).get(id_)
+    if not isinstance(lead, dict):
+        return False
+    gap, age = _num(lead.get("gapPct")), _num(lead.get("ageS"))
+    if gap is None or age is None:
+        return False
+    return abs(gap) > US_LEAD_MAX_GAP_PCT and age <= US_LEAD_MAX_AGE_S
+
+
 def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
                 holdings: dict[str, float], cash_eur: float,
                 quotes: dict[str, dict], universe: dict[str, dict],
@@ -124,7 +142,8 @@ def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
                 decimals: dict[str, int], now: float,
                 session_ok: dict[str, bool],
                 orders_today: int, turnover_today_eur: float,
-                exempt_caps: bool = False) -> dict:
+                exempt_caps: bool = False, us_lead: dict[str, dict] | None = None,
+                held_prices: dict[str, dict] | None = None) -> dict:
     lim = {**DEFAULT_LIMITS, **(limits or {})}
     max_w = {**DEFAULT_LIMITS["maxWeightPct"], **(lim.get("maxWeightPct") or {})}
     min_cash = float(lim["minCashPct"])
@@ -250,6 +269,10 @@ def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
             raw = qty_held if target <= 0 else min(qty_held, value / price * (1 + 1e-9))
             sells.append((id_, raw, price, actual, target))
         else:
+            if _us_lead_blocks(us_lead, id_):
+                skipped.append({"id": id_, "reason": "us_lead_gap"})
+                effective[id_] = round(actual, 6)
+                continue
             buys.append((id_, value, price, actual, target))
 
     # -- 4. caps state
@@ -262,14 +285,24 @@ def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
 
     intents: list[Intent] = []
 
-    def _mk(id_, side, qty, price, actual, target) -> Intent:
-        q = quotes[id_]
-        as_of = _num(q.get("asOf"))
+    def _mk(id_, side, qty, price, actual, target, as_of=None) -> Intent:
+        if as_of is None:
+            as_of = _num(quotes[id_].get("asOf"))
         return Intent(
             id=id_, ticker=str(universe[id_].get("t212")), side=side, quantity=qty,
             limit_price=_limit_price(price, side, slip_bps), ref_price=price,
             ref_price_as_of=int(as_of) if as_of is not None else None,
             value_eur=qty * price, reason=f"rebalance {actual:.1f}%->{target:.1f}%")
+
+    def _sell_ref(id_, price):
+        """(price, asOf) of a SELL: the broker's own price of the held name when
+        it is at most T212_REF_MAX_AGE_S old, else the quote's (asOf None = the
+        quote's). Buys never use it."""
+        t = (held_prices or {}).get(id_)
+        p, a = _num((t or {}).get("price")), _num((t or {}).get("asOf"))
+        if p is not None and p > 0 and a is not None and 0 <= now - a <= T212_REF_MAX_AGE_S:
+            return p, a
+        return price, None
 
     def _caps_ok(id_, value) -> bool:
         nonlocal orders_left, turnover_left
@@ -287,6 +320,7 @@ def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
     proceeds = 0.0
     sold_value = 0.0
     for id_, raw, price, actual, target in sells:
+        price, ref_as_of = _sell_ref(id_, price)
         qty = _round_down(min(raw, held[id_]), decimals.get(id_, 2))
         if qty <= 0:
             skipped.append({"id": id_, "reason": "zero_quantity"})
@@ -297,7 +331,7 @@ def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
         value = qty * price
         if not _caps_ok(id_, value):
             continue
-        intents.append(_mk(id_, "sell", qty, price, actual, target))
+        intents.append(_mk(id_, "sell", qty, price, actual, target, ref_as_of))
         proceeds += value * (1 - slip)
         sold_value += value
 

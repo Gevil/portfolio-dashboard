@@ -908,6 +908,29 @@ def test_a_dry_run_plans_but_never_writes_or_sends(env):
     assert [c[0] for c in env.broker.calls] == ["positions"]
 
 
+def test_rebalance_feeds_live_held_prices_and_the_us_lead_into_the_risk_engine(env, monkeypatch):
+    # Both fresher-price inputs default to None in plan_orders: a missed wiring would silently do nothing.
+    held_book(env)
+    env.cfg["universeSource"] = "paper_universe"
+    monkeypatch.setattr(pex.paper_eval, "_open", lambda *a, **k: False)   # keep the watchlist quote path of the fakes
+    seen = {}
+    real = pex.paper_risk.plan_orders
+
+    def spy(**kw):
+        seen.update(kw)
+        return real(**kw)
+
+    async def held_prices(universe):
+        return {"NVDA": {"price": 1.0, "asOf": 1.0}}
+    monkeypatch.setattr(pex.paper_risk, "plan_orders", spy)
+    monkeypatch.setattr(pex.paper_eval, "held_prices", held_prices)
+    import app.api.live_ws as lw
+    monkeypatch.setattr(lw, "us_lead", lambda pid: {"gapPct": 2.0, "ageS": 10} if pid == "ASML" else None)
+    run(pex.rebalance(targets=TARGETS, dry_run=True))
+    assert seen["held_prices"] == {"NVDA": {"price": 1.0, "asOf": 1.0}}
+    assert seen["us_lead"] == {"ASML": {"gapPct": 2.0, "ageS": 10}}
+
+
 def test_a_dry_run_is_allowed_when_off_or_halted_and_says_so(env):
     held_book(env, mode="off")
     res = run(pex.rebalance(targets=TARGETS, dry_run=True))

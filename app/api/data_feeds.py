@@ -161,6 +161,7 @@ def reset_state() -> None:
     """Forget every in-memory cache (tests; a restarted worker starts from the files)."""
     global _state, _task
     _state, _task = None, None
+    _us_quotes_last["at"] = 0.0
     _health.clear()
     _stats.update(running=False, enabled=False, last_run=0.0, runs=0, errors=0, lastError=None, lastPass=None)
 
@@ -344,8 +345,37 @@ async def _step_identity(now: float, deadline: float, st: dict):
     return (int(a), int(o), int((res or {}).get("new") or 0)) if a else None
 
 
+US_QUOTES_EVERY_S = 300            # Xetra quote refresh for the US-lead names during the NYSE/XETR overlap
+_us_quotes_last = {"at": 0.0}
+
+
+async def _step_us_quotes(now: float, deadline: float, st: dict):
+    """Keep the delayed Xetra quote of every US-lead name current while New York and Xetra are both open,
+    so ``live_ws.us_lead`` has something to compare the live US price with (it needs a quote <= 30 min old).
+    ``paper_universe.listing_quote`` caches 15 min, so this costs at most ~30 Yahoo quotes per 15 min."""
+    from app.api import live_ws
+    if now - _us_quotes_last["at"] < US_QUOTES_EVERY_S:
+        return None
+    if not (live_ws._session_open("XNYS", now) and live_ws._session_open("XETR", now)):
+        return None
+    ids = list(paper_universe.us_symbols())
+    if not ids:
+        return None
+    _us_quotes_last["at"] = now
+    sem = asyncio.Semaphore(4)
+
+    async def one(pid):
+        async with sem:
+            try:
+                return bool(await paper_universe.listing_quote(pid))
+            except Exception:
+                return False
+    got = await asyncio.gather(*(one(pid) for pid in ids))
+    return len(ids), sum(got), 0
+
+
 STEPS = (("regime", _step_regime), ("regulators", _step_regulators), ("consensus", _step_consensus),
-         ("identity", _step_identity))
+         ("identity", _step_identity), ("us_quotes", _step_us_quotes))
 
 
 async def _tick() -> tuple[bool, str, bool]:

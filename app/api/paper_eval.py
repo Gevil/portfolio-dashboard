@@ -21,9 +21,11 @@ import asyncio
 import datetime
 import logging
 import os
+import statistics
 import time
 
 from app.api import broker as broker_mod
+from app.api import jsonstore
 from app.api import calendars
 from app.api import paper_buckets, paper_ledger, paper_universe, performance, prices, registry, scoreboard
 from app.api import portfolio as portfolio_mod
@@ -244,6 +246,143 @@ async def _bars_universe(universe: dict) -> dict:
     return dict(zip(ids, bars))
 
 
+# ------------------------------------------------- t212 held prices (valuation)
+
+PRICE_FRESH_FILE = paper_ledger.DATA_DIR / "price_fresh.json"
+FRESH_KEEP = 500          # samples kept in the file
+FRESH_WINDOW = 50         # the disable rule looks at the last N samples ...
+FRESH_OLDER_PCT = 80.0    # ... and fires when t212 was older than Yahoo in >= this share
+T212_FRESH_S = 120        # a t212 price older than this is not used as a sell reference
+
+
+def _fresh_doc() -> dict:
+    d = jsonstore.load(PRICE_FRESH_FILE, None)
+    d = d if isinstance(d, dict) else {}
+    s = d.get("samples")
+    return {"disabled": bool(d.get("disabled")), "disabledAt": d.get("disabledAt"),
+            "reason": d.get("reason"),
+            "samples": [x for x in s if isinstance(x, dict)] if isinstance(s, list) else []}
+
+
+def t212_price_enabled() -> bool:
+    """False once the freshness check switched the t212 price source off."""
+    return not _fresh_doc()["disabled"]
+
+
+def reenable_t212_price() -> None:
+    """Owner reset: clears the flag and the samples."""
+    jsonstore.save(PRICE_FRESH_FILE, {"disabled": False, "disabledAt": None,
+                                      "reason": None, "samples": []}, indent=1)
+
+
+def record_price_sample(pid: str, t212: dict, yahoo: dict, now: float | None = None) -> None:
+    """Keep one (t212 price, yahoo price, both asOf) sample (500 newest) and
+    switch the t212 source off when its price was older than Yahoo's in
+    >= 80 % of the last 50 samples. A repeat of the id's last sample is skipped."""
+    doc = _fresh_doc()
+    sample = {"id": pid, "at": int(now if now is not None else time.time()),
+              "t212": t212["price"], "yahoo": yahoo["price"],
+              "t212AsOf": int(t212["asOf"]), "yahooAsOf": int(yahoo["asOf"])}
+    samples = doc["samples"]
+    last = next((s for s in reversed(samples) if s.get("id") == pid), None)
+    if last and last.get("t212AsOf") == sample["t212AsOf"] and last.get("yahooAsOf") == sample["yahooAsOf"]:
+        return
+    samples.append(sample)
+    samples = samples[-FRESH_KEEP:]
+    window = samples[-FRESH_WINDOW:]
+    if not doc["disabled"] and len(window) >= FRESH_WINDOW:
+        older = sum(1 for s in window if _num(s.get("t212AsOf")) is not None
+                    and _num(s.get("yahooAsOf")) is not None and s["t212AsOf"] < s["yahooAsOf"])
+        if older / len(window) * 100.0 >= FRESH_OLDER_PCT:
+            doc["disabled"] = True
+            doc["disabledAt"] = sample["at"]
+            doc["reason"] = (f"t212 price older than yahoo in {older} of the last "
+                             f"{len(window)} samples")
+            log.warning("paper_eval: t212 price source disabled (%s)", doc["reason"])
+    jsonstore.save(PRICE_FRESH_FILE, {"disabled": doc["disabled"], "disabledAt": doc["disabledAt"],
+                                      "reason": doc["reason"], "samples": samples}, indent=1)
+
+
+def price_fresh_status() -> dict:
+    """Status block: flag, sample count, median |t212 vs yahoo| gap (%) and
+    median age (s) of the t212 price when sampled."""
+    doc = _fresh_doc()
+    gaps = [abs((s["t212"] / s["yahoo"] - 1.0) * 100.0) for s in doc["samples"]
+            if _num(s.get("t212")) is not None and _num(s.get("yahoo")) and s["yahoo"] > 0]
+    ages = [s["at"] - s["t212AsOf"] for s in doc["samples"]
+            if _num(s.get("at")) is not None and _num(s.get("t212AsOf")) is not None]
+    return {"enabled": not doc["disabled"], "disabledAt": doc["disabledAt"], "reason": doc["reason"],
+            "samples": len(doc["samples"]),
+            "medianGapPct": _r(statistics.median(gaps), 3) if gaps else None,
+            "medianAgeS": statistics.median(ages) if ages else None}
+
+
+async def held_prices(universe: dict, fresh: bool = False) -> dict:
+    """``{id: {price, asOf, source: "t212"}}`` of the held names the demo broker
+    prices, mapped through the universe's t212 tickers. {} when the source is
+    disabled, the broker has no ``held_quotes``, or the read fails."""
+    if not t212_price_enabled():
+        return {}
+    brk = _broker()
+    fn = getattr(brk, "held_quotes", None) if brk is not None else None
+    if fn is None:
+        return {}
+    try:
+        by_ticker = await fn(fresh=fresh)
+    except Exception as e:
+        log.warning("paper_eval: t212 held quotes failed: %s", type(e).__name__)
+        return {}
+    if not isinstance(by_ticker, dict):
+        return {}
+    out = {}
+    for pid, spec in universe.items():
+        t = by_ticker.get(spec.get("t212")) if isinstance(spec, dict) else None
+        if isinstance(t, dict) and _num(t.get("price")) and _num(t.get("asOf")) is not None:
+            out[pid] = t
+    return out
+
+
+def _overlay_t212(quote: dict | None, t: dict, now: float) -> dict:
+    price, as_of = float(t["price"]), int(t["asOf"])
+    out = dict(quote or {})
+    out.setdefault("prevClose", None)          # keep the listing-quote shape when Yahoo had nothing
+    prev = _num(out.get("prevClose"))
+    out.update({"price": price, "asOf": as_of, "source": "t212",
+                "stale": (now - as_of) > T212_FRESH_S})
+    if prev:
+        out["change"] = price - prev
+        out["changePct"] = (price / prev - 1.0) * 100.0
+    return out
+
+
+async def valuation_quotes(universe: dict, ids=None) -> dict:
+    """``_quote_universe`` for Practice valuation/snapshots: a held name takes
+    the t212 price when it is newer than the Yahoo quote's asOf (or Yahoo has
+    none), else the Yahoo quote; ``source`` is the row's ``priceSource``. Each
+    (t212, yahoo) pair is sampled for the freshness check. Planning and the
+    PM pack keep the plain Yahoo quotes."""
+    quotes = await (_quote_universe(universe, ids) if _open() else _quote_universe(universe))
+    held = await held_prices(universe)
+    if not held:
+        return quotes
+    now = time.time()
+    out = dict(quotes)
+    for pid, t in held.items():
+        if pid not in universe:
+            continue
+        y = quotes.get(pid)
+        y_price, y_as_of = _num((y or {}).get("price")), _num((y or {}).get("asOf"))
+        if y_price is not None and y_price > 0 and y_as_of is not None:
+            try:
+                record_price_sample(pid, t, y, now)
+            except Exception as e:
+                log.warning("paper_eval: price sample failed: %s", type(e).__name__)
+            if int(t["asOf"]) <= y_as_of:
+                continue
+        out[pid] = _overlay_t212(y, t, now)
+    return out
+
+
 def decimals_by_id(universe: dict) -> dict[str, int]:
     """{id: quantity decimals} from the broker's instrument metadata (the
     broker falls back to 2 when it has none)."""
@@ -269,7 +408,7 @@ async def take_snapshot(date: str | None = None, bucket: str = DAILY) -> dict | 
     acct, pos = await _broker_read()
     if acct is None:
         return None
-    quotes = await _quote_universe(cfg["universe"])
+    quotes = await valuation_quotes(cfg["universe"])
     bucket_state = paper_ledger.bucket_from_positions(
         positions=pos, account=acct, universe=cfg["universe"],
         budget_eur=cfg["budgetEur"], prices_by_id=quotes,
@@ -354,7 +493,7 @@ async def portfolio_snapshot(bucket: str = DAILY) -> dict:
     stale = False
     warnings: list[dict] = []
     if acct is not None:
-        quotes, bars = await asyncio.gather(_quote_universe(cfg["universe"]),
+        quotes, bars = await asyncio.gather(valuation_quotes(cfg["universe"]),
                                             _bars_universe(cfg["universe"]))
         bucket_state = paper_ledger.bucket_from_positions(
             positions=pos, account=acct, universe=cfg["universe"],
@@ -585,6 +724,7 @@ def status(bucket: str = DAILY) -> dict:
     from app.api import paper_pm      # lazy: paper_pm imports this module
     out["decision"] = paper_pm.decision_status(bucket=bucket)
     out["buckets"] = {b: _bucket_status(b) for b in paper_buckets.ids()}
+    out["priceFresh"] = price_fresh_status()
     if not is_enabled:
         out["reason"] = ("PAPER_TRADING_ENABLED is not set"
                          if os.getenv("PAPER_TRADING_ENABLED", "0") != "1"

@@ -292,6 +292,17 @@ Point-in-time news for every registry name; the only news the forecast packets r
 - Test seams: `universe_news._now` / `_mono` / `_sleep` / `_get` / `_gdelt_pace` / `_finnhub_news` / `focus_ids` / `_yf_news_blocking` / `_yf_calendar_blocking`, `NEWS_DIR` / `EARNINGS_FILE` / `STATE_FILE`,
   `topnews.GDELT_BACKOFF_FILE`, `event_cards._now` / `CARDS_DIR` / `QUEUE_FILE`, `lane_client.chat` / `can_start`; `reset_state()` in both modules; `forecast_packets._news_rows` / `_earnings_obs`.
 
+## Fresher prices (intraday `i3`, free)
+- **Trading 212 held prices**: `broker_t212.held_quotes()` (positions `currentPrice`, `asOf` = read time) overlays Practice
+  valuation/snapshots when newer than Yahoo (`priceSource: t212`), feeds `livePrice` in the intraday pack and is the SELL
+  reference in `paper_risk` when ≤ 120 s old. Samples vs Yahoo in `data/price_fresh.json`; auto-disables when T212 is older
+  in ≥ 80 % of the last 50 samples (`status.priceFresh`, `paper_eval.reenable_t212_price()`).
+- **US lead**: `live_ws` subscribes Finnhub (free WS, cap 50, watchlist first) to the open universe's US tickers (`us` field
+  in the seed); `live_ws.us_lead(id)` = live US price × EUR/USD vs the delayed Xetra quote, only while XNYS and XETR are
+  both open; intraday pack field `usLead`; `paper_risk` skips a BUY with `us_lead_gap` when |gap| > 1.5 % and the tick is
+  ≤ 120 s old. Never written into a listing series. `GET /api/paper/status` → `liveRefs`.
+- Strategy: intraday moved to `i3` on 2026-10-21 (before any trade); the daily bucket is the control.
+
 ## Data feeds (`data_feeds.py`, `regime_feed.py`, `consensus_log.py`, `regulators.py`)
 Free accuracy feeds from `docs/research/data-sources.md` section 4 (items 2, 4, 6, 7). Gate `DATA_FEEDS_ENABLED` (default: on when `FORECAST_ENABLED=1`; `0` = off), read at `start()`.
 - **Worker** `data_feeds` (in `BACKGROUND_MODULES`, `ops_watch` key `worker-stale:data_feeds`, `interval_s` = `WATCH_INTERVAL_S`): polls every 60 s and runs four isolated steps; cadence markers in `data/data_feeds/state.json`.

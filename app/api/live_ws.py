@@ -57,6 +57,81 @@ STALE_TICK_MAX_AGE = 120
 FEED_PARK_S = 24 * 3600
 _parked: dict[str, tuple[frozenset, int]] = {}
 
+FINNHUB_MAX_SUBS = 50          # free-plan WebSocket symbol limit
+# {wire symbol: id the subscription stores ticks under} (watchlist id wins a shared symbol)
+_wire_owner: dict[str, str] = {}
+
+
+def _fx_rate() -> dict:
+    """Cached USD->EUR (test seam); never fetches."""
+    from app.api import forex
+    return forex.cached_rate()
+
+
+_SESSION_TZ = {"XNYS": "America/New_York", "XETR": "Europe/Berlin"}
+
+
+def _session_open(mic: str, now: float) -> bool:
+    """True while `mic` is inside its regular session at `now` (holidays and
+    early closes from the calendars module)."""
+    from zoneinfo import ZoneInfo
+    from app.api import calendars
+    local = datetime.fromtimestamp(now, ZoneInfo(_SESSION_TZ[mic]))
+    bounds = calendars.session_bounds(mic, local.date())
+    if bounds is None:
+        return False
+    return bounds[0] <= local < bounds[1]
+
+
+def us_lead(pid: str, now: float | None = None) -> dict | None:
+    """The US price of a universe name as a leading REFERENCE for its XETRA
+    listing: {usPrice (USD), eurusd (USD per EUR), impliedEur, xetraDelayedEur,
+    gapPct (implied vs XETRA, %), ageS (of the US tick)}. Only while the US and
+    the XETRA sessions overlap, and only when every input exists and is fresh
+    (US tick, forex rate, XETRA quote); else None. Read-only: nothing here is
+    ever written into a listing series."""
+    return us_lead_explain(pid, now)[0]
+
+
+def us_lead_explain(pid: str, now: float | None = None) -> tuple[dict | None, str]:
+    """(lead or None, reason): ``ok`` or the first input that is missing
+    (no_us_symbol | sessions_closed | no_tick | fx | xetra_quote | xetra_price)."""
+    from app.api import paper_universe
+    now = time.time() if now is None else float(now)
+    sym = paper_universe.us_symbol(pid)
+    if not sym:
+        return None, "no_us_symbol"
+    if not (_session_open("XNYS", now) and _session_open("XETR", now)):
+        return None, "sessions_closed"
+    key = str(pid).strip().upper()
+    tick = live_prices.get(key) or live_prices.get(_wire_owner.get(sym.upper(), ""))
+    if not tick:
+        return None, "no_tick"
+    fx = _fx_rate() or {}
+    rate = fx.get("rate")
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or fx.get("stale") \
+            or not math.isfinite(rate) or rate <= 0:
+        return None, "fx"
+    quote = paper_universe.cached_quote(key)
+    as_of = quote.get("asOf") if quote else None
+    if not quote or quote.get("stale") or not isinstance(as_of, (int, float)) \
+            or now - as_of > prices_mod.STALE_OPEN_S:        # the delayed listing must itself be current
+        return None, "xetra_quote"
+    xetra = quote.get("price")
+    if not isinstance(xetra, (int, float)) or isinstance(xetra, bool) \
+            or not math.isfinite(xetra) or xetra <= 0:
+        return None, "xetra_price"
+    us_price = float(tick["price"])
+    implied = us_price * float(rate)
+    return {
+        "usPrice": round(us_price, 4),
+        "eurusd": round(1.0 / float(rate), 5),
+        "impliedEur": round(implied, 4),
+        "xetraDelayedEur": round(float(xetra), 4),
+        "gapPct": round((implied / float(xetra) - 1.0) * 100.0, 3),
+        "ageS": max(0, int(now - int(tick["ts"]))),
+    }, "ok"
+
 
 def _current_ts() -> int:
     return int(time.time())
@@ -353,6 +428,42 @@ def _desired(provider: str) -> dict[str, str]:
     return out
 
 
+def _universe_source() -> str:
+    """``paperTrading.universeSource`` (test seam); anything unreadable -> watchlist."""
+    try:
+        from app.api import paper_buckets
+        return paper_buckets.universe_source()
+    except Exception:
+        return "watchlist"
+
+
+def _universe_us_wires() -> dict[str, str]:
+    """{US wire symbol: paper_universe id} of the open universe's US names
+    (Trading 212-mapped, i.e. investable, names first); {} unless the open
+    universe is the source."""
+    from app.api import paper_buckets, paper_universe
+    if _universe_source() != paper_buckets.PAPER_UNIVERSE:
+        return {}
+    rows = [r for r in paper_universe.entries() if r.get("role") == "candidate" and r.get("us")]
+    rows.sort(key=lambda r: not r.get("t212"))        # stable: mapped first, file order inside
+    return {r["us"].upper(): r["id"] for r in rows}
+
+
+def _desired_finnhub() -> dict[str, str]:
+    """Finnhub subscriptions: the watchlist's symbols first, then the open
+    universe's US symbols, never more than FINNHUB_MAX_SUBS in total (free plan)."""
+    out = dict(list(_desired("finnhub").items())[:FINNHUB_MAX_SUBS])
+    for wire, pid in _universe_us_wires().items():
+        if len(out) >= FINNHUB_MAX_SUBS:
+            break
+        out.setdefault(wire, pid)
+    return out
+
+
+def _feed_desired(provider: str) -> dict[str, str]:
+    return _desired_finnhub() if provider == "finnhub" else _desired(provider)
+
+
 async def _cancel(task: asyncio.Task | None):
     if task is None or task.done():
         return
@@ -381,7 +492,7 @@ async def _sync_feeds_once():
         ("twelvedata", TWELVE_DATA_API_KEY, _twelvedata_ws_loop),
         ("finnhub", FINNHUB_API_KEY, _finnhub_ws_loop),
     ):
-        desired = _desired(provider) if key else {}
+        desired = _feed_desired(provider) if key else {}
         sig = frozenset(desired.items())
         cur = _feed_tasks.get(provider)
         if cur and cur[0] == sig and not cur[1].done():
@@ -396,7 +507,9 @@ async def _sync_feeds_once():
         if cur and cur[0] != sig:
             log.info("%s symbol set changed -> %s", provider, sorted(desired))
         _feed_tasks[provider] = (sig, asyncio.create_task(loop_fn(desired)))
-    wanted = {i for p in ("twelvedata", "finnhub") for i in _desired(p).values()}
+    wanted = {i for p in ("twelvedata", "finnhub") for i in _feed_desired(p).values()}
+    _wire_owner.clear()
+    _wire_owner.update(_feed_desired("finnhub"))
     for ticker in list(live_prices):
         if ticker not in wanted:
             live_prices.pop(ticker, None)

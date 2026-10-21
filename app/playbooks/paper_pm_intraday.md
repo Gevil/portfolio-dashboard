@@ -28,6 +28,10 @@ Everything the daily PM sees (`holdings`, top-15 `candidates` by the pool's 20-d
 `stale` and the quote's `asOf`; and `intradayBars` from today's 5-minute bars (closes only): `sinceOpenPct`,
 `last60MinPct`, `fromHighPct`, `fromLowPct`, `sigmaBarPct` (5-minute volatility), `barCount` — each `MISSING` when
 there are too few bars. `feedback` lists the last slot decisions and the excess return over EUNL since each.
+Two fresher reference prices may appear: `livePrice` (held names only: the broker's own current price, with
+`gapPctVsDelayed` against the delayed quote) and `usLead` (US companies, only while New York and Xetra are both open:
+the live US price converted to EUR, with `gapPct` against the delayed Xetra quote). They are **references**, not the
+traded price; a large gap means the delayed quote is out of date, not that there is an opportunity.
 
 ## Evidence discipline (non-negotiable)
 

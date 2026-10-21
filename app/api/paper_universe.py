@@ -66,6 +66,18 @@ def _now() -> float:
 
 # ------------------------------------------------------------------ loading
 
+_US_SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,6}(\.[A-Z])?$")
+
+
+def _clean_us(value, isin) -> str | None:
+    """The US listing symbol of a row, only for a US ISIN (``US`` prefix) and a
+    plausible ticker (``BRK.B`` style class suffix allowed); else None."""
+    if not isinstance(value, str) or not isinstance(isin, str) or not isin.startswith("US"):
+        return None
+    sym = value.strip().upper()
+    return sym if _US_SYMBOL_RE.match(sym) else None
+
+
 def _clean_row(raw) -> dict | None:
     """A validated copy of one row, or None when it cannot be used."""
     if not isinstance(raw, dict):
@@ -92,6 +104,11 @@ def _clean_row(raw) -> dict | None:
         "isin": (raw.get("isin") or "").strip().upper() if isinstance(raw.get("isin"), str) else None,
         "t212": t212.strip() if t212 else None,
     })
+    us = _clean_us(raw.get("us"), row["isin"])
+    if us:
+        row["us"] = us
+    else:
+        row.pop("us", None)
     return row
 
 
@@ -143,6 +160,11 @@ def _load_doc() -> dict:
             doc = {"entries": []}
     elif seed is not None:
         have = {r["id"] for r in doc["entries"]}
+        seed_us = {r["id"]: r for r in seed["entries"] if r.get("us")}
+        for r in doc["entries"]:        # a store row written before `us` existed learns it from the seed
+            s = seed_us.get(r["id"])
+            if s is not None and not r.get("us") and s.get("isin") == r.get("isin"):
+                r["us"] = s["us"]
         extra = [r for r in seed["entries"] if r["id"] not in have]
         if extra:
             doc = {**doc, "entries": [*doc["entries"], *extra]}
@@ -175,6 +197,28 @@ def t212_ticker(pid: str) -> str | None:
     """The mapped Trading 212 ticker, None when unmapped or unknown."""
     row = get(pid)
     return row["t212"] if row else None
+
+
+def us_symbol(pid: str) -> str | None:
+    """The US (NASDAQ/NYSE) ticker of a row, None for non-US names / unknown ids."""
+    row = get(pid)
+    return row.get("us") if row else None
+
+
+def us_symbols() -> dict[str, str]:
+    """{id: US ticker} of the candidate rows that have one, file order."""
+    return {r["id"]: r["us"] for r in _load_doc()["entries"]
+            if r.get("role") == "candidate" and r.get("us")}
+
+
+def cached_quote(pid: str) -> dict | None:
+    """The cached EUR listing quote (no fetch), None when none is cached.
+    Carries ``stale`` like ``listing_quote``."""
+    key = (pid or "").strip().upper() if isinstance(pid, str) else ""
+    cached = _quote_cache.get(key)
+    if not cached:
+        return None
+    return {**cached[0], "stale": _now() - cached[0]["asOf"] > QUOTE_STALE_S}
 
 
 # ------------------------------------------------------------------ prices

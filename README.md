@@ -126,11 +126,20 @@ Feature gates / tuning (defaults in code; `=1` enables):
 | `KB_SYNC_ENABLED` | off | upload reports to the Open WebUI knowledge base |
 | `FILINGS_ENABLED`, `FUNDAMENTALS_ENABLED`, `MARKET_LIGHT_ENABLED`, `OPS_WATCH_ENABLED` | on | other workers |
 | `POLICY_WATCH_ENABLED` | on | daily policy worker (drift bands, single-stock cap, monthly trend flips; pushes at priority 3) |
+| `PAPER_TRADING_ENABLED` | off | paper-trading worker + Practice context (needs `T212_DEMO_KEY` / `T212_DEMO_SECRET`); plan: [`docs/plans/paper-trading.md`](docs/plans/paper-trading.md) |
+| `TRADING_TURN_CAP` | `3` | LLM turns per day for the paper PM (purpose `trading`: 1 decision + 1 repair + 1 spare) |
+| `UNIVERSE_NEWS_ENABLED` | on when `FORECAST_ENABLED=1` | universe news collector (`app/api/universe_news.py`): free sources (yfinance, Google News RSS, GDELT, Finnhub for US names, topnews cache) for every registry name, stored point-in-time in `data/universe_news/<YYYY-MM>.jsonl` (+ daily earnings dates in `earnings.jsonl`); feeds the forecast packets and `GET /api/paper/news?book=practice&id=&limit=`. `0` switches it off |
+| `EVENT_CARDS_ENABLED` | `1` (needs the news worker) | log-only event cards for new items of held + top-30 names (`app/api/event_cards.py`, local lane, purpose `events`) in `data/event_cards/<YYYY-MM>.jsonl`; not used by any forecast. `0` switches them off |
+| `EVENTS_TURN_CAP` | `2000` | LLM turns per day for the event cards (purpose `events`); its own allowance outside the 30-turn total, like `FORECAST_TURN_CAP` / `INTRADAY_TURN_CAP` |
+| `CLAUDE_ENABLED` | off | `=1` lets the forecaster call Claude (Opus/Sonnet) through the Claude Code CLI on the owner's subscription (`app/api/claude_client.py`); needs `CLAUDE_CODE_OAUTH_TOKEN` |
+| `CLAUDE_CAP_5H` / `CLAUDE_CAP_DAY` | `20` / `40` | local call caps over a rolling 5 h / 24 h window (persisted in `data/claude_usage.json`); a usage-limit answer of the CLI also blocks calls until its window ends |
+| `CLAUDE_CODE_OAUTH_TOKEN` | unset | long-lived subscription token from `claude setup-token`, set in `env.secrets` (name only here, never the value); `ANTHROPIC_API_KEY` is deliberately never passed to the CLI |
+| `paperTrading.costModel` (config key, not env) | `{spreadBps: 10, commissionEur: 0, fxBps: 0}` | cost model of the Practice evaluation: a fill costs `value x (spreadBps/2 + fxBps)/1e4 + commissionEur`; limits `spreadBps`/`fxBps` <= 500, `commissionEur` <= 50, unknown keys rejected |
 | `LANE_PREFERENCE` | `ninfer-nvfp4,exllama` | lane order |
 | `AUTONOMOUS_TURN_BUDGET` / `DIGEST_TURN_RESERVE` / `TRIAGE_TURN_CAP` | 30 / 16 / 10 | LLM turns per day |
 | `NOTIFY_MIN_SEVERITY`, `PRICE_ALERT_INTERVAL_S`, `NEWS_ALERTS_INTERVAL`, `EDGAR_POLL_INTERVAL` | see code | alert cadence |
 | `NOTIFY_QUIET_HOURS` | `22-7` | container-local window in which pushes are queued until it ends; `off` disables. Bypass: priority 5 from `price` or `policy`, and approval pushes |
-| `NOTIFY_SOURCE_CAPS` | `ops_watch=3,ops=3,triage=6,news=6,analysis=4,price=8,insider=6,policy=3,market_light=2` | pushes per source per rolling 24 h (persisted in `data/notify_caps.json`); over the cap nothing is pushed but the alert row is still stored. Approval pushes are never capped |
+| `NOTIFY_SOURCE_CAPS` | `ops_watch=3,ops=3,triage=6,news=6,analysis=4,price=8,insider=6,policy=3,market_light=2,paper=4` | pushes per source per rolling 24 h (persisted in `data/notify_caps.json`); over the cap nothing is pushed but the alert row is still stored. Approval pushes are never capped |
 | `NTFY_TOPIC_OPS` | `<NTFY_TOPIC>-ops` (`stocks-ops`) | topic for infrastructure sources `ops_watch` and `ops` (priority capped at 3). **Subscribe the phone to `stocks-ops` if you want infra alerts**; they no longer arrive on the main topic |
 | `DASHBOARD_PUBLIC_URL`, `NTFY_CLICK_URL` | unset | base URL for the per-alert deep link `<base>#alerts/<id>` and the approval buttons (`DASHBOARD_PUBLIC_URL` wins) |
 | `OPS_WATCH_REALERT_S` | `86400` | re-alert interval of a persisting ops finding (priority 3) |
@@ -184,6 +193,9 @@ Frontend rules: strict CSP (no inline script/style), markdown only through `rend
 `/api/jobs`, `/api/digest/run`, `/api/advice`, `/api/scoreboard`, `/api/evidence/{id}`, `/api/report/{id}`,
 `/api/chat`, `/api/lane-status`, `/api/models` · `/api/market-light`, `/api/macro`, `/api/earnings`,
 `/api/insider`, `/api/top-news`, `/api/alerts-news` · `/api/background`, `/api/worker-runs`, `/api/triage`.
+
+**Practice context** (paper trading): `/api/portfolio`, `/history` and `/performance` accept `?book=practice` (same shapes plus
+`book`, `capabilities`, `banner`, `bucket`, `baselines`; `/performance` also carries `metrics` for the current strategy version and `versions`: excess vs buy & hold gross/net with a 95 % bootstrap CI and verdict, drawdown, tracking error, information ratio, turnover, cost drag); `/risk` and `/attribution` answer 400 for it; `/api/paper/status`, `/orders`, `/decisions`, `GET /api/paper/grading?book=practice` (decision quality at 5 / 20 sessions; any other book -> 400), `POST /api/paper/season|rebalance|seed|mode|halt|resume|decide`.
 
 Behaviour worth knowing:
 - **Calendars.** `app/api/calendars.py` wraps `exchange_calendars` (XAMS, XETR, XNYS, XNAS, XPAR, XBRU, XMIL). Holidays and early closes are modelled (e.g. Amsterdam 24 Dec closes early); `.DE` listings map to XETR, indices to XNYS. Outside the library's date range it falls back to Mon-Fri with a single warning. The digest runs on trading days only: a slot where no analysable holding's venue has a session is recorded as `deferred: no session today`.

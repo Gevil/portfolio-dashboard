@@ -43,7 +43,7 @@ under that id when accepted. `notify.policy_status()` (also merged into `status(
   falls back to the default). In the window a push is queued in the durable outbox with `not_before` = the window end and
   returns `Delivery(QUEUED, "quiet hours")` (a consumed outcome). **Bypass:** priority 5 from source `price` or `policy`,
   and any push with approval `actions`.
-- **Per-source caps** `NOTIFY_SOURCE_CAPS` (default `ops_watch=3,ops=3,triage=6,news=6,analysis=4,price=8,insider=6,policy=3,market_light=2`
+- **Per-source caps** `NOTIFY_SOURCE_CAPS` (default `ops_watch=3,ops=3,triage=6,news=6,analysis=4,price=8,insider=6,policy=3,market_light=2,paper=4`
   per rolling 24 h, persisted in `data/notify_caps.json`). Over the cap: no ntfy push, the `alert()` row is still stored,
   the call returns `Delivery(FILTERED, "cap")`. Approval pushes are never capped. A new source needs an entry or it is uncapped.
 - **Ops topic**: sources `ops_watch` and `ops` publish to `NTFY_TOPIC_OPS` (default `<NTFY_TOPIC>-ops`, i.e. `stocks-ops`) with

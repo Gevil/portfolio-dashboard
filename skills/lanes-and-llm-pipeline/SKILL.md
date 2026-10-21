@@ -27,17 +27,27 @@ mount — `lanes-enrich.json` is replaced by rename every ~45 s). A lane is usab
 ```python
 res = await lane_client.chat(messages, max_tokens=..., json_mode=True,
                              enable_thinking=False,        # machine-consumed stages: no hidden reasoning
-                             autonomous=True, purpose="digest")  # purpose in PURPOSES = digest|triage|approval|other
+                             autonomous=True, purpose="digest")  # purpose in PURPOSES = digest|triage|trading|approval|other
 # -> {content, finish_reason, lane, model, usage} or {"error": "lane_down"|"model_missing"|"budget"|"timeout"|"http"}
 ```
 Errors are **envelopes, never exceptions** — workers defer instead of fabricating output. User-initiated
 chat is `autonomous=False` (no budget charge).
 
 ## Daily autonomous budget
-`AUTONOMOUS_TURN_BUDGET=30`, `DIGEST_TURN_RESERVE=16`, `TRIAGE_TURN_CAP=10` (env; remainder for approvals/other).
+`AUTONOMOUS_TURN_BUDGET=30`, `DIGEST_TURN_RESERVE=16`, `TRIAGE_TURN_CAP=10`, `TRADING_TURN_CAP=3` (env; the remainder, 30 - 16 - 10 - 3 = 1 by
+default, is for approvals/other). `trading` is the paper PM (`app/api/paper_pm.py`): 1 decision + 1 repair + 1 spare, reserved with
+`can_start("trading", 2)` before the run. Allowances are clamped in order digest -> triage -> trading, so `other` is never negative
+(`TRADING_TURN_CAP` larger than what is left after digest and triage is cut down to it); like triage, trading may never eat into the digest reserve.
+`budget_state()` / `GET /api/lane-status` show `trading_cap` and `purposes.trading {used, allowance, left}`.
 State in `data/lane_budget.json`. Reserve **before** starting a job: `lane_client.can_start(purpose, JOB_TURNS[mode])`;
 check-and-charge is atomic; turns are refunded on lane-down/timeout/5xx. `budget_state(purpose)` → `{day, used, cap, left, ...}`
 (also in `/api/lane-status`). Never add a code path that calls the lane autonomously without a purpose.
+**Separate allowances (outside the 30-turn total):** `forecast` (`FORECAST_TURN_CAP`, default 1000; the paper
+forecaster pool, `app/api/forecasts.py`), `intraday` (`INTRADAY_TURN_CAP`, default 200; the intraday paper PM) and
+`events` (`EVENTS_TURN_CAP`, default 2000; news event cards, `app/api/event_cards.py`, logged only). They
+never count against `used`, never touch the digest reserve, and refunds do not touch the shared total. When no lane is
+healthy before a deadline, these jobs fall back to the Claude subscription (`app/api/claude_client.py`, gated by
+`CLAUDE_ENABLED` + `CLAUDE_CODE_OAUTH_TOKEN`, local caps `CLAUDE_CAP_5H`/`CLAUDE_CAP_DAY`); every row is tagged by source.
 
 ## Spine, digest, jobs
 - `ta_pipeline`: stages analyst → research manager → trader → risk → PM; quick/standard/deep run different
@@ -86,6 +96,9 @@ check-and-charge is atomic; turns are refunded on lane-down/timeout/5xx. `budget
   sits beside the real cells; `0 graded` is surfaced loudly.
 - `reports.py`: ids are opaque `TICKER@<stem>`; only `full_states_log_*.json` under `results/<TICKER>/` is
   served, jail via `os.path.commonpath` (no absolute paths, `..`, symlinks, sibling-prefix dirs).
+- `paper_pm.py` (+ `playbooks/paper_pm.md`): the paper-trading PM, one JSON decision per XETR session day on `purpose="trading"`, reusing
+  `ta_pipeline._extract_json` and the digest's `decision_v2` advice rows as inputs (it never reruns the per-ticker analysis). Pack, gates,
+  validation and failure semantics: `skills/paper-trading`.
 
 ## Prompt safety (non-negotiable)
 Every playbook (`app/playbooks/*.md`) contains the clause that evidence-pack text (headlines, filings,

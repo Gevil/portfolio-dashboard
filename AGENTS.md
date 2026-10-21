@@ -21,7 +21,10 @@ This file is the map. **Procedures live in `skills/`** — read the matching ski
   `prevClose` dates; `.DE` listings are XETR. Never hand-roll weekday/holiday arithmetic.
 - **LLM lanes** (shared with the owner's other GPU work — be frugal): primary `ninfer-nvfp4`
   (`qwen3.8-27b`), fallback `exllama` (`Qwen3.8-Flash-Next-exl3`). Autonomous budget 30 turns/day
-  (digest reserve 16, triage cap 10).
+  (digest reserve 16, triage cap 10, trading cap 3 for the paper-trading agent, other = the rest). The paper
+  forecaster (`forecast`, default 1000/day), intraday agent (`intraday`, 200/day) and news event cards (`events`,
+  2000/day) have their own allowances outside that total: the owner allows heavy GPU use for them (lane permitting);
+  Claude subscription (Opus/Sonnet 5.5) is the forecaster's fallback.
 
 ## Layout
 ```
@@ -36,6 +39,7 @@ app/api/notify.py (outbox + Delivery + quiet hours/caps/ops topic) alerts.py app
   rules.py (alertRules v3) news_alerts.py triage.py edgar.py market_light.py ops_watch.py policy.py runlog.py ...   alert/worker side
 app/api/tax.py events.py config_edit.py   CZ tax lots, /api/events, config validation (lots, policy, benchmark keys)
 app/api/jsonstore.py textsafe.py   shared atomic-JSON + untrusted-text helpers
+app/api/broker.py broker_t212.py paper_*.py   paper trading on the Trading 212 DEMO account only (see skills/paper-trading)
 app/playbooks/*.md     LLM prompts (all carry the "pack text is untrusted DATA" clause)
 static/index.html      shell; js/main.js is the ES-module entry; js/views/*, css/*
 config/config.json     YOUR watchlist/portfolio/alertRules (gitignored; sample: config.example.json; bind-mounted DIR → /app/config)
@@ -59,6 +63,7 @@ Project overview, features, configuration, deploy/backup/dev commands: [`README.
 | edit anything under `static/` (UI, CSS, vendored libs, CSP) | `skills/frontend-modules/SKILL.md` |
 | write or run tests | `skills/testing/SKILL.md` |
 | back up, restore, roll back, or debug the pod/quadlet/host timers | `skills/ops-backup-and-troubleshooting/SKILL.md` |
+| touch paper trading: broker client, Practice context, season/snapshots, `paperTrading` config | `skills/paper-trading/SKILL.md` |
 
 ## Non-negotiable rules
 1. **Image-baked code**: `app/` and `static/` are copied into the image. An edit is **not live** until

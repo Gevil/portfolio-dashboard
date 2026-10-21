@@ -5,6 +5,7 @@ import { api } from './api.js';
 import { ui, usePolling, renderState, toast } from './ui.js';
 import { markdown } from './markdown.js';
 import * as data from './data.js';
+import { initBook, setBook, readHashBook } from './book.js';
 import { initStatusBar } from './statusbar.js';
 import { mountOverview } from './views/overview.js';
 import { trackVisit } from './views/_since.js';
@@ -78,15 +79,44 @@ async function mountSecondary(view) {
   await load();
 }
 
+function titleFor(view) {
+  const prefix = get('book') === 'practice' ? '[Practice] ' : '';
+  return `${prefix}${TITLES[view]} \u00b7 Portfolio Watch`;
+}
+
 async function applyView(view) {
   const prev = get('view');
   if (prev === view && (view === 'overview' || secondary)) return;
   await unmountSecondary();
   for (const v of VIEWS) sections[v].hidden = v !== view;
   set('view', view);
-  document.title = `${TITLES[view]} \u00b7 Portfolio Watch`;
+  document.title = titleFor(view);
   if (view !== 'overview') await mountSecondary(view);
 }
+
+// Switching books never changes the trading mode (plan §4.3); it only resets the resource slots
+// fed by /api/portfolio* so the previous book's data is never shown under the new label, then
+// refetches. Each loader's own latestRequest() aborts any in-flight request for the old book.
+function switchBook(next) {
+  if (next === get('book')) return;
+  setBook(next);
+  set('portfolio', undefined);
+  set('risk', undefined);
+  data.refreshPortfolio();
+  data.refreshRisk();
+  data.refreshPaperStatus();
+}
+subscribe('book', () => { const v = get('view'); if (v) document.title = titleFor(v); });
+// Practice bucket switch (Daily | Intraday): drop the old bucket's figures and reload; every loader is
+// "latest wins", so the old bucket's in-flight requests are aborted/discarded.
+subscribe('bucket', (b, prev) => {
+  if (prev === undefined || b === prev) return;   // boot (initBook) is not a switch
+  if (get('book') !== 'practice') return;
+  set('portfolio', undefined);
+  set('paperStatus', undefined);
+  data.refreshPortfolio();
+  data.refreshPaperStatus();
+});
 
 // ------------------------------------------------------------------ routes (C10)
 //   #overview | #digest | #market | #aiops      views
@@ -131,7 +161,11 @@ function goHash(hash) {
 }
 const goView = goHash;
 
-window.addEventListener('hashchange', () => applyRoute(parseRoute()));
+window.addEventListener('hashchange', () => {
+  const hb = readHashBook(); // a same-page #book= link switches the context too
+  if (hb && hb !== 'live') switchBook(hb);
+  applyRoute(parseRoute());
+});
 
 subscribe('selectedId', id => {
   if (routing) return;
@@ -191,12 +225,14 @@ function openAlerts(focusId) {
   return lazyCall('./views/alertcenter.js', 'openAlertCenter', 'Alert center', { focusId: focusId || null });
 }
 
+initBook(); // store 'book' from localStorage/#book= deep link (data-book attr already set pre-paint)
 initStatusBar({
   onView: goView,
   onSettings: () => lazyCall('./views/settings.js', 'openSettings', 'Settings'),
   onAlerts: () => goHash('alerts'),
   onChat: async () => { const c = await ensureChat(); if (c) c.toggle(); },
   onLane: () => goView('aiops'),
+  onBook: switchBook,
 });
 
 // ------------------------------------------------------------------ data
@@ -216,6 +252,7 @@ usePolling(data.refreshPolicy, 300000);
 usePolling(data.refreshEvents, 300000);
 usePolling(data.refreshAlertRules, 300000);
 usePolling(data.refreshRisk, 600000);
+usePolling(data.refreshPaperStatus, 60000);
 
 // Live price events re-derive the portfolio server-side; throttle so a burst of ticks costs one request.
 let lastTickSeen = 0;

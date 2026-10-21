@@ -1,7 +1,9 @@
 // Status bar behaviour: quote-age chip (oldest held quote), SSE liveness dot, EU/US session pills,
-// alerts bell + unread badge, neutral lane dot, chat/settings buttons, view tabs.
+// alerts bell + unread badge, neutral lane dot, chat/settings buttons, view tabs, account-context
+// switch (Real | Practice) + the book banner shown while not in Real (plan §4.3 / contract §6).
 import { slot, subscribe, get } from './store.js';
-import { fmtTime24, fmtDateTime24, ageSeconds, isNum, toDate } from './util.js';
+import { el, fmtTime24, fmtDateTime24, ageSeconds, isNum, toDate } from './util.js';
+import { getBook, getBucket, BUCKET_LABEL } from './book.js';
 
 const SESSIONS = {
   eu: { tz: 'Europe/Amsterdam', open: [9, 0], close: [17, 30] },
@@ -144,6 +146,54 @@ function paintLane() {
   btn.setAttribute('aria-label', text + ' \u2013 open AI Ops');
 }
 
+const BOOK_LABEL = { real: 'Real', practice: 'Practice', live: 'Live bucket' };
+const BANNER_FALLBACK = {
+  practice: 'PRACTICE \u2013 simulated money \u00b7 Trading 212 demo',
+  live: 'LIVE BUCKET \u2013 real money',
+};
+
+function paintBookSwitch() {
+  const cur = getBook();
+  document.querySelectorAll('#book-switch .book-btn').forEach(b => {
+    b.setAttribute('aria-pressed', b.dataset.book === cur ? 'true' : 'false');
+  });
+}
+
+/** The Live option only exists once the server reports liveAvailable (Phase 5; never true in Phase 1). */
+function ensureLiveButton(available) {
+  const seg = document.getElementById('book-switch');
+  if (!seg) return;
+  let btn = seg.querySelector('.book-btn[data-book="live"]');
+  if (available && !btn) {
+    btn = el('button', { type: 'button', class: 'book-btn', dataset: { book: 'live' }, 'aria-pressed': 'false', text: BOOK_LABEL.live });
+    seg.append(btn);
+  } else if (!available && btn) {
+    btn.remove();
+  }
+}
+
+/** Full-width, non-dismissible bar under the status bar on every tab while book != 'real'. */
+function paintBanner() {
+  const node = document.getElementById('book-banner');
+  const text = document.getElementById('book-banner-text');
+  const book = getBook();
+  if (book === 'real') { node.hidden = true; return; }
+  const s = slot('paperStatus');
+  const serverText = s.data && s.data.banner && s.data.banner.text;
+  let line = serverText || BANNER_FALLBACK[book] || `${BOOK_LABEL[book] || book} context active`;
+  if (book === 'practice') {
+    // The banner always names the selected bucket (the server text only does for intraday) and its mode.
+    const bucket = getBucket();
+    const bs = s.data && s.data.buckets && s.data.buckets[bucket];
+    const mode = bs && bs.mode ? bs.mode : null;
+    if (!line.toLowerCase().includes(bucket)) line += ` \u00b7 ${BUCKET_LABEL[bucket]} bucket`;
+    if (!serverText && mode) line += ` \u00b7 ${mode}`;
+  }
+  text.textContent = line;
+  node.classList.toggle('is-live', book === 'live');
+  node.hidden = false;
+}
+
 function paintTabs(view) {
   document.querySelectorAll('#tabs .tab').forEach(b => {
     if (b.dataset.view === view) b.setAttribute('aria-current', 'page');
@@ -151,13 +201,15 @@ function paintTabs(view) {
   });
 }
 
-/** handlers: {onView(view), onSettings(), onAlerts(), onChat(), onLane()} -> dispose() */
+/** handlers: {onView(view), onSettings(), onAlerts(), onChat(), onLane(), onBook(book)} -> dispose() */
 export function initStatusBar(handlers) {
   const unsub = [];
   const repaint = () => { paintDataChip(); paintSessions(); };
   unsub.push(subscribe('portfolio', paintDataChip), subscribe('prices', paintDataChip), subscribe('sse', () => { paintSse(); paintDataChip(); }));
   unsub.push(subscribe('alerts', paintBell), subscribe('lane', paintLane));
   unsub.push(subscribe('view', paintTabs));
+  unsub.push(subscribe('book', () => { paintBookSwitch(); paintBanner(); }), subscribe('bucket', paintBanner));
+  unsub.push(subscribe('paperStatus', s => { ensureLiveButton(!!(s && s.data && s.data.liveAvailable)); paintBanner(); }));
   unsub.push(subscribe('chatOpen', open => {
     document.getElementById('btn-chat').setAttribute('aria-expanded', open ? 'true' : 'false');
   }));
@@ -166,11 +218,15 @@ export function initStatusBar(handlers) {
     const b = e.target.closest('.tab');
     if (b) handlers.onView(b.dataset.view);
   });
+  document.getElementById('book-switch').addEventListener('click', e => {
+    const b = e.target.closest('.book-btn');
+    if (b && handlers.onBook) handlers.onBook(b.dataset.book);
+  });
   document.getElementById('btn-settings').addEventListener('click', () => handlers.onSettings());
   document.getElementById('btn-alerts').addEventListener('click', () => handlers.onAlerts());
   document.getElementById('btn-chat').addEventListener('click', () => handlers.onChat());
   document.getElementById('btn-lane').addEventListener('click', () => handlers.onLane());
-  repaint(); paintSse(); paintBell(); paintLane(); paintTabs(get('view'));
+  repaint(); paintSse(); paintBell(); paintLane(); paintTabs(get('view')); paintBookSwitch(); paintBanner();
   const timer = setInterval(() => { if (!document.hidden) repaint(); }, 15000);
   const onVis = () => { if (!document.hidden) repaint(); };
   document.addEventListener('visibilitychange', onVis);

@@ -18,6 +18,7 @@ import {
 import { configPositionOf, entryOf, labelOf, positionOf, priceItemOf, refreshPortfolio } from '../data.js';
 import { createPriceChart } from '../charts.js';
 import { daysFromToday, shortDate } from './_common.js';
+import { capsOf, subscribeBook } from '../book.js';
 
 // ------------------------------------------------------------------ constants
 
@@ -1285,7 +1286,7 @@ export function mountDetail(root, { onClose } = {}) {
     if (isNum(a.p20)) facts.push(el('span', { class: 'num', text: `p(beat ${bench} in 20d) ${Math.round(a.p20 * 100)}%` }));
     if (isNum(a.expExcess20Pct)) facts.push(el('span', { class: 'num', text: `expected excess ${fmtPct(a.expExcess20Pct)} (20d)` }));
     if (a.trigger) facts.push(chip(`trigger: ${a.trigger}`, 'chip-info'));
-    if (a.taxTag) facts.push(chip(String(a.taxTag), '', 'Tax note'));
+    if (a.taxTag && capsOf().tax) facts.push(chip(String(a.taxTag), '', 'Tax note'));
     dom.advice.append(head);
     if (facts.length) dom.advice.append(el('div', { class: 'dt-advice-facts' }, facts));
     dom.advice.hidden = false;
@@ -1307,6 +1308,7 @@ export function mountDetail(root, { onClose } = {}) {
   async function loadAttribution() {
     const s = S;
     if (!s) return;
+    if (!capsOf().attribution) { s.attrBlocked = true; return; } // capabilities.attribution === false (Practice)
     const range = prefs.attrRange;
     const t = lr.attr.begin();
     if (!s.attr || s.attr.range !== range) {
@@ -1355,12 +1357,12 @@ export function mountDetail(root, { onClose } = {}) {
 
   function lotsOf(id) {
     const c = configPositionOf(id);
-    return c && Array.isArray(c.lots) ? c.lots : [];
+    return capsOf().lots && c && Array.isArray(c.lots) ? c.lots : []; // capabilities.lots === false hides the lots card
   }
 
   async function loadTax() {
     const s = S;
-    if (!s || !lotsOf(s.id).length) return;
+    if (!s || !capsOf().tax || !lotsOf(s.id).length) return; // capabilities.tax === false: no /api/tax call
     const t = lr.tax.begin();
     const res = await apiGet('/api/tax', { signal: t.signal });
     if (s !== S || destroyed || !t.current() || res.aborted) return;
@@ -1379,7 +1381,7 @@ export function mountDetail(root, { onClose } = {}) {
 
   function ensureTax() {
     const s = S;
-    if (!s || s.taxAsked || !lotsOf(s.id).length) return;
+    if (!s || s.taxAsked || !capsOf().tax || !lotsOf(s.id).length) return;
     s.taxAsked = true;
     loadTax();
   }
@@ -1392,6 +1394,7 @@ export function mountDetail(root, { onClose } = {}) {
     if (!lots.length) return;
     const taxRows = s.tax && Array.isArray(s.tax.lots) ? s.tax.lots.filter(r => r.id === s.id) : [];
     const used = new Set();
+    const showTax = capsOf().tax; // capabilities.tax === false: lots without age / unlock / tax columns
     const body = el('tbody');
     for (const l of [...lots].sort((a, b) => String(a.date).localeCompare(String(b.date)))) {
       const sell = l.side === 'sell';
@@ -1407,13 +1410,15 @@ export function mountDetail(root, { onClose } = {}) {
         el('td', { text: sell ? 'sell' : 'buy' }),
         el('td', { class: 'num' }, fmtShares(Number(l.shares)), left != null ? el('span', { class: 'muted dt-lot-left', text: ` (${fmtShares(left)} left)` }) : null),
         el('td', { class: 'num', text: fmtEur(Number(l.priceEur)) }),
-        el('td', { class: 'num', text: sell || age == null ? '\u2013' : String(age) }),
-        el('td', { class: 'num', text: t && t.unlockDate ? String(t.unlockDate) : '\u2013' }),
-        el('td', null, t ? (t.exempt ? chip('exempt', 'chip-ok', 'Held past the time test: sale is exempt') : chip('taxable', '', 'Still inside the time test')) : '\u2013')));
+        ...(showTax ? [
+          el('td', { class: 'num', text: sell || age == null ? '\u2013' : String(age) }),
+          el('td', { class: 'num', text: t && t.unlockDate ? String(t.unlockDate) : '\u2013' }),
+          el('td', null, t ? (t.exempt ? chip('exempt', 'chip-ok', 'Held past the time test: sale is exempt') : chip('taxable', '', 'Still inside the time test')) : '\u2013'),
+        ] : [])));
     }
     const table = el('table', { class: 'dt-lots-table' },
-      el('caption', { class: 'visually-hidden', text: 'Purchase lots with age, unlock date and tax status' }),
-      el('thead', null, el('tr', null, ['Date', 'Side', 'Shares', 'Price', 'Age (d)', 'Unlocks', 'Tax'].map(h => el('th', { scope: 'col', text: h })))),
+      el('caption', { class: 'visually-hidden', text: showTax ? 'Purchase lots with age, unlock date and tax status' : 'Purchase lots' }),
+      el('thead', null, el('tr', null, (showTax ? ['Date', 'Side', 'Shares', 'Price', 'Age (d)', 'Unlocks', 'Tax'] : ['Date', 'Side', 'Shares', 'Price']).map(h => el('th', { scope: 'col', text: h })))),
       body);
     setContent(dom.lots.body,
       el('div', { class: 'tbl-wrap' }, table),
@@ -1423,7 +1428,9 @@ export function mountDetail(root, { onClose } = {}) {
   /** Cards that depend on the holding being a position / having lots. */
   function syncExtraCards() {
     if (!S) return;
-    dom.attr.node.hidden = !positionOf(S.id);
+    const caps = capsOf();
+    dom.attr.node.hidden = !positionOf(S.id) || !caps.attribution; // capabilities.attribution
+    if (caps.attribution && S.attrBlocked) { S.attrBlocked = false; loadAttribution(); }
     paintLots();
     ensureTax();
   }
@@ -1513,12 +1520,14 @@ export function mountDetail(root, { onClose } = {}) {
   }
 
   // live store updates
-  unsubs.push(store.subscribe('portfolio', () => { renderHeader(); renderPosition(); syncExtraCards(); }));
+  unsubs.push(store.subscribe('portfolio', () => { renderHeader(); renderPosition(); renderAdvice(); syncExtraCards(); }));
   unsubs.push(store.subscribe('prices', () => renderHeader()));
   unsubs.push(store.subscribe('advice', () => renderAdvice()));
   const onEntries = () => { if (S) { renderHeader(); paintAiShell(); syncExtraCards(); } };
   unsubs.push(store.subscribe('watchlist', onEntries));
   unsubs.push(store.subscribe('config', onEntries));
+  // Switching book: repaint from the store (the new payload's capabilities re-gate via the portfolio subscription).
+  unsubs.push(subscribeBook(() => { if (S) { renderHeader(); renderPosition(); renderAdvice(); syncExtraCards(); } }));
 
   paintOverlays();
   paintEmpty();

@@ -243,13 +243,15 @@ export function markerKind(m) {
 }
 
 /**
- * Align two {t, pct} series on the union of their timestamps (step carry-forward inside each
- * series' own range, null outside). Returns [{t, p, b}] ascending.
+ * Align a portfolio {t, pct} series with N named secondary series on the union of their
+ * timestamps (step carry-forward inside each series' own range, null outside).
+ * lines: [{key, points}]. Returns [{t, p, [key]: pct, ...}] ascending.
  */
-export function mergeIndexed(portfolio, benchmark) {
-  const P = (portfolio || []).filter(r => r && isNum(r.t) && isNum(r.pct));
-  const B = (benchmark || []).filter(r => r && isNum(r.t) && isNum(r.pct));
-  const ts = [...new Set([...P.map(r => r.t), ...B.map(r => r.t)])].sort((a, b) => a - b);
+export function mergeMultiIndexed(portfolio, lines) {
+  const valid = (arr) => (arr || []).filter(r => r && isNum(r.t) && isNum(r.pct));
+  const P = valid(portfolio);
+  const series = (lines || []).map(l => ({ key: l.key, pts: valid(l.points) }));
+  const ts = [...new Set([...P.map(r => r.t), ...series.flatMap(s => s.pts.map(r => r.t))])].sort((a, b) => a - b);
   const walk = (S) => {
     let j = 0;
     return (t) => {
@@ -259,11 +261,23 @@ export function mergeIndexed(portfolio, benchmark) {
     };
   };
   const pAt = walk(P);
-  const bAt = walk(B);
-  return ts.map(t => ({ t, p: pAt(t), b: bAt(t) }));
+  const walkers = series.map(s => ({ key: s.key, at: walk(s.pts) }));
+  return ts.map(t => {
+    const row = { t, p: pAt(t) };
+    for (const w of walkers) row[w.key] = w.at(t);
+    return row;
+  });
 }
 
-export const chartMath = { nearestIndexByTime, segmentRanges, gapThreshold, niceTicks, timeTicks, dateTicks, markerKind, mergeIndexed, withAlpha };
+/**
+ * Align two {t, pct} series on the union of their timestamps. Returns [{t, p, b}] ascending.
+ * Thin wrapper over mergeMultiIndexed kept for the single-benchmark case.
+ */
+export function mergeIndexed(portfolio, benchmark) {
+  return mergeMultiIndexed(portfolio, [{ key: 'b', points: benchmark }]);
+}
+
+export const chartMath = { nearestIndexByTime, segmentRanges, gapThreshold, niceTicks, timeTicks, dateTicks, markerKind, mergeIndexed, mergeMultiIndexed, withAlpha };
 
 // ------------------------------------------------------------------ canvas plumbing
 
@@ -1100,9 +1114,16 @@ export function createPriceChart(host, { onHover } = {}) {
 
 // ------------------------------------------------------------------ indexed comparison chart
 
+/**
+ * Indexed comparison chart: one portfolio line plus one or more secondary lines. Legacy call shape
+ * setData({portfolio, benchmark, benchmarkLabel}) draws a single dashed "benchmark" line (unchanged
+ * behaviour for the real book). setData({portfolio, baselines:[{id,label,series}]}) draws N dashed
+ * "baseline" lines instead (practice book, plan §8.1) - colours come from the EMA20/EMA50/RSI chart
+ * tokens (already theme-aware and visually distinct; no dedicated tokens needed for three lines).
+ */
 export function createIndexedChart(host) {
   const canvas = el('canvas', { class: 'ch-canvas ch-canvas-indexed', 'aria-hidden': 'true' });
-  let d = null;       // {rows, t0, t1, pl, bl, hasB, lastP, lastB}
+  let d = null;       // {rows, t0, t1, pl, lines:[{key,label,colorKey}], lastP, last:{[key]:v}}
   let state = null;
   let view = null;
 
@@ -1125,7 +1146,8 @@ export function createIndexedChart(host) {
       renderTip,
       announce(i) {
         const r = d.rows[i];
-        return `${fmtDate(r.t)}, ${d.pl} ${fmtPct(r.p, { dec: 1 })}, ${d.bl} ${fmtPct(r.b, { dec: 1 })}`;
+        const parts = [`${d.pl} ${fmtPct(r.p, { dec: 1 })}`, ...d.lines.map(ln => `${ln.label} ${fmtPct(r[ln.key], { dec: 1 })}`)];
+        return `${fmtDate(r.t)}, ${parts.join(', ')}`;
       },
     },
   });
@@ -1141,7 +1163,7 @@ export function createIndexedChart(host) {
     let min = 0;
     let max = 0;
     for (const r of rows) {
-      for (const v of [r.p, r.b]) {
+      for (const v of [r.p, ...d.lines.map(ln => r[ln.key])]) {
         if (v == null) continue;
         if (v < min) min = v;
         if (v > max) max = v;
@@ -1222,7 +1244,7 @@ export function createIndexedChart(host) {
         ctx.fill();
       }
     };
-    if (d.hasB) line('b', col.benchmark, 1.5, [5, 4]);
+    for (const ln of d.lines) line(ln.key, col[ln.colorKey] || col.benchmark, 1.5, [5, 4]);
     line('p', col.line, 2, []);
   }
 
@@ -1243,7 +1265,8 @@ export function createIndexedChart(host) {
     ctx.lineTo(x + 0.5, view.pr.y + view.pr.h);
     ctx.stroke();
     ctx.setLineDash([]);
-    for (const [v, color] of [[r.b, col.benchmark], [r.p, col.line]]) {
+    const pts = [...d.lines.map(ln => [r[ln.key], col[ln.colorKey] || col.benchmark]), [r.p, col.line]];
+    for (const [v, color] of pts) {
       if (v == null) continue;
       ctx.beginPath();
       ctx.arc(x, view.yAt(v), 4, 0, Math.PI * 2);
@@ -1259,9 +1282,9 @@ export function createIndexedChart(host) {
     const r = d.rows[i];
     node.append(el('div', { class: 'ch-tip-time', text: fmtDate(r.t) }));
     node.append(tipRow(d.pl, fmtPct(r.p, { dec: 1 }), { cls: dir(r.p), swatch: 'ch-g-line ch-g-portfolio' }));
-    if (d.hasB) node.append(tipRow(d.bl, fmtPct(r.b, { dec: 1 }), { cls: dir(r.b), swatch: 'ch-g-line ch-g-bench' }));
-    if (r.p != null && r.b != null) {
-      const diff = r.p - r.b;
+    for (const ln of d.lines) node.append(tipRow(ln.label, fmtPct(r[ln.key], { dec: 1 }), { cls: dir(r[ln.key]), swatch: 'ch-g-line ch-g-bench' }));
+    if (d.lines.length === 1 && r.p != null && r[d.lines[0].key] != null) {
+      const diff = r.p - r[d.lines[0].key];
       node.append(tipRow('Difference', fmtSigned(diff, 1, ' pp'), { cls: dir(diff) }));
     }
   }
@@ -1271,15 +1294,15 @@ export function createIndexedChart(host) {
     if (!hasRows()) return;
     const val = (v) => el('span', { class: 'ch-key-val num ' + dir(v), text: fmtPct(v, { dec: 1 }) });
     shell.key.append(keyItem('ch-g-line ch-g-portfolio', d.pl, val(d.lastP)));
-    if (d.hasB) shell.key.append(keyItem('ch-g-line ch-g-bench', d.bl, val(d.lastB)));
+    for (const ln of d.lines) shell.key.append(keyItem('ch-g-line ch-g-bench', ln.label, val(d.last[ln.key])));
   }
 
   function updateAria() {
     if (!hasRows()) { shell.setAria('Indexed performance chart: no data'); return; }
-    let s = `${d.pl} versus ${d.bl}, indexed return from ${fmtDate(d.t0)} to ${fmtDate(d.t1)}: ${d.pl} ${fmtPct(d.lastP, { dec: 1 })}`;
-    if (d.hasB) {
-      s += `, ${d.bl} ${fmtPct(d.lastB, { dec: 1 })}`;
-      if (isNum(d.lastP) && isNum(d.lastB)) s += `, difference ${fmtSigned(d.lastP - d.lastB, 1, ' percentage points')}`;
+    let s = `${d.pl} versus ${d.lines.map(ln => ln.label).join(', ') || 'benchmark'}, indexed return from ${fmtDate(d.t0)} to ${fmtDate(d.t1)}: ${d.pl} ${fmtPct(d.lastP, { dec: 1 })}`;
+    for (const ln of d.lines) {
+      s += `, ${ln.label} ${fmtPct(d.last[ln.key], { dec: 1 })}`;
+      if (d.lines.length === 1 && isNum(d.lastP) && isNum(d.last[ln.key])) s += `, difference ${fmtSigned(d.lastP - d.last[ln.key], 1, ' percentage points')}`;
     }
     shell.setAria(s + '. Focus and use arrow keys to inspect values.');
   }
@@ -1291,7 +1314,13 @@ export function createIndexedChart(host) {
 
   return {
     setData(x) {
-      const rows = mergeIndexed(x && x.portfolio, x && x.benchmark);
+      const baselineColorKeys = ['ema20', 'ema50', 'rsi'];
+      const secondary = x && Array.isArray(x.baselines) && x.baselines.length
+        ? x.baselines.map((b, i) => ({ key: 's' + i, label: b.label || b.id, colorKey: baselineColorKeys[i % baselineColorKeys.length], points: b.series }))
+        : [{ key: 'b', label: (x && x.benchmarkLabel) || 'S&P 500', colorKey: 'benchmark', points: x && x.benchmark }];
+      const hasAny = secondary.some(s => Array.isArray(s.points) && s.points.length);
+      const rows = mergeMultiIndexed(x && x.portfolio, secondary.map(s => ({ key: s.key, points: s.points })));
+      const lines = hasAny ? secondary.map(({ key, label, colorKey }) => ({ key, label, colorKey })).filter(ln => rows.some(r => r[ln.key] != null)) : [];
       const lastOf = (key) => {
         for (let i = rows.length - 1; i >= 0; i--) if (rows[i][key] != null) return rows[i][key];
         return null;
@@ -1301,13 +1330,22 @@ export function createIndexedChart(host) {
         t0: rows.length ? rows[0].t : 0,
         t1: rows.length ? rows[rows.length - 1].t : 0,
         pl: (x && x.portfolioLabel) || 'Portfolio',
-        bl: (x && x.benchmarkLabel) || 'S&P 500',
-        hasB: rows.some(r => r.b != null),
+        lines,
         lastP: lastOf('p'),
-        lastB: lastOf('b'),
+        last: Object.fromEntries(lines.map(ln => [ln.key, lastOf(ln.key)])),
       };
       shell.resetHover();
       renderLegend();
+      updateAria();
+      applyState();
+      shell.redraw();
+    },
+    /** Drop dataset, legend and aria text (book switch / no data) so nothing from a previous payload survives. */
+    reset() {
+      d = null;
+      view = null;
+      shell.resetHover();
+      clear(shell.key);
       updateAria();
       applyState();
       shell.redraw();

@@ -4,15 +4,19 @@
 // Panel logic lives in _since / _attn / _perf / _risk / _policy; this file wires data, state and DOM.
 import { el, clear, fmtEur, fmtPct, fmtNum, fmtDateTime24, signCls, isNum } from '../util.js';
 import { get, slot, subscribe } from '../store.js';
-import { apiGet, latestRequest } from '../api.js';
-import { renderState, stamp, openDialog, usePolling } from '../ui.js';
+import { apiGet, apiSend, latestRequest } from '../api.js';
+import { renderState, stamp, openDialog, usePolling, toast } from '../ui.js';
 import * as data from '../data.js';
+import { withBook, getBucket, setBucket, BUCKETS, BUCKET_LABEL } from '../book.js';
 import { drawSparkline, createDonut, createIndexedChart } from '../charts.js';
 import { buildSince, computeSince, isCollapsed, isDismissed, markDismissed, setCollapsed } from './_since.js';
 import { buildAttentionCard, buildAttentionItems } from './_attn.js';
-import { PERF_RANGES, basisOf, benchmarkChoices, buildBasisWarning, buildKpis, kindText, perfBenchmarkLabel } from './_perf.js';
+import { buildBenchmarks, buildCompare, buildSeasonHistory } from './_compare.js';
+import { PERF_RANGES, basisOf, baselineSeries, benchmarkChoices, buildBasisWarning, buildKpis, buildPracticeKpis, kindText, perfBenchmarkLabel } from './_perf.js';
 import { buildRisk } from './_risk.js';
 import { buildPolicy } from './_policy.js';
+import { createAgentPanel } from './_agent.js';
+import { createForecasterPanel } from './_forecaster.js';
 
 const SORTS = [
   { key: 'weightPct', label: 'Weight', th: 'Weight' },
@@ -27,6 +31,7 @@ const SORTS = [
 const LIGHT_LABEL = { green: 'Green', yellow: 'Yellow', red: 'Red' };
 const LIGHT_CLS = { green: 'ok', yellow: 'warn', red: 'err' };
 const PERF_REFRESH_MS = 600000;
+const COMPARE_REFRESH_MS = 300000;
 const RISK_KEY = 'pd.riskOpen';
 
 const wideQuery = window.matchMedia('(min-width: 1200px)');
@@ -63,12 +68,27 @@ export function mountOverview(root) {
   const heroHost = el('section', { class: 'hero', 'aria-label': 'Portfolio summary' });
   const attnHost = el('section', { class: 'card attn', id: 'attn-card', 'aria-labelledby': 'attn-title' });
   const posCard = el('section', { class: 'card pos-card', 'aria-labelledby': 'pos-title' });
+  const agentCard = el('section', { class: 'card agent-card', id: 'agent-card', 'aria-labelledby': 'agent-title', hidden: true });
+  const compareCard = el('section', { class: 'card compare-card', id: 'compare-card', 'aria-labelledby': 'compare-title', hidden: true });
   const perfCard = el('section', { class: 'card perf-card', id: 'perf-card', 'aria-labelledby': 'perf-title' });
   const policyCard = el('section', { class: 'card policy-card', id: 'policy-card', 'aria-labelledby': 'policy-title' });
   const riskCard = el('section', { class: 'card risk-card', id: 'risk-card', 'aria-labelledby': 'risk-title' });
   const dock = el('aside', { class: 'ov-dock', 'aria-label': 'Holding detail', hidden: true });
-  const main = el('div', { class: 'ov-main' }, el('div', { class: 'ov-left' }, posCard, perfCard, policyCard, riskCard), dock);
+  // Practice-only Forecaster + Candidates cards (own polling; started/stopped by renderForecaster()).
+  const forecaster = createForecasterPanel({
+    heldIds: () => new Set((((slot('portfolio').data || {}).positions) || []).map(p => String(p.id).toUpperCase())),
+  });
+  cleanups.push(() => forecaster.destroy());
+  const main = el('div', { class: 'ov-main' }, el('div', { class: 'ov-left' }, posCard, agentCard, forecaster.forecasterNode, forecaster.candidatesNode, compareCard, perfCard, policyCard, riskCard), dock);
   root.replaceChildren(el('div', { class: 'ov' }, sinceHost, heroHost, attnHost, main));
+
+  // capabilities gate the practice-only panels (missing = all true, per contract §4; 'real' never carries capabilities).
+  function capsOf() {
+    const d = slot('portfolio').data;
+    const c = d && d.capabilities;
+    const has = (k) => !c || c[k] !== false;
+    return { lots: has('lots'), policy: has('policy'), tax: has('tax'), editPositions: has('editPositions'), alertActions: has('alertActions'), attribution: has('attribution'), risk: has('risk'), analysis: has('analysis') };
+  }
 
   // ------------------------------------------------------------ helpers
   const roleBench = () => {
@@ -77,7 +97,7 @@ export function mountOverview(root) {
   };
   const roleLabel = () => (roleBench() && roleBench().label) || 'Benchmark';
   /** Label of the PERFORMANCE benchmark (hero KPI, KPI strip); falls back to the role benchmark. */
-  const benchLabel = () => perfBenchmarkLabel(perf.history, perf.performance, data.labelOf) || roleLabel();
+  const benchLabel = () => perfBenchmarkLabel(perf.history, perf.performance, data.labelOf, get('book') === 'practice') || roleLabel();
   const labelsOf = ids => (ids || []).map(id => data.labelOf(id)).join(', ');
 
   /** The /performance payload for the selected range, when it carries an excess return. */
@@ -111,6 +131,7 @@ export function mountOverview(root) {
     const b = d.benchmark || {};
     const pe = excess();
     const stale = !!pf.error || !!pf.stale;
+    const practice = get('book') === 'practice';
     const cards = [];
 
     cards.push(statCard({
@@ -130,7 +151,12 @@ export function mountOverview(root) {
     }));
 
     const missing = Array.isArray(t.costMissing) ? t.costMissing : [];
-    if (!isNum(t.pnlEur)) {
+    const practiceEmpty = practice && (!Array.isArray(d.positions) || !d.positions.length || (isNum(t.investedEur) && t.investedEur === 0));
+    if (practiceEmpty) {
+      cards.push(statCard({ label: 'Total P&L', value: fmtEur(0), valueCls: 'flat', sub: 'no positions yet', subCls: 'flat' }));
+    } else if (!isNum(t.pnlEur) && practice) {
+      cards.push(statCard({ label: 'Total P&L', value: '\u2013', valueCls: 'flat' }));
+    } else if (!isNum(t.pnlEur)) {
       cards.push(statCard({
         label: 'Total P&L',
         value: 'Cost unknown',
@@ -153,7 +179,7 @@ export function mountOverview(root) {
       label: `vs ${benchLabel()} \u00b7 ${view.perfRange}`,
       value: pe ? `${pe.excessPct >= 0 ? '+' : '\u2212'}${fmtNum(Math.abs(pe.excessPct), 1)} pp` : '\u2013',
       valueCls: pe ? signCls(pe.excessPct) : 'flat',
-      sub: `${roleLabel()} today ${fmtPct(b.dayPct)}`,
+      sub: practice && !d.benchmark ? null : `${roleLabel()} today ${fmtPct(b.dayPct)}`,
       subCls: 'flat',
       note: pe ? `portfolio ${fmtPct(pe.twrPct)} vs ${fmtPct(pe.perfBenchmarkPct)}` : (perf.perfError ? 'comparison unavailable' : ''),
     }));
@@ -291,7 +317,7 @@ export function mountOverview(root) {
         type: 'button', class: 'pos-btn', 'aria-current': sel ? 'true' : null, dataset: { symbol: p.id },
         'aria-label': `${name}, ${fmtEur(p.valueEur)}, today ${fmtPct(p.dayPct)}. Show details`,
       }, el('span', { class: 'pos-name' }, name),
-        el('span', { class: 'pos-meta' }, p.kind ? p.kind.toUpperCase() : '', p.stale ? el('span', { class: 'chip chip-warn pos-stale', title: `Price as of ${fmtDateTime24(p.priceAsOf)}`, text: 'stale' }) : null))),
+        el('span', { class: 'pos-meta' }, p.kind ? p.kind.toUpperCase() : '', p.sector ? el('span', { class: 'pos-sector', dataset: { label: 'Sector' }, text: ` \u00b7 ${p.sector}` }) : null, p.stale ? el('span', { class: 'chip chip-warn pos-stale', title: `Price as of ${fmtDateTime24(p.priceAsOf)}`, text: 'stale' }) : null))),
       el('td', { class: 'c-weight num', dataset: { label: 'Weight' } }, fmtPct(p.weightPct, { sign: false, dec: 1 })),
       el('td', { class: 'c-value num', dataset: { label: 'Value' } }, fmtEur(p.valueEur)),
       el('td', { class: 'c-day', dataset: { label: 'Today' } }, twoLine(p.dayPnlEur, p.dayPct)),
@@ -331,7 +357,7 @@ export function mountOverview(root) {
     }
     const positions = Array.isArray(d.positions) ? d.positions : [];
     if (!positions.length) {
-      renderState(posBody, { empty: 'No positions yet. Add shares in Settings \u2192 Positions.' });
+      renderState(posBody, { empty: get('book') === 'practice' ? 'No positions yet \u2014 the agent has not traded in this bucket.' : 'No positions yet. Add shares in Settings \u2192 Positions.' });
       donut.update([], null);
       return;
     }
@@ -413,10 +439,12 @@ export function mountOverview(root) {
     onclick: () => { view.perfBench = k; paintPerf(); },
   }));
   const benchSeg = el('div', { class: 'seg perf-bench-seg', id: 'perf-bench-toggle', role: 'group', 'aria-label': 'Benchmark line', hidden: true }, benchBtns);
+  let perfVersion = null;   // Practice: selected strategyVersion (null = current)
   function paintRange() { rangeBtns.forEach(b => b.setAttribute('aria-pressed', b.dataset.range === view.perfRange ? 'true' : 'false')); }
+  const perfTitle = el('h2', { class: 'card-title', id: 'perf-title' });
   perfCard.append(
     el('div', { class: 'card-head' },
-      el('h2', { class: 'card-title', id: 'perf-title' }, 'Portfolio vs benchmark (indexed %)'),
+      perfTitle,
       el('div', { class: 'card-tools' }, perfStamp, el('div', { class: 'seg', id: 'perf-range', role: 'group', 'aria-label': 'Chart range' }, rangeBtns))),
     benchSeg, perfKpiHost, perfNotes, perfChartHost, perfSummary);
   const perfChart = createIndexedChart(perfChartHost);
@@ -430,7 +458,9 @@ export function mountOverview(root) {
     const h = perf.history;
     const ix = h && h.indexed;
     const n = ix && Array.isArray(ix.portfolio) ? ix.portfolio.length : 0;
-    const choices = benchmarkChoices(h);
+    const practice = get('book') === 'practice';
+    perfTitle.textContent = practice ? 'Bucket vs baselines (indexed %)' : 'Portfolio vs benchmark (indexed %)';
+    const choices = practice ? { perf: null, role: null, toggle: false } : benchmarkChoices(h);
     const line = view.perfBench === 'role' && choices.role ? choices.role : choices.perf;
     benchSeg.hidden = !choices.toggle;
     if (choices.toggle) {
@@ -441,7 +471,8 @@ export function mountOverview(root) {
 
     const p = perf.performance;
     if (p && p.range === view.perfRange) {
-      perfKpiHost.replaceChildren(buildKpis(p, benchLabel()));
+      perfKpiHost.replaceChildren(buildKpis(p, benchLabel()),
+        ...(practice ? [buildPracticeKpis(p, { version: perfVersion, onVersion: v => { perfVersion = v; paintPerf(); } })] : []));
     } else if (perf.perfError) {
       perfKpiHost.replaceChildren(el('p', { class: 'pos-note warn-ink', role: 'status' }, `Return figures unavailable: ${perf.perfError}`));
     } else {
@@ -451,16 +482,37 @@ export function mountOverview(root) {
       ? [buildBasisWarning(() => openSettingsTab('positions'))] : []));
 
     if (!h) {
+      if (practice) perfChart.reset();
       perfChart.setState(perf.error ? { error: perf.error } : { loading: true });
       perfSummary.textContent = '';
       return;
     }
     if (n < 2) {
+      perfChart.reset();
       perfChart.setState({ empty: 'Not enough history to compare yet.' });
       perfSummary.textContent = '';
       return;
     }
     perfChart.setState(null);
+    if (practice) {
+      // Practice book draws the buy-and-hold/trend/momentum baselines (plan §8.1) instead of a benchmark line.
+      // An open-universe season (SXR8 / real-weights benchmarks present) draws only the three buy & hold lines:
+      // EUNL (primary), SXR8 and the real weights, so the legend stays unambiguous.
+      const all = baselineSeries(h);
+      const open = all.some(b => b.id === 'buy_hold_sxr8' || b.id === 'buy_hold_real');
+      const baselines = open ? all.filter(b => /^buy_hold/.test(b.id)) : all;
+      perfChart.setData({ portfolio: ix.portfolio, baselines, portfolioLabel: 'Bucket' });
+      const lp = ix.portfolio[ix.portfolio.length - 1];
+      const bh = baselines[0];
+      const lb = bh && bh.series[bh.series.length - 1];
+      const others = baselines.slice(1).map(b => ({ label: b.label, last: b.series[b.series.length - 1] })).filter(b => b.last && isNum(b.last.pct))
+        .map(b => ` \u00b7 ${b.label} ${fmtPct(b.last.pct)}`).join('');
+      perfSummary.textContent = lp && lb && isNum(lp.pct) && isNum(lb.pct)
+        ? `Bucket ${fmtPct(lp.pct)} \u00b7 ${bh.label} ${fmtPct(lb.pct)}${others} \u00b7 difference vs ${bh.label} ${lp.pct - lb.pct >= 0 ? '+' : '\u2212'}${fmtNum(Math.abs(lp.pct - lb.pct), 1)} pp over ${view.perfRange}`
+        : (baselines.length ? '' : 'No practice season yet \u2014 start one from the Agent card.');
+      if (perf.error) perfSummary.textContent += ` \u00b7 refresh failed: ${perf.error}`;
+      return;
+    }
     const label = line ? `${line.label} (${kindText(line.kind)})` : 'Benchmark';
     perfChart.setData({ portfolio: ix.portfolio, benchmark: line ? line.series : [], portfolioLabel: 'Portfolio', benchmarkLabel: label });
     const lp = ix.portfolio[ix.portfolio.length - 1];
@@ -481,22 +533,25 @@ export function mountOverview(root) {
     if (!perf.performance || perf.performance.range !== range) perf.performance = null;
     paintPerf();
     await Promise.all([
-      apiGet(`/api/portfolio/history?range=${q}`, { signal: th.signal, timeoutMs: 30000 }).then(res => {
+      apiGet(withBook(`/api/portfolio/history?range=${q}`), { signal: th.signal, timeoutMs: 30000 }).then(res => {
         if (!th.current()) return;
         perf.loading = false;
         if (res.ok) { perf.history = res.data; perf.ts = Date.now(); perf.error = null; } else { perf.error = res.error; }
         paintPerf();
         renderHero();
+        renderCompare();
       }),
-      apiGet(`/api/portfolio/performance?range=${q}`, { signal: tk.signal, timeoutMs: 30000 }).then(res => {
+      apiGet(withBook(`/api/portfolio/performance?range=${q}`), { signal: tk.signal, timeoutMs: 30000 }).then(res => {
         if (!tk.current()) return;
         if (res.ok) { perf.performance = res.data; perf.perfError = null; } else { perf.perfError = res.error; }
         paintPerf();
         renderHero();
+        renderSeasonHistory();
       }),
     ]);
   }
   cleanups.push(usePolling(loadPerf, PERF_REFRESH_MS));
+
 
   // ------------------------------------------------------------ risk panel (collapsible)
   const riskBody = el('div', { class: 'risk-body', id: 'risk-body' });
@@ -516,6 +571,8 @@ export function mountOverview(root) {
     riskToggle.textContent = view.riskOpen ? 'Collapse' : 'Expand';
   }
   function renderRisk() {
+    if (!capsOf().risk) { riskCard.hidden = true; return; }
+    riskCard.hidden = false;
     const s = slot('risk');
     riskStamp.replaceChildren(s.ts ? stamp(s.ts, { stale: !!s.error }) : '');
     if (!s.data) {
@@ -536,6 +593,8 @@ export function mountOverview(root) {
       el('div', { class: 'card-tools' }, policyStamp)),
     policyBody);
   function renderPolicy() {
+    if (!capsOf().policy) { policyCard.hidden = true; return; }
+    policyCard.hidden = false;
     const s = slot('policy');
     policyStamp.replaceChildren(s.ts ? stamp(s.ts, { stale: !!s.error }) : '');
     if (!s.data) {
@@ -545,6 +604,136 @@ export function mountOverview(root) {
     policyBody.replaceChildren(...[...buildPolicy(s.data, { labelOf: data.labelOf, onSetTargets: () => openSettingsTab('policy') }),
       s.error ? el('p', { class: 'pos-note warn-ink', role: 'status' }, `Refresh failed: ${s.error}`) : null].filter(Boolean));
     policyBody.removeAttribute('aria-busy');
+  }
+
+  // ------------------------------------------------------------ agent card (practice book only)
+  const agentBody = el('div', { class: 'agent-body' });
+  const seasonHistoryHost = el('div', { class: 'agent-history-host' });
+  // Bucket switch (Practice only): Daily | Intraday, remembered in localStorage 'pd.bucket' (book.js).
+  const bucketBtns = BUCKETS.map(id => el('button', {
+    type: 'button', class: 'bucket-btn', id: `bucket-${id}`, dataset: { bucket: id }, text: BUCKET_LABEL[id],
+    'aria-pressed': id === getBucket() ? 'true' : 'false',
+    onclick: () => setBucket(id),
+  }));
+  const bucketSeg = el('div', { class: 'seg bucket-switch', id: 'bucket-switch', role: 'group', 'aria-label': 'Paper bucket' }, bucketBtns);
+  function paintBucketSwitch() {
+    bucketBtns.forEach(b => b.setAttribute('aria-pressed', b.dataset.bucket === getBucket() ? 'true' : 'false'));
+  }
+  agentCard.append(
+    el('div', { class: 'card-head' }, el('h2', { class: 'card-title', id: 'agent-title' }, 'Agent'), el('div', { class: 'card-tools' }, bucketSeg)),
+    agentBody, seasonHistoryHost);
+
+  async function startSeason() {
+    const res = await apiSend('POST', '/api/paper/season', { book: 'practice', bucket: getBucket() });
+    if (res.ok) {
+      toast('Practice season started.', { type: 'ok' });
+      data.refreshPaperStatus();
+      data.refreshPortfolio();
+    } else {
+      toast(`Could not start the season: ${res.error}`, { type: 'error' });
+    }
+  }
+
+  const agentPanel = createAgentPanel({
+    onStartSeason: startSeason,
+    onChanged: () => { data.refreshPaperStatus(); data.refreshPortfolio(); },
+  });
+  cleanups.push(() => agentPanel.destroy());
+
+  function renderAgent() {
+    if (get('book') !== 'practice') { agentPanel.stop(); agentCard.hidden = true; return; }
+    agentCard.hidden = false;
+    paintBucketSwitch();
+    const bucket = getBucket();
+    const s = slot('paperStatus');
+    // a status block of the other bucket (switch in flight) counts as "not loaded yet"
+    if (!s.data || (s.data.bucketId && s.data.bucketId !== bucket)) {
+      agentPanel.stop();
+      renderState(agentBody, s.error ? { error: `Agent unavailable: ${s.error}`, retry: () => data.refreshPaperStatus() } : { loading: 'Loading agent status' });
+      return;
+    }
+    if (s.data.enabled === false) {
+      agentPanel.stop();
+      renderState(agentBody, { empty: s.data.reason ? `Practice agent disabled: ${s.data.reason}` : 'Practice agent is disabled.' });
+      return;
+    }
+    const bs = s.data.buckets && s.data.buckets[bucket];
+    if (bs && bs.enabled === false) {
+      agentPanel.stop();
+      agentBody.replaceChildren(el('div', { class: 'state state-empty', id: 'agent-bucket-disabled', role: 'status' },
+        el('div', { class: 'state-text' }, `${BUCKET_LABEL[bucket]} bucket not enabled${bs.mode ? ` (mode: ${bs.mode})` : ''}`)));
+      agentBody.removeAttribute('aria-busy');
+      return;
+    }
+    const pf = slot('portfolio').data;
+    const bucketEmpty = !!pf && Array.isArray(pf.positions) && pf.positions.length === 0;
+    agentPanel.update(s.data, { bucketEmpty });
+    if (agentBody.firstChild !== agentPanel.node) agentBody.replaceChildren(agentPanel.node);
+    agentBody.removeAttribute('aria-busy');
+  }
+
+  // ------------------------------------------------------------ compare card (practice book only)
+  const cmp = { data: null, error: null, ts: null, disabled: false };
+  const compareBody = el('div', { class: 'compare-card-body' });
+  const compareStamp = el('span', { class: 'compare-stamp' });
+  compareCard.append(
+    el('div', { class: 'card-head' }, el('h2', { class: 'card-title', id: 'compare-title' }, 'Compare'), el('div', { class: 'card-tools' }, compareStamp)),
+    compareBody);
+  const compareReq = latestRequest();
+  cleanups.push(() => compareReq.abort());
+
+  async function loadCompare() {
+    if (get('book') !== 'practice') return;
+    const t = compareReq.begin();
+    const res = await apiGet(withBook('/api/paper/compare'), { signal: t.signal, timeoutMs: 30000 });
+    if (!t.current()) return;
+    if (res.ok && res.data && typeof res.data === 'object') {
+      cmp.data = res.data; cmp.error = null; cmp.disabled = false; cmp.ts = Date.now();
+    } else if (res.aborted) {
+      return;
+    } else {
+      cmp.error = res.error || 'invalid response';
+      cmp.disabled = res.status === 503 && /paper_disabled/.test(String(res.error));
+    }
+    renderCompare();
+  }
+  cleanups.push(usePolling(loadCompare, COMPARE_REFRESH_MS));
+
+  function renderCompare() {
+    if (get('book') !== 'practice') { compareCard.hidden = true; return; }
+    compareCard.hidden = false;
+    compareStamp.replaceChildren(cmp.ts ? stamp(cmp.ts, { stale: !!cmp.error }) : '');
+    if (!cmp.data) {
+      if (cmp.disabled) renderState(compareBody, { empty: 'Paper trading is disabled, so there is nothing to compare.' });
+      else renderState(compareBody, cmp.error ? { error: `Comparison unavailable: ${cmp.error}`, retry: () => loadCompare() } : { loading: 'Loading comparison' });
+      return;
+    }
+    const ps = slot('paperStatus').data;
+    compareBody.replaceChildren(...[buildCompare(cmp.data, ps && ps.buckets),
+      buildBenchmarks(perf.history, view.perfRange),
+      cmp.error ? el('p', { class: 'pos-note warn-ink', role: 'status' }, `Refresh failed, showing older data: ${cmp.error}`) : null].filter(Boolean));
+    compareBody.removeAttribute('aria-busy');
+  }
+
+  // ------------------------------------------------------------ forecaster + candidates (practice book only)
+  function renderForecaster() {
+    const practice = get('book') === 'practice';
+    forecaster.forecasterNode.hidden = !practice;
+    forecaster.candidatesNode.hidden = !practice;
+    if (!practice) { forecaster.stop(); return; }
+    const s = slot('paperStatus');
+    forecaster.update(s.data || null);
+    forecaster.repaint();
+  }
+
+  // Earlier seasons (s1 / i1) as read-only history under the Agent card: dates come from the performance
+  // payload's strategy-version windows, plus status.season.previous when the server sends it.
+  function renderSeasonHistory() {
+    if (get('book') !== 'practice') { seasonHistoryHost.replaceChildren(); return; }
+    const ps = slot('paperStatus').data;
+    const current = ps && ps.bucket && ps.bucket.strategyVersion;
+    const node = buildSeasonHistory(perf.performance && perf.performance.versions, ps && ps.season && ps.season.previous, current);
+    seasonHistoryHost.replaceChildren(...(node ? [node] : []));
   }
 
   // ------------------------------------------------------------ detail host
@@ -648,10 +837,12 @@ export function mountOverview(root) {
       if (todo.includes('pos')) renderPositions();
       if (todo.includes('risk')) renderRisk();
       if (todo.includes('policy')) renderPolicy();
+      if (todo.includes('agent')) { renderAgent(); renderForecaster(); renderSeasonHistory(); }
+      if (todo.includes('compare')) renderCompare();
     });
   }
   const sub = (key, ...parts) => cleanups.push(subscribe(key, () => schedule(...parts)));
-  sub('portfolio', 'hero', 'since', 'attn', 'pos');
+  sub('portfolio', 'hero', 'since', 'attn', 'pos', 'risk', 'policy', 'agent');
   sub('prices', 'pos');
   sub('alerts', 'since', 'attn');
   sub('config', 'attn');
@@ -663,15 +854,42 @@ export function mountOverview(root) {
   sub('alertRules', 'since', 'attn');
   sub('policy', 'attn', 'policy');
   sub('risk', 'risk');
+  sub('paperStatus', 'agent', 'compare');
   sub('lastVisit', 'since');
+  // Switching books: the previous book's history/performance cache is local to this module (not a
+  // store slot), so reset it here and reload; capability-gated cards and the Agent card recompute too.
+  cleanups.push(subscribe('book', () => {
+    perf.history = null; perf.performance = null; perf.error = null; perf.perfError = null; perf.ts = null;
+    cmp.data = null; cmp.error = null; cmp.ts = null; cmp.disabled = false;
+    // The chart keeps its last dataset + legend across setState(); drop them so the previous book's numbers cannot linger.
+    perfChart.reset();
+    paintPerf();
+    loadPerf();
+    loadCompare();
+    schedule('hero', 'pos', 'risk', 'policy', 'agent', 'compare');
+  }));
+  // Bucket switch: stop the Agent panel (aborts its in-flight requests), drop the old bucket's figures and
+  // reload; loadPerf/loadCompare begin new "latest" requests, which abort the old bucket's.
+  cleanups.push(subscribe('bucket', (b, prev) => {
+    if (b === prev) return;
+    agentPanel.stop();
+    perf.history = null; perf.performance = null; perf.error = null; perf.perfError = null; perf.ts = null;
+    cmp.data = null; cmp.error = null; cmp.ts = null; cmp.disabled = false;
+    perfChart.reset();
+    paintBucketSwitch();
+    paintPerf();
+    if (get('book') === 'practice') { loadPerf(); loadCompare(); }
+    schedule('hero', 'pos', 'agent', 'compare');
+  }));
   cleanups.push(subscribe('selectedId', () => { schedule('pos'); syncDetail(); }));
   const onVis = () => { if (!document.hidden) schedule('hero', 'since', 'attn', 'pos'); };
   document.addEventListener('visibilitychange', onVis);
   cleanups.push(() => document.removeEventListener('visibilitychange', onVis));
 
   paintMode(); paintRiskOpen();
-  renderHero(); renderSince(); renderAttention(); renderPositions(); renderRisk(); renderPolicy(); paintPerf(); paintRange();
+  renderHero(); renderSince(); renderAttention(); renderPositions(); renderRisk(); renderPolicy(); renderAgent(); renderForecaster(); renderSeasonHistory(); renderCompare(); paintPerf(); paintRange();
   loadPerf();
+  loadCompare();
   if (get('selectedId')) syncDetail();
 
   return function unmount() {

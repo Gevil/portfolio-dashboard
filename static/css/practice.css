@@ -1,0 +1,266 @@
+/* Practice/live book chrome: the account-context switch, the persistent banner and the practice-only
+   Agent card. Tokens only (tokens.css); the pressed-practice accent comes from --book-accent, which
+   tracks --amber in both themes so light/dark need no separate overrides here. */
+
+.book-switch { flex: 0 0 auto; }
+
+/* Pressed state picks up the book accent only for the book that is actually active, so a merely
+   hovered/unpressed button never looks like it is already selected. */
+.book-switch > .book-btn[data-book="practice"][aria-pressed="true"] {
+  background: var(--book-accent-soft);
+  color: var(--book-accent);
+}
+.book-switch > .book-btn[data-book="live"][aria-pressed="true"] {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.book-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  background: var(--book-accent-soft);
+  color: var(--book-accent);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.book-banner-icon { font-size: 0.55em; }
+.book-banner.is-live { background: var(--red-soft); color: var(--red); }
+
+@media (max-width: 760px) {
+  .book-banner { padding: var(--space-2) var(--space-3); }
+}
+
+/* Agent card (practice book, Overview, below the positions). */
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-3);
+}
+.agent-row { display: flex; flex-direction: column; gap: 2px; }
+.agent-row-val { font-size: var(--fs-md); }
+.agent-note { font-size: var(--fs-sm); color: var(--ink-2); margin: var(--space-2) 0; }
+.agent-note.muted { color: var(--ink-3); }
+.down-ink { color: var(--red); }
+
+/* Phase 2: halt banner, mode control, actions, dialogs, orders table. */
+.agent-halt {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+  border: 1px solid var(--red);
+  border-radius: var(--radius);
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: var(--fs-md);
+}
+.agent-halt-icon { font-size: 1.25em; line-height: 1; }
+.agent-halt-text { overflow-wrap: anywhere; }
+
+.agent-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+}
+.agent-mode { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.agent-mode-group {
+  display: inline-flex;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+  align-self: flex-start;
+}
+.agent-mode-btn {
+  appearance: none;
+  border: 0;
+  border-right: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+}
+.agent-mode-btn:last-child { border-right: 0; }
+.agent-mode-btn:hover:not(:disabled):not([aria-pressed="true"]) { background: var(--panel-2); color: var(--ink); }
+.agent-mode-btn[aria-pressed="true"] { background: var(--book-accent-soft); color: var(--book-accent); font-weight: 600; }
+.agent-mode-btn:disabled { opacity: 0.6; cursor: default; }
+.agent-mode-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+.agent-mode-help { font-size: var(--fs-sm); color: var(--ink-3); }
+.agent-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+.agent-subtitle { font-size: var(--fs-base); margin: 0 0 var(--space-2); color: var(--ink); }
+.agent-table-wrap { overflow-x: auto; max-width: 100%; }
+.agent-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.agent-table th,
+.agent-table td {
+  text-align: left;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.agent-table th { color: var(--ink-3); font-weight: 600; }
+.agent-table th.num,
+.agent-table td.num { text-align: right; }
+.agent-table td.agent-msg { white-space: normal; min-width: 10rem; overflow-wrap: anywhere; color: var(--ink-2); }
+
+.agent-chip {
+  display: inline-block;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  font-size: var(--fs-xs);
+  color: var(--ink-2);
+}
+.agent-chip.is-filled { border-color: var(--green); color: var(--green); }
+.agent-chip.is-partially_filled,
+.agent-chip.is-submitted,
+.agent-chip.is-pending { border-color: var(--blue); color: var(--blue); }
+.agent-chip.is-unknown,
+.agent-chip.is-not_sent { border-color: var(--amber); color: var(--amber); background: var(--amber-soft); }
+.agent-chip.is-rejected,
+.agent-chip.is-cancelled { border-color: var(--red); color: var(--red); background: var(--red-soft); }
+
+.agent-field { display: flex; flex-direction: column; gap: var(--space-1); margin-top: var(--space-2); }
+.agent-field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: var(--space-2) var(--space-4);
+  margin: var(--space-3) 0;
+}
+.agent-input {
+  font: inherit;
+  padding: var(--space-2);
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  min-width: 0;
+}
+.agent-input:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.agent-preview { margin-top: var(--space-3); }
+.agent-skipped { margin: 0 0 var(--space-2); padding-left: var(--space-4); font-size: var(--fs-sm); }
+
+/* Phase 3: Decisions section (today's decision, last 10, run-now button). */
+.agent-decisions { margin-top: var(--space-4); min-width: 0; }
+.agent-decisions-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.agent-decisions-head .agent-subtitle { margin: 0; }
+.agent-minititle { font-size: var(--fs-sm); font-weight: 600; color: var(--ink-3); margin: var(--space-3) 0 var(--space-1); }
+.agent-decision-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1); margin: 0 0 var(--space-2); font-size: var(--fs-sm); color: var(--ink-2); overflow-wrap: anywhere; }
+.agent-rationale,
+.agent-reason { font-size: var(--fs-sm); color: var(--ink-2); overflow-wrap: anywhere; min-width: 0; }
+.agent-rationale > :first-child,
+.agent-reason > :first-child { margin-top: 0; }
+.agent-rationale > :last-child,
+.agent-reason > :last-child { margin-bottom: 0; }
+.agent-views { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.agent-views li { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); font-size: var(--fs-sm); }
+.agent-views .agent-reason { flex: 1 1 14rem; }
+.agent-decision-list { list-style: none; margin: 0; padding: 0; }
+.agent-decision-item { border-bottom: 1px solid var(--line); }
+.agent-decision-item > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.agent-decision-item > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.agent-decision-item .agent-decision-body { padding: 0 0 var(--space-3); }
+.agent-decision-date { color: var(--ink-3); }
+.agent-decision-sum { min-width: 0; overflow-wrap: anywhere; color: var(--ink-2); }
+.agent-chip.is-targets { border-color: var(--blue); color: var(--blue); }
+.agent-chip.is-deferred,
+.agent-chip.is-underweight { border-color: var(--amber); color: var(--amber); background: var(--amber-soft); }
+.agent-chip.is-invalid { border-color: var(--red); color: var(--red); background: var(--red-soft); }
+.agent-chip.is-overweight { border-color: var(--green); color: var(--green); }
+
+@media (max-width: 760px) {
+  .agent-controls { align-items: stretch; }
+}
+
+/* Phase 4: Practice KPI strip (performance card) and Decision quality (agent card). */
+.perf-practice { margin: 0 0 var(--space-3); min-width: 0; }
+.perf-practice:empty { display: none; }
+.perf-version { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); }
+.perf-practice-grid { grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); }
+.perf-verdict.is-verdict-ahead { border-color: var(--green); color: var(--green); }
+.perf-verdict.is-verdict-behind { border-color: var(--red); color: var(--red); background: var(--red-soft); }
+.perf-verdict.is-verdict-inconclusive { border-color: var(--blue); color: var(--blue); }
+.perf-verdict.is-verdict-insufficient_sample { border-color: var(--amber); color: var(--amber); background: var(--amber-soft); }
+.agent-grading { margin-top: var(--space-4); min-width: 0; }
+.agent-grading .agent-subtitle { margin: 0 0 var(--space-2); }
+.agent-table tbody th[scope="row"] { text-align: left; font-weight: 600; }
+
+/* Phase 5: bucket switch (Agent card head), Compare card, Briefings (agent card). */
+.bucket-switch > button { min-width: 4.5rem; }
+.agent-briefs { margin-top: var(--space-4); min-width: 0; }
+.agent-briefs .agent-subtitle { margin: 0 0 var(--space-2); }
+.agent-brief-list { list-style: none; margin: 0; padding: 0; }
+.agent-brief-item { border-bottom: 1px solid var(--line); }
+.agent-brief-item > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.agent-brief-item > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.agent-brief-body { padding: 0 0 var(--space-3); min-width: 0; overflow-wrap: anywhere; }
+.agent-brief-text { margin: 0 0 var(--space-2); font-size: var(--fs-sm); color: var(--ink-2); }
+.agent-brief-decisions { list-style: none; margin: 0 0 var(--space-2); padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.agent-brief-decisions li { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); font-size: var(--fs-sm); }
+.agent-brief-decisions .agent-rationale { flex: 1 1 100%; }
+.agent-brief-slot { color: var(--ink-3); }
+.compare-card-body { min-width: 0; }
+.compare-table th[scope="col"] { white-space: nowrap; }
+.compare-table td.compare-wide { text-align: right; overflow-wrap: anywhere; min-width: 8rem; }
+.compare-why { font-weight: 400; }
+
+/* Forecaster + Candidates cards, benchmarks table, season history (Practice, Overview). */
+.forecaster-card, .candidates-card { min-width: 0; }
+.fc-body, .cand-body { min-width: 0; }
+.fc-experiment { min-width: 0; margin-top: var(--space-2); }
+.fc-progress progress { vertical-align: middle; width: 8rem; max-width: 100%; }
+.fc-help { font-weight: 400; }
+.fc-legend { margin: 0; display: grid; gap: var(--space-1); font-size: var(--fs-sm); }
+.fc-legend-row { display: flex; gap: var(--space-2); align-items: baseline; }
+.fc-legend dt { font-weight: 600; min-width: 1.5rem; }
+.fc-legend dd { margin: 0; color: var(--ink-2); overflow-wrap: anywhere; }
+.fc-chip { display: inline-block; padding: 0 var(--space-2); border: 1px solid var(--line-strong); border-radius: var(--radius); white-space: nowrap; }
+.fc-chip.is-local, .fc-chip.is-held, .fc-chip.is-status-verdict { border-color: var(--green); color: var(--green); }
+.fc-chip.is-opus, .fc-chip.is-sonnet, .fc-chip.is-status-interim, .fc-chip.is-status-sanity { border-color: var(--blue); color: var(--blue); }
+.fc-chip.is-fallback { border-color: var(--amber); color: var(--amber); background: var(--amber-soft); }
+.fc-chip.is-status-pending, .fc-chip.is-status-insufficient { color: var(--ink-3); }
+.cand-table td.cand-sector { overflow-wrap: anywhere; }
+.cand-row { cursor: pointer; }
+.cand-row.is-selected { background: var(--panel-2); }
+.cand-btn { text-align: left; }
+.cand-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.cand-packet { margin-top: var(--space-3); min-width: 0; }
+.cand-packet-text p { margin: 0 0 var(--space-1); font-size: var(--fs-sm); color: var(--ink-2); overflow-wrap: anywhere; }
+.cand-packet-text p:first-child { color: var(--ink); font-weight: 600; }
+.compare-bench { margin-top: var(--space-4); min-width: 0; }
+.agent-history-host:empty { display: none; }
+.agent-history-host { margin-top: var(--space-4); min-width: 0; }
+.season-history-list { list-style: none; margin: 0; padding: 0; font-size: var(--fs-sm); color: var(--ink-2); display: flex; flex-direction: column; gap: var(--space-1); }
+.pos-sector { color: var(--ink-3); }

@@ -87,6 +87,11 @@
   --tabbar-h: 3.5rem;
   --content-max: 1560px;
   --focus: #7dd3fc;
+
+  /* account context (plan §4.3): tracks --amber/--amber-soft in both themes, so defining this once
+     here (rather than duplicating in the light overrides below) is enough. */
+  --book-accent: var(--amber);
+  --book-accent-soft: var(--amber-soft);
 }
 
 :root[data-theme="light"] {

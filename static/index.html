@@ -6,17 +6,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="color-scheme" content="dark light" />
   <meta name="referrer" content="same-origin" />
-  <link rel="stylesheet" href="/static/css/tokens.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/base.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/shell.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/overview.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/charts.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/detail.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/settings.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/alerts.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/chat.css?v=20261015-1" />
-  <link rel="stylesheet" href="/static/css/views.css?v=20261015-1" />
-  <script src="/static/js/theme-boot.js?v=20261015-1"></script>
+  <link rel="stylesheet" href="/static/css/tokens.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/base.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/shell.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/overview.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/charts.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/detail.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/settings.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/alerts.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/chat.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/views.css?v=20261021-1" />
+  <link rel="stylesheet" href="/static/css/practice.css?v=20261021-1" />
+  <script src="/static/js/theme-boot.js?v=20261021-1"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -24,6 +25,11 @@
   <div id="app">
     <header class="statusbar" id="statusbar">
       <h1 class="brand">Portfolio<span class="brand-sub"> Watch</span></h1>
+
+      <div class="seg book-switch" id="book-switch" role="group" aria-label="Account context">
+        <button type="button" class="book-btn" data-book="real" aria-pressed="true">Real</button>
+        <button type="button" class="book-btn" data-book="practice" aria-pressed="false">Practice</button>
+      </div>
 
       <div class="sb-chips" id="sb-chips">
         <span class="chip sb-data" id="sb-data" role="status" aria-live="off">
@@ -62,6 +68,11 @@
       </div>
     </header>
 
+    <div class="book-banner" id="book-banner" role="status" hidden>
+      <span class="book-banner-icon" aria-hidden="true">&#9679;</span>
+      <span class="book-banner-text" id="book-banner-text"></span>
+    </div>
+
     <main id="main" class="main" tabindex="-1">
       <section id="view-overview" class="view" data-view="overview" aria-label="Overview"></section>
       <section id="view-digest" class="view" data-view="digest" aria-label="Digest" hidden></section>
@@ -75,8 +86,8 @@
   <noscript><p class="noscript">This dashboard needs JavaScript.</p></noscript>
 
   <!-- Sanitiser and parser first, then the app (an ES module: deferred, runs after both). -->
-  <script src="/static/dompurify.min.js?v=20261015-1"></script>
-  <script src="/static/marked.min.js?v=20261015-1"></script>
-  <script type="module" src="/static/js/main.js?v=20261015-1"></script>
+  <script src="/static/dompurify.min.js?v=20261021-1"></script>
+  <script src="/static/marked.min.js?v=20261021-1"></script>
+  <script type="module" src="/static/js/main.js?v=20261021-1"></script>
 </body>
 </html>

@@ -12,6 +12,7 @@ import { el, clear, fmtEur, fmtDateTime24 } from '../util.js';
 import { apiGet, apiSend, latestRequest } from '../api.js';
 import * as store from '../store.js';
 import { openDialog, confirmDialog, renderState, toast, stamp } from '../ui.js';
+import { getBook, subscribeBook } from '../book.js';
 import { refreshConfig, refreshWatchlist, refreshAll } from '../data.js';
 
 /* ================================================================== helpers */
@@ -1218,6 +1219,11 @@ export function openSettings({ tab } = {}) {
 
   function renderPositions() {
     const p = panels.positions;
+    if (getBook() === 'practice') {
+      // Practice positions belong to the agent (Trading 212 demo bucket): no editor, nothing is ever PUT for them.
+      renderState(p, { empty: 'Positions in Practice are managed by the agent on the Trading 212 demo account; switch to Real to edit your portfolio.' });
+      return;
+    }
     if (gate(p)) return;
     clear(p);
     const holdings = holdingDrafts();
@@ -1721,6 +1727,7 @@ export function openSettings({ tab } = {}) {
       el('section', { class: 'st-sec' }, el('h3', { class: 'card-title', text: 'About' }), about));
     paintModelBox();
   }
+  offs.push(subscribeBook(() => { renderPositions(); paintFlags(); paintSave(); }));
   offs.push(store.subscribe('themePref', v => {
     const val = v || 'system';
     root.querySelectorAll(`input[type="radio"][name="st-theme-${uid}"]`).forEach(r => { r.checked = r.value === val; });
@@ -1874,7 +1881,7 @@ export function openSettings({ tab } = {}) {
     const issues = [];
     const note = (tabKey, key, message) => { S.err.set(key, message); issues.push({ tab: tabKey, message }); };
     validateWatchlist(S.wl).forEach(e => note('watchlist', `wl:${e.key}:${e.field || 'general'}`, e.message));
-    const pv = validatePositions([...S.pos.values()], holdingIdSet());
+    const pv = getBook() === 'practice' ? { errors: [], portfolio: null } : validatePositions([...S.pos.values()], holdingIdSet());
     pv.errors.forEach(e => note('positions', `pos:${e.id}:${e.field}`, e.message));
     let pol = null;
     if (S.pol) {
@@ -1913,6 +1920,7 @@ export function openSettings({ tab } = {}) {
     paintSave();
     setStatus('Saving\u2026');
     const body = { watchlist: buildWatchlist(S.wl), portfolio: v.pv.portfolio, chatModel: S.chatModel, ...(v.pol ? v.pol.body : {}) };
+    if (getBook() === 'practice') delete body.portfolio; // Practice never writes positions
     const r = await apiSend('PUT', '/api/config', body, { timeoutMs: 30000 });
     if (S.closed) return;
     if (!r.ok) {

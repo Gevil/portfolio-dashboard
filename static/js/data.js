@@ -3,6 +3,7 @@
 // keeps the last good data when a refresh fails (slot.error is set, slot.data survives).
 import { apiGet, latestRequest } from './api.js';
 import { slot, slotApply, slotLoading, set as setStore } from './store.js';
+import { withBook, getBook } from './book.js';
 
 function loader(key, url, { timeoutMs = 25000 } = {}) {
   const lr = latestRequest();
@@ -16,8 +17,8 @@ function loader(key, url, { timeoutMs = 25000 } = {}) {
   };
 }
 
-/** GET /api/portfolio -> slot 'portfolio' */
-export const refreshPortfolio = loader('portfolio', '/api/portfolio');
+/** GET /api/portfolio (book-aware: ?book=practice when the Practice context is active) -> slot 'portfolio' */
+export const refreshPortfolio = loader('portfolio', () => withBook('/api/portfolio'));
 /** GET /api/prices -> slot 'prices' (array of price items incl. sparkline; usLive optional) */
 export const refreshPrices = loader('prices', '/api/prices');
 /** GET /api/config -> slot 'config' */
@@ -38,15 +39,20 @@ export const refreshPolicy = loader('policy', '/api/policy');
 export const refreshEvents = loader('events', '/api/events?days=30');
 /** GET /api/alert-rules -> slot 'alertRules' (effective v3 rules + sigma {id: {sigmaPct}}) */
 export const refreshAlertRules = loader('alertRules', '/api/alert-rules');
-/** GET /api/portfolio/risk -> slot 'risk' (C4: exposures, volatility, beta, drawdown, correlation, concentration) */
-export const refreshRisk = loader('risk', '/api/portfolio/risk', { timeoutMs: 30000 });
+/** GET /api/portfolio/risk -> slot 'risk' (C4: exposures, volatility, beta, drawdown, correlation, concentration).
+ * Real book only: risk is not offered for Practice (server answers 400, card hidden by capabilities). */
+const loadRisk = loader('risk', '/api/portfolio/risk', { timeoutMs: 30000 });
+export const refreshRisk = () => (getBook() === 'real' ? loadRisk() : Promise.resolve(null));
+/** GET /api/paper/status -> slot 'paperStatus' ({enabled, mode, broker, bucket, season, banner, worker, liveAvailable, bucketId, buckets}).
+ * Practice asks for the selected bucket's block (`?book=practice&bucket=`); `buckets` always lists every bucket. */
+export const refreshPaperStatus = loader('paperStatus', () => withBook('/api/paper/status'));
 
 /** Reload everything the shell shows (after a settings save, on manual refresh). */
 export function refreshAll() {
   return Promise.all([
     refreshPortfolio(), refreshPrices(), refreshConfig(), refreshWatchlist(),
     refreshAlerts(), refreshLane(), refreshMarketLight(),
-    refreshAdvice(), refreshPolicy(), refreshEvents(), refreshAlertRules(), refreshRisk(),
+    refreshAdvice(), refreshPolicy(), refreshEvents(), refreshAlertRules(), refreshRisk(), refreshPaperStatus(),
   ]);
 }
 

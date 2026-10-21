@@ -501,6 +501,13 @@ async def model(range_key: str = "3M") -> dict:
                                                             axis).items():
                     net[d] = net.get(d, 0.0) + v
         twr = performance.twr_series(pv, flows, axis)
+        bad_days = performance.inconsistent_flow_days(pv, flows, axis)
+        if bad_days:
+            _warn(warnings, "flow_exceeds_value",
+                  "A lot's cost is larger than the value it added on "
+                  + ", ".join(bad_days) + " (check that priceEur is the per-share "
+                  "price, not the order total); those days are left out of the TWR",
+                  None)
     costs = [_invested(portfolio[e["id"]]) for e in included]
     cost = sum(costs) if costs and all(c is not None for c in costs) else None
 

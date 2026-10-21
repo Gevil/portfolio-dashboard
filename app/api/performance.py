@@ -240,14 +240,34 @@ def net_invested_by_day(lots: list[dict], axis: list[str]) -> dict[str, float]:
 def daily_returns(values: dict[str, float], flows: dict[str, float],
                   axis: list[str]) -> list[tuple[str, float]]:
     """[(day, r)] with ``r = (V_d - F_d) / V_{d-1} - 1`` for every day after
-    the first whose previous value is positive."""
+    the first whose previous value is positive. A day with ``V_d - F_d <= 0``
+    (a loss of 100 % or more, impossible for a long-only book) means the day's
+    flow is inconsistent with the value it added (e.g. a lot whose ``priceEur``
+    holds the order total instead of the per-share price); it is skipped, never
+    compounded, and :func:`inconsistent_flow_days` reports it."""
     out = []
     for prev, d in zip(axis, axis[1:]):
         v0 = values.get(prev)
         v1 = values.get(d)
         if v0 is None or v1 is None or v0 <= 0:
             continue
-        out.append((d, (v1 - flows.get(d, 0.0)) / v0 - 1.0))
+        net = v1 - flows.get(d, 0.0)
+        if net <= 0:
+            continue
+        out.append((d, net / v0 - 1.0))
+    return out
+
+
+def inconsistent_flow_days(values: dict[str, float], flows: dict[str, float],
+                           axis: list[str]) -> list[str]:
+    """Days skipped by :func:`daily_returns` because ``V_d - F_d <= 0``."""
+    out = []
+    for prev, d in zip(axis, axis[1:]):
+        v0, v1 = values.get(prev), values.get(d)
+        if v0 is None or v1 is None or v0 <= 0:
+            continue
+        if v1 - flows.get(d, 0.0) <= 0:
+            out.append(d)
     return out
 
 

@@ -122,6 +122,22 @@ def test_twr_of_an_empty_axis_is_empty():
     assert perf.twr_series({}, {}, []) == []
 
 
+def test_a_lot_priced_at_the_order_total_is_skipped_not_compounded():
+    # Real-world entry error: priceEur holds the order total (1000) for 5 shares
+    # trading at 100, so the day's flow (5000) dwarfs the value it added (500).
+    # Compounding that day gave a TWR far below -100 %; it must be left out and
+    # reported instead.
+    closes = [100.0, 100.0, 100.0, 110.0]
+    lots = [lot("2026-09-01", 1.0, 100.0), lot("2026-09-03", 5.0, 1000.0)]
+    held = perf.shares_by_day(lots, AXIS)
+    values = {d: held[d] * c for d, c in zip(AXIS, closes)}
+    flows = perf.flows_by_day(lots, AXIS)
+    series = perf.twr_series(values, flows, AXIS)
+    assert all(x > -1.0 for _, x in series)
+    assert series[-1][1] == pytest.approx(0.10)          # only the real price move
+    assert perf.inconsistent_flow_days(values, flows, AXIS) == ["2026-09-03"]
+
+
 # ------------------------------------------------------------------- XIRR
 
 D0 = datetime.date(2025, 1, 1)

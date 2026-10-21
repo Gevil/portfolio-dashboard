@@ -357,8 +357,17 @@ def note_skip(src: str) -> None:
     _h(src)["skipped"] += 1
 
 
+def yahoo_enabled() -> bool:
+    """Yahoo news returns nothing from this host: off unless UNIVERSE_NEWS_YAHOO=1."""
+    return os.getenv("UNIVERSE_NEWS_YAHOO", "").strip() == "1"
+
+
 def health() -> dict:
-    return {s: dict(_h(s)) for s in SOURCES}
+    out = {s: dict(_h(s)) for s in SOURCES}
+    if not yahoo_enabled():
+        out["yfinance"] = {**out["yfinance"], "disabled": True, "consecutiveFails": 0,
+                           "backoffUntil": 0, "lastError": None}
+    return out
 
 
 async def _pace(src: str) -> None:
@@ -535,7 +544,7 @@ async def _fetch_topnews(row: dict) -> list[dict]:
 
 def calls_for(row: dict) -> list[tuple[str, object, tuple]]:
     """(source, fetcher, extra args) in the order they run for one registry row."""
-    calls: list[tuple[str, object, tuple]] = [("yfinance", _fetch_yfinance, ())]
+    calls: list[tuple[str, object, tuple]] = [("yfinance", _fetch_yfinance, ())] if yahoo_enabled() else []
     if row.get("kind") == "equity":
         calls.append(("google", _fetch_google, ("en",)))
         home = home_language(row)
@@ -701,6 +710,10 @@ def ingest(pid: str, cands: list[dict], source: str, now: float | None = None) -
 
 # ------------------------------------------------------------------ earnings observations (PIT)
 
+CARRIED = "carried"                 # observation source: the last known future date, kept while the calendar is empty
+CALENDAR_SOURCE = "yfinance.calendar"
+
+
 def _index_earnings(rows: list[dict]) -> dict[str, list[tuple]]:
     by_id: dict[str, list[tuple]] = {}
     for r in rows:
@@ -708,25 +721,39 @@ def _index_earnings(rows: list[dict]) -> dict[str, list[tuple]]:
         day = r.get("date")
         if not isinstance(pid, str) or fetched is None or not (day is None or _to_date(day)):
             continue
-        by_id.setdefault(pid, []).append((fetched, _to_date(day) if day else None))
+        by_id.setdefault(pid, []).append((fetched, _to_date(day) if day else None,
+                                          CARRIED if r.get("source") == CARRIED else CALENDAR_SOURCE))
     for obs in by_id.values():
-        obs.sort()
+        obs.sort(key=lambda o: o[0])
     return by_id
 
 
 def next_earnings(pid: str, cutoff: float) -> dict | None:
     """The newest observation fetched at or before ``cutoff``: ``{"date": ISO | None, "fetchedAt": epoch}``, or None
-    when none exists yet. ``date`` None = the calendar had no upcoming date then."""
+    when none exists yet. ``date`` None = the calendar had no upcoming date then. A date kept alive by the
+    carry-forward also has ``"source": "carried"``."""
     obs = [o for o in _cached_rows(EARNINGS_FILE, _index_earnings).get(pid, []) if o[0] <= cutoff]
     if not obs:
         return None
-    fetched, day = obs[-1]
-    return {"date": day, "fetchedAt": fetched}
+    fetched, day, src = obs[-1]
+    out = {"date": day, "fetchedAt": fetched}
+    if src == CARRIED:
+        out["source"] = CARRIED
+    return out
 
 
-def record_earnings(pid: str, day: str | None, fetched: float) -> bool:
+def carried_earnings(pid: str, today_iso: str) -> str | None:
+    """The date to carry forward when the calendar has none today: the date of the newest observation that had one,
+    while it is today or later (it passes the day after). None when no such observation exists or it has passed."""
+    for _fetched, day, _src in reversed(_cached_rows(EARNINGS_FILE, _index_earnings).get(pid, [])):
+        if day is not None:
+            return day if day >= today_iso else None
+    return None
+
+
+def record_earnings(pid: str, day: str | None, fetched: float, source: str = CALENDAR_SOURCE) -> bool:
     return append_jsonl(EARNINGS_FILE, [{"id": pid, "date": day, "fetchedAt": iso_ceil(fetched),
-                                         "source": "yfinance.calendar"}])
+                                         "source": source}])
 
 
 # ------------------------------------------------------------------ worker state and schedule
@@ -845,7 +872,11 @@ async def _earnings_step(rows: dict[str, dict], now: float, deadline: float) -> 
             if res is None:
                 raise SourceError("http", "yfinance calendar unavailable")
             fetched = _now()
-            if not record_earnings(row["id"], res[0], fetched):
+            day, src = res[0], CALENDAR_SOURCE
+            if day is None:                      # an empty calendar must not erase a known future date
+                day = carried_earnings(row["id"], today)
+                src = CARRIED if day else CALENDAR_SOURCE
+            if not record_earnings(row["id"], day, fetched, src):
                 raise SourceError("http", "earnings store not writable")
         except asyncio.CancelledError:
             raise

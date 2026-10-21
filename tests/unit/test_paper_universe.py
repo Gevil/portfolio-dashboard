@@ -47,6 +47,7 @@ class FakeYF:
         self.calls = []
         self.daily = {}     # (symbol, period) -> rows | None | Exception
         self.bars = {}      # (symbol, interval, period) -> bars | None | Exception
+        self.adj = {}       # (symbol, period) -> [(date, raw, adj | None)] | None | Exception
 
     async def __call__(self, key, fn, *args):
         self.calls.append((fn.__name__, args))
@@ -54,6 +55,8 @@ class FakeYF:
             val = self.daily.get((args[0], args[1]))
         elif fn is prices._yf_bars_blocking:
             val = self.bars.get((args[0], args[1], args[2]))
+        elif fn is prices._yf_daily_adj_blocking:
+            val = self.adj.get((args[0], args[1]))
         else:
             raise AssertionError(f"unexpected yahoo call {fn.__name__}")
         if isinstance(val, Exception):
@@ -70,6 +73,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(pu, "STORE_FILE", tmp_path / "paper_universe.json")
     monkeypatch.setattr(pu, "SEED_FILE", seed)
     monkeypatch.setattr(pu, "_closes_cache", {})
+    monkeypatch.setattr(pu, "_adj_cache", {})
     monkeypatch.setattr(pu, "_quote_cache", {})
     monkeypatch.setattr(pu, "_intraday_cache", {})
     monkeypatch.setattr(pu, "_load_cache", {"sig": None, "doc": None})
@@ -218,6 +222,66 @@ def test_daily_closes_never_raises(env):
     assert run(pu.daily_closes("SAP", "3d")) == []
     assert run(pu.daily_closes(None, "2y")) == []
     assert len(env.yf.calls) == n
+
+
+# a 2:1 split on 2026-10-16 and a 1.00 dividend: raw closes fall, adjusted closes stay smooth
+ADJ_ROWS = [("2026-10-14", 200.0, 98.0), ("2026-10-15", 204.0, 100.0), ("2026-10-16", 102.0, 102.0),
+            ("2026-10-19", 103.0, None)]
+
+
+def test_adj_closes_returns_the_adjusted_series_and_leaves_the_raw_one_alone(env):
+    env.yf.adj[("SAP.DE", "2y")] = ADJ_ROWS
+    env.yf.daily[("SAP.DE", "2y")] = [(d, c) for d, c, _a in ADJ_ROWS]
+    assert run(pu.adj_closes("sap", "2y")) == [("2026-10-14", 98.0), ("2026-10-15", 100.0), ("2026-10-16", 102.0)]
+    assert run(pu.daily_closes("SAP", "2y")) == [(d, c) for d, c, _a in ADJ_ROWS]      # the raw output is unchanged
+
+
+def test_adj_closes_never_fills_a_missing_adjusted_value_from_the_raw_close(env):
+    env.yf.adj[("SAP.DE", "2y")] = [("2026-10-14", 200.0, None), ("2026-10-15", 204.0, None)]
+    assert run(pu.adj_closes("SAP", "2y")) == []
+
+
+def test_adj_closes_is_cached_for_six_hours_serves_the_cache_on_failure_and_never_raises(env):
+    sym = ("SAP.DE", "2y")
+    env.yf.adj[sym] = ADJ_ROWS
+    first = run(pu.adj_closes("SAP", "2y"))
+    first.append(("x", 1.0))                                   # a copy: the cache is not affected
+    env.clock["t"] += 6 * 3600 - 1
+    assert run(pu.adj_closes("SAP", "2y")) == [("2026-10-14", 98.0), ("2026-10-15", 100.0), ("2026-10-16", 102.0)]
+    assert len(env.yf.calls) == 1
+    env.clock["t"] += 2
+    env.yf.adj[sym] = None                                     # expired entry + a failed refetch: last value
+    assert len(run(pu.adj_closes("SAP", "2y"))) == 3
+    env.yf.adj[sym] = RuntimeError("boom")
+    assert len(run(pu.adj_closes("SAP", "2y"))) == 3
+    n = len(env.yf.calls)
+    assert run(pu.adj_closes("NOPE", "2y")) == [] and run(pu.adj_closes("SAP", "3d")) == [] and run(pu.adj_closes(None)) == []
+    assert len(env.yf.calls) == n
+
+
+def test_the_adjusted_fetch_keeps_the_raw_close_and_adds_adj_close(monkeypatch):
+    import pandas as pd
+    idx = pd.DatetimeIndex(["2026-10-14", "2026-10-15", "2026-10-16", "2026-10-19"], tz="Europe/Berlin")
+    frame = pd.DataFrame({"Close": [200.0, 204.0, 102.0, float("nan")], "Adj Close": [98.0, float("nan"), 102.0, 103.0]},
+                         index=idx)
+    asked = []
+
+    class T:
+        def __init__(self, sym):
+            self.sym = sym
+
+        def history(self, period, interval, auto_adjust):
+            asked.append((self.sym, period, interval, auto_adjust))
+            return frame
+
+    monkeypatch.setattr(prices.yf, "Ticker", T)
+    got = prices._yf_daily_adj_blocking("SAP.DE", "2y")
+    assert got == [("2026-10-14", 200.0, 98.0), ("2026-10-15", 204.0, None), ("2026-10-16", 102.0, 102.0)]
+    assert asked == [("SAP.DE", "2y", "1d", False)]                      # unadjusted bars: raw closes match the quotes
+    assert [(d, c) for d, c, _a in got] == prices._yf_daily_blocking("SAP.DE", "2y")      # same rows as the raw reader
+    monkeypatch.setattr(T, "history", lambda self, period, interval, auto_adjust: frame.drop(columns=["Adj Close"]))
+    assert prices._yf_daily_adj_blocking("SAP.DE", "2y") == [("2026-10-14", 200.0, None), ("2026-10-15", 204.0, None),
+                                                              ("2026-10-16", 102.0, None)]
 
 
 # ------------------------------------------------------------------ quote

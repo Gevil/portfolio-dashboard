@@ -682,6 +682,27 @@ def _yf_daily_blocking(sym: str, period: str) -> list[tuple[str, float]]:
     return out
 
 
+def _yf_daily_adj_blocking(sym: str, period: str) -> list[tuple[str, float, float | None]]:
+    """Executor only. [(exchange-local iso date, raw close, adjusted close | None)] of daily bars.
+
+    The raw close is the same value `_yf_daily_blocking` returns (auto_adjust=False); `Adj Close` is Yahoo's
+    split- and dividend-adjusted close of the same row, None when the column or the value is missing or not
+    positive. Only returns, momentum and ranges may use the adjusted value; prices and valuation stay raw."""
+    tk = yf.Ticker(sym)
+    hist = tk.history(period=period, interval="1d", auto_adjust=False)
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return []
+    has_adj = "Adj Close" in hist.columns
+    out = []
+    for ts, row in hist.iterrows():
+        c = _finite(row.get("Close"))
+        if c is None or c <= 0:
+            continue
+        a = _finite(row.get("Adj Close")) if has_adj else None
+        out.append((ts.date().isoformat(), c, a if a is not None and a > 0 else None))
+    return out
+
+
 def _yf_info_blocking(sym: str) -> dict:
     return yf.Ticker(sym).info or {}
 

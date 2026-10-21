@@ -68,6 +68,7 @@ LABEL_MIN_SHARE = 0.8
 STALE_ENTRY_DAYS = 5
 BOOT_N = 2000
 GRADED_ROLES = ("scheduled", "fallback")
+STALE_ROLE = "excluded"                 # status rows of names left out for stale data: never graded
 PLAYBOOK = ta_pipeline.PLAYBOOK_DIR / "forecaster.md"
 
 DATA_DIR = pathlib.Path(os.getenv("HISTORY_DIR", "/app/data"))
@@ -556,7 +557,7 @@ async def run(ids, *, arms=("B",), horizons=HORIZONS, cohort: str | None = None,
     role = role or cohort_role(cohort)
     prog = progress if progress is not None else {}
     out: dict = {"cohort": cohort, "role": role, "asOf": as_of_iso, "arms": list(arms), "horizons": list(horizons),
-                 "unknown": [], "packetFailed": {}, "samples": {"asked": 0, "valid": 0, "invalid": 0, "laneErrors": 0},
+                 "unknown": [], "packetFailed": {}, "stale": {}, "samples": {"asked": 0, "valid": 0, "invalid": 0, "laneErrors": 0},
                  "fallback": {"opus": [], "sonnet": [], "hold": []}, "d": {"done": [], "failed": []},
                  "invalidPool": [], "pending": [], "complete": False}
 
@@ -585,10 +586,20 @@ async def run(ids, *, arms=("B",), horizons=HORIZONS, cohort: str | None = None,
         except Exception as e:
             out["packetFailed"][pid] = f"{type(e).__name__}: {str(e)[:100]}"
             log.warning("forecasts: packet %s/%s failed: %s", cohort, pid, type(e).__name__)
-    ids_ok = [p for p in want if p in pk]
+    for pid in want:
+        if pid in pk and packets.is_stale(pk[pid]["packet"]):
+            ds = pk[pid]["packet"]["dataStatus"]
+            out["stale"][pid] = (f"last close {ds.get('lastClose')} is older than the last completed {ds.get('venue')} "
+                                 f"session {ds.get('expectedSession')}")
+            log.warning("forecasts: %s/%s excluded: %s", cohort, pid, out["stale"][pid])
+    ids_ok = [p for p in want if p in pk and p not in out["stale"]]
 
     def base(pid):
         return _base(cohort, role, as_of_iso, pid, pk[pid]["sha256"])
+
+    # a stale name gets one status row per horizon (p null, role "excluded": never graded, never a hold forecast)
+    _emit(st, [_agg(base(pid), "B", NONE, h, None, role=STALE_ROLE, error=packets.STALE_STATUS, status=packets.STALE_STATUS)
+               for pid in out["stale"] for h in horizons if not st.has_agg(pid, "B", h, NONE)])
 
     # ---- code arms
     prog["phase"] = "code arms"

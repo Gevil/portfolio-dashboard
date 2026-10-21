@@ -186,7 +186,7 @@ Per batch, under the lock, in this order:
 - **Two buckets, one demo account**: `daily` (everything that existed before: top-level `paperTrading` keys, `s1`) and `intraday`
   (`paperTrading.buckets.intraday {enabled, mode, strategyVersion "i1", budgetEur, intervalMin 15|30|60|120, flatAtClose, limits}`;
   `config_edit` rejects unknown keys / bucket ids; the universe is shared). A disabled or absent intraday block is mode `off`.
-  Intraday limits = daily limits, then `maxOrdersPerDay 12 / maxTurnoverPctPerDay 100 / rebalanceBandPct 2 / minTradeEur 25`, then the block's own.
+  Intraday limits = daily limits, then `maxOrdersPerDay 12 / maxTurnoverPctPerDay 100 / rebalanceBandPct 2 / minTradeEur 25 / adjustFraction 0.5`, then the block's own.
 - **`app/api/paper_buckets.py`** (the API the intraday worker uses): `ids()`, `validate(b)` (None/"" = daily, unknown -> `BadBucket`),
   `cfg(b)` (merged mode/strategyVersion/budgetEur/limits/universe/costModel + `enabled`, `intervalMin`, `flatAtClose`), `path(b, name)`,
   `suffixed(daily_path, b)`. Everything else reads config through `paper_eval._paper_cfg(bucket)` (the test seam),
@@ -229,6 +229,10 @@ the forecaster (`forecasts.latest`, arm B) ranks them, the PM decides, the risk 
   limits): `maxPositions` 10 (drops the lowest-weighted NEW names; held names never), `maxWeightPct {equity 20, etf 40}`, `maxSectorPct` 40 (scales the
   targets of one `sector`; names without a sector are exempt), `minPositionEur` 50 (a new name below it is skipped, a held one is sold out), plus
   all earlier limits. Skipped reasons `max_positions`, `below_min_position`; warning `sector_capped:<sector>`. `exempt_caps` (seed) skips them.
+- **Partial adjustment** (`adjustFraction`, 0 < f <= 1; default daily 0.15, intraday 0.5; validated in `config_edit`): `plan_orders` moves each name only a fraction of the way to its target.
+  diff = target - actual (% of equity); the band applies to the ORIGINAL diff; step = max(f*|diff|, minStep) capped at |diff|, minStep = max(`minTradeEur`, `minPositionEur` if not held)/equity;
+  effective target = actual +/- step (`plan["targetsEffective"]`; `targetsApplied` stays the clipped target). A target of 0 whose held remainder would fall below `minPositionEur` sells out.
+  `exempt_caps` (seed) ignores it; so does a flat-everything call (`cash_pct` 100 and every target 0: flat-at-close).
 - **Seasons / benchmarks**: an open season's baseline is buy and hold of `EUNL` (primary; `baselineWeights {"EUNL": 100}`, so metrics, compare, the
   kill switch's vs-baseline and the PM feedback measure against it), with `benchmarks {sxr8, real}` (SXR8 and the owner's real weights, frozen at
   start) drawn by `history()` as `indexed.buy_hold_sxr8` / `buy_hold_real`. `POST /api/paper/new-season {book, bucket, strategyVersion}`
@@ -268,7 +272,7 @@ Point-in-time news for every registry name; the only news the forecast packets r
   starts no new name after 240 s. Cadence on the container-local clock: held names + the top 30 candidates (`forecast_worker.held_ids` / `top_candidates`) every 30 min inside 07:00-22:00,
   every other name (and the hot names outside that window) every 3 h, and a FULL sweep of the registry in the 2.5 h before the close of the week's last XETR session (the weekly cohort's as-of).
   `last` per id, the sweep marker and the earnings check times persist in `data/universe_news/state.json`, so a restart does not re-sweep.
-- **Sources** (all free, each its own spacing, health row and backoff, isolated per call): `yfinance` (`Ticker(yahoo).news` through `prices._yf`, backoff key `universe_news`), `google` (Google News RSS by company name + id,
+- **Sources** (all free, each its own spacing, health row and backoff, isolated per call): `yfinance` news (`Ticker(yahoo).news` through `prices._yf`, backoff key `universe_news`; DISABLED by default because it returns nothing from this host: set `UNIVERSE_NEWS_YAHOO=1` to re-enable; the health row shows `disabled: true`, not failing), `google` (Google News RSS by company name + id,
   English plus de/nl/fr taken from the ISIN country DE/AT/NL/FR), `gdelt` (DOC API, through `topnews._gdelt_space_out`, `_gdelt_backoff_until` and the persisted `gdelt_backoff.json`; a 429 sets that shared marker at once),
   `finnhub` (company-news, US ISINs only, via `providers.finnhub._get` and its own 429 backoff), `topnews` (the watchlist cache, disk only), `calendar` (yfinance earnings dates). ETFs: yfinance + topnews only.
   A failure counts on the source's health row; a rate limit backs the source off at once (120 s doubling to 1 h), other errors after 3 in a row. `GET /api/paper/news` and `status()["sources"]` show `ok/fail/skipped/items/lastError/backoffUntil`.
@@ -287,6 +291,25 @@ Point-in-time news for every registry name; the only news the forecast packets r
   ingestion never waits for it. Allowance `EVENTS_TURN_CAP` (default 2000/day, outside the 30-turn total). **Nothing reads the cards** (a test pins it): do not add them to a packet before the week-12 readout.
 - Test seams: `universe_news._now` / `_mono` / `_sleep` / `_get` / `_gdelt_pace` / `_finnhub_news` / `focus_ids` / `_yf_news_blocking` / `_yf_calendar_blocking`, `NEWS_DIR` / `EARNINGS_FILE` / `STATE_FILE`,
   `topnews.GDELT_BACKOFF_FILE`, `event_cards._now` / `CARDS_DIR` / `QUEUE_FILE`, `lane_client.chat` / `can_start`; `reset_state()` in both modules; `forecast_packets._news_rows` / `_earnings_obs`.
+
+## Data feeds (`data_feeds.py`, `regime_feed.py`, `consensus_log.py`, `regulators.py`)
+Free accuracy feeds from `docs/research/data-sources.md` section 4 (items 2, 4, 6, 7). Gate `DATA_FEEDS_ENABLED` (default: on when `FORECAST_ENABLED=1`; `0` = off), read at `start()`.
+- **Worker** `data_feeds` (in `BACKGROUND_MODULES`, `ops_watch` key `worker-stale:data_feeds`, `interval_s` = `WATCH_INTERVAL_S`): polls every 60 s and runs four isolated steps; cadence markers in `data/data_feeds/state.json`.
+  A pass is not ok only when a step crashed or two or more attempted sources all failed (one failing source shows on its health row, `status()["sources"]`: `ok/fail/items/consecutiveFails/lastError/backoffUntil`).
+  Backoff per source: a 429 backs off at once, other errors after 3 in a row, 120 s doubling to 1 h. Spacing in `regime_feed.SPACING_S` (ECB/FRED 1 s, AFM 2 s, BDIF 1.2 s, OpenFIGI 2.6 s, consensus 1 s). Descriptive `User-Agent` only: FRED hung on a `Mozilla/...` one.
+- **Regime** (hourly): `regime_feed.refresh_ecb/refresh_fred` -> `data/regime/<YYYY-MM>.jsonl` `{key, value, date, source, ingestedAt}`; a row is appended when the newest observation changed or none was stored this UTC month.
+  Keys `ecb.{mro,dfr,dfrLastChange,estr,aaa10y,eurusd}` and `fred.{vix,us10y}` (keyless FRED CSV; `macro.refresh_fred` and its keyed path are untouched, so packet inputs do not change).
+  **Reader** `regime_feed.pit(as_of_iso)` -> `{"ecb": {...}, "fred": {...}}`, each `{value, date, source}` of the newest row with `ingestedAt <= as_of`, else the literal `"MISSING"`. A bare date as-of means the end of that UTC day.
+- **Consensus** (daily, XETR session days from close + 30 min, equities only): `consensus_log.run_snapshot` -> `data/consensus/<YYYY-MM>.jsonl` `{id, targetMean, targetHigh, targetLow, recKey, recMean, nAnalysts, fetchedAt}` (yfinance `info` through `prices._yf`, key `consensus_log`;
+  three failed names in a row end the pass; ids done today persist, so a restart resumes). **Readers** `pit(id, as_of_iso)` (newest row with `fetchedAt <= as_of` or None) and `revisions(id, as_of_iso)` -> `{targetMeanChg7dPct, targetMeanChg30dPct, recMeanChg30d}`:
+  newest row vs the newest row at or before its own time minus 7/30 days (reference no older than +4/+10 days), None per field when either side has < 3 analysts or a missing value; None overall without a row. **No packet reads it** (week-12 readout first, >= 60 sessions); DataQuality must not add it to the packets.
+- **Regulators** (daily from 08:00 Berlin): AFM short-position CSV (UTF-8 BOM or cp1252, matched by ISIN) and AMF BDIF `DD`/`VAD` notices (French ISINs, one search by legal name per name and type, metadata only). Typed rows go into the universe news store with `source: "regulator"`, `kind short_position|directors_dealing`,
+  `regulator`, `eventDate`, `ingestedAt`, `eventHash` (+ `holder`/`netShortPct` or `docId`/`url`); they have NO `title`, so `pit_news`/`recent` never show them. Dedupe hashes in `regulators_state.json`; readers collapse duplicates. **Reader** `regulators.pit_events(id, as_of_iso, days)` ->
+  `[{kind, regulator, event_date, ingested_at, net_short_pct}]` newest first, no URL/holder text. BaFin, Stooq, Euronext, Boerse Frankfurt and the AFM MAR export are NOT used (robots/ToS/no amounts). The BDIF JSON field names and the AFM header wording were never captured: both parsers are tolerant and an unreadable item/header is dropped or a `parse` failure (probe once and pin a fixture before relying on them).
+- **Identity audit** (monthly, first pass of a Berlin month): every registry ISIN + venue exchange code (`XETR GY, XAMS NA, XPAR FP, XBRU BB, XMIL IM`) in batches of 10 to OpenFIGI (keyless). `compare_identity` reports `venue` (Yahoo suffix vs registry venue), `listing` (no listing on that exchange), `ticker` (Yahoo base not among the listed tickers), `name` (no plausible name match).
+  Result in `data/data_feeds/identity.json`; `ops_watch.identity_findings` raises ONE grouped finding `identity-mismatch` while the audit is younger than 14 days. Report only, never an automatic registry change; the fix is a registry/seed edit by the owner.
+- **FX**: `forex._ecb_latest` (ECB EXR reference rate, inverted, newest observation <= 6 days old) is the second provider of the USD->EUR chain (Frankfurter -> ECB -> Yahoo -> cache).
+- **Tests**: `tests/unit/test_data_feeds.py`. Seams: `regime_feed._request` / `_now` / `_mono` / `_sleep` (every data-feed HTTP call), `regime_feed.REGIME_DIR`, `consensus_log.CONSENSUS_DIR`, `universe_news.NEWS_DIR` (regulator rows), `data_feeds.STATE_FILE` / `IDENTITY_FILE`, `prices._yf`; `reset_state()` in `regime_feed`, `regulators`, `data_feeds`.
 
 ## Invariants
 - **Real is untouched**: without `?book=` (or `book=real`) the `/api/portfolio*` routes run the original code and payloads

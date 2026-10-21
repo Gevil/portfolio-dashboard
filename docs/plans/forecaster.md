@@ -92,3 +92,4 @@ The practice buckets are no longer limited to the owner's 3 holdings. Goal: make
 (registry loader merges the seed, daily Trading 212 mapping, paper_universe pricing everywhere, risk limits `maxPositions` / `maxSectorPct` /
 `minPositionEur`), the s2 daily PM and the i2 intraday agent + slot schedule, EUNL / SXR8 / real-weights benchmarks, `POST /api/paper/new-season`. The
 owner switches by setting the source and calling new-season on an empty bucket; with no forecasts yet the PM holds. See `skills/paper-trading` ("Open universe").
+Orders move only a fraction of the way to the target per decision (`adjustFraction`, daily 0.15 / intraday 0.5, `targetsEffective` in the plan).

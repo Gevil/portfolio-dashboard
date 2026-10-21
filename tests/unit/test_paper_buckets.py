@@ -114,7 +114,7 @@ def test_the_default_intraday_limits_apply_without_an_override(conf):
     block, _ = conf
     block["buckets"] = {"intraday": {"enabled": True, "mode": "demo"}}
     assert pb.cfg("intraday")["limits"] == {"maxOrdersPerDay": 12, "maxTurnoverPctPerDay": 100,
-                                            "rebalanceBandPct": 2, "minTradeEur": 25}
+                                            "rebalanceBandPct": 2, "minTradeEur": 25, "adjustFraction": 0.5}
 
 
 def test_a_disabled_intraday_bucket_can_never_be_in_a_trading_mode(conf):

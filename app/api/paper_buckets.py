@@ -55,7 +55,7 @@ OPEN_UNIVERSE_LIMITS = {"maxPositions": 10, "maxWeightPct": {"equity": 20, "etf"
                         "maxSectorPct": 40, "minPositionEur": 50}
 DEFAULT_COST_MODEL = {"spreadBps": 10.0, "commissionEur": 0.0, "fxBps": 0.0}
 INTRADAY_DEFAULT_LIMITS = {"maxOrdersPerDay": 12, "maxTurnoverPctPerDay": 100,
-                           "rebalanceBandPct": 2, "minTradeEur": 25}
+                           "rebalanceBandPct": 2, "minTradeEur": 25, "adjustFraction": 0.5}
 SHARED_FILES = ("orders",)
 
 DATA_DIR = pathlib.Path(os.getenv("HISTORY_DIR", "/app/data"))

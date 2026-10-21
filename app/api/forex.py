@@ -1,8 +1,8 @@
 """USD->EUR rates (key-free) for the data layer and the /api/forex endpoint.
 
 Latest rate chain: frankfurter.dev (ECB reference, follows redirects) ->
-yahoo ``EURUSD=X`` -> last cached value (also persisted to ``forex.json`` so a
-restart keeps it). Every result carries its provenance:
+the ECB Data Portal reference rate itself (EXR csvdata) -> yahoo ``EURUSD=X`` -> last cached value (also persisted to
+``forex.json`` so a restart keeps it). Every result carries its provenance:
 
     {"rate": float | None, "source": str | None, "asOf": epoch_s | None,
      "stale": bool}
@@ -132,6 +132,28 @@ async def _frankfurter_latest(client: httpx.AsyncClient) -> float | None:
     return _sane((payload.get("rates") or {}).get("EUR"))
 
 
+ECB_EXR_URL = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A"
+ECB_MAX_AGE_DAYS = 6          # ECB publishes on TARGET days only: a longer gap is a dead feed, not a weekend
+
+
+async def _ecb_latest(client: httpx.AsyncClient) -> float | None:
+    """USD->EUR from the ECB reference rate (USD per EUR, inverted). None when the newest observation is too old."""
+    from app.api import regime_feed         # lazy: regime_feed -> universe_news -> prices
+    r = await client.get(ECB_EXR_URL, params={"format": "csvdata", "lastNObservations": 5},
+                         headers={"User-Agent": regime_feed.USER_AGENT})
+    if r.status_code != 200:
+        log.warning("ecb non-2xx: %d", r.status_code)
+        return None
+    obs = regime_feed.parse_ecb_csv(r.content)
+    if not obs:
+        return None
+    day, usd_per_eur = obs[-1]
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    if usd_per_eur <= 0 or (today - datetime.date.fromisoformat(day)).days > ECB_MAX_AGE_DAYS:
+        return None
+    return _sane(1.0 / usd_per_eur)
+
+
 def _yahoo_eurusd_blocking(period: str) -> list[tuple[str, float]]:
     """[(iso_day, USD per EUR)] from yahoo daily bars (executor only)."""
     import math
@@ -160,6 +182,7 @@ async def _yahoo_latest(_client: httpx.AsyncClient) -> float | None:
 
 _PROVIDERS = (
     ("frankfurter", _frankfurter_latest),
+    ("ecb", _ecb_latest),
     ("yahoo", _yahoo_latest),
 )
 

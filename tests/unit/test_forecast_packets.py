@@ -56,7 +56,7 @@ def env(monkeypatch, tmp_path):
     state = {"closes": series(), "bars": [], "vix": [{"date": "2026-10-30", "value": 31.0},
                                                        {"date": "2026-10-23", "value": 19.5},
                                                        {"date": "2026-10-22", "value": 20.1}],
-             "news": [], "obs": None, "earnings": {}, "advice": {}}
+             "news": [], "obs": None, "earnings": {}, "advice": {}, "adj": [], "feed": {}, "reg": []}
 
     async def closes(pid):
         return list(state["closes"])
@@ -69,6 +69,22 @@ def env(monkeypatch, tmp_path):
             raise state["vix"]
         return list(state["vix"])
 
+    async def adj(pid):
+        return list(state["adj"])
+
+    def feed(as_of_iso):
+        if isinstance(state["feed"], Exception):
+            raise state["feed"]
+        return state["feed"]
+
+    def reg(pid, as_of_iso, days):
+        if isinstance(state["reg"], Exception):
+            raise state["reg"]
+        return state["reg"]
+
+    monkeypatch.setattr(fp, "_adj_closes", adj)
+    monkeypatch.setattr(fp, "_regime_feed", feed)
+    monkeypatch.setattr(fp, "_regulator_events", reg)
     monkeypatch.setattr(fp, "_closes", closes)
     monkeypatch.setattr(fp, "_volume_bars", bars)
     monkeypatch.setattr(fp, "_fred_vix", vix)
@@ -192,7 +208,7 @@ def test_etf_has_no_earnings_and_a_stock_gets_its_date(env):
 
 
 @pytest.mark.parametrize("vix,above,label", [(30.0, True, "stress"), (30.0, False, "stress"), (15.0, False, "weak"),
-                                              (15.0, True, "calm"), (None, True, "calm"), (20.0, True, "neutral"),
+                                              (15.0, True, "calm"), (None, True, "neutral"), (20.0, True, "neutral"),
                                               (20.0, None, "neutral"), (None, None, None)])
 def test_regime_label_by_code(vix, above, label):
     assert fp.regime_label(vix, above) == label
@@ -397,3 +413,203 @@ def test_observation_after_the_cutoff_alone_leaves_the_cache_fallback(store):
     store["earnings"] = {"_fetched": CUTOFF - 3600, "SAP": {"date": "2026-11-09"}}
     ne = build()["nextEarnings"]
     assert ne["eventDate"] == "2026-11-09" and "macro earnings cache" in ne["source"]
+
+
+# ---------------------------------------------------------------- adjusted closes, stale gate, regime feed, regulators
+
+I_ASOF = SESSIONS.index("2026-10-23")
+EX_BACK, DIV = 3, 0.99                   # a 1 % dividend went ex three sessions before the as-of
+SPLIT_BACK = 30                          # raw closes before this session carry a 2:1 split distortion
+
+
+def e_close(back: int) -> float:
+    """The economic close ``back`` sessions before the as-of."""
+    return close_on(SESSIONS[I_ASOF - back])
+
+
+def split_and_dividend_series():
+    """(raw, adjusted): raw closes are doubled before the split; adjusted closes are scaled by the dividend factor
+    before the ex-date and are smooth otherwise."""
+    raw, adj = [], []
+    for i, d in enumerate(SESSIONS):
+        raw.append((d, close_on(d) * (2.0 if i < I_ASOF - SPLIT_BACK else 1.0)))
+        adj.append((d, close_on(d) * (DIV if i < I_ASOF - EX_BACK else 1.0)))
+    return raw, adj
+
+
+def pct(a, b):
+    return round((a / b - 1) * 100, 2)
+
+
+def test_returns_momentum_sigma_and_range_use_adjusted_closes_while_price_stays_raw(env):
+    env["closes"], env["adj"] = split_and_dividend_series()
+    pk = build()
+    last = e_close(0)
+    assert pk["price"]["close"] == last and pk["price"]["source"] == fp.CLOSES_SOURCE and pk["price"]["stale"] is False
+    assert pk["returns"]["1d"]["pct"] == pct(last, e_close(1))                       # both after the ex-date
+    assert pk["returns"]["5d"]["pct"] == pct(last, e_close(5) * DIV)                 # the dividend is not a loss
+    assert pk["returns"]["60d"]["pct"] == pct(last, e_close(60) * DIV)               # the split is not a crash
+    assert pk["week1"]["pct"] == pct(last, e_close(5) * DIV)
+    assert pk["momentum12_1"]["pct"] == pct(e_close(21) * DIV, e_close(252) * DIV)
+    assert pk["range52w"]["pctBelowHigh"] == 0.0 and pk["range52w"]["windowSessions"] == 252
+    for name in ("week1", "momentum12_1", "sigmaDaily", "range52w"):
+        assert pk[name]["source"] == fp.ADJ_SOURCE, name
+    assert all(v["source"] == fp.ADJ_SOURCE for v in pk["returns"].values())
+    assert pk["dataStatus"] == {"status": "ok", "lastClose": "2026-10-23", "expectedSession": "2026-10-23",
+                                "venue": "XETR", "basis": "adjusted"}
+    assert fp.leaks(pk) == []
+
+
+def test_without_a_usable_adjusted_series_the_raw_closes_are_used_and_labelled(env):
+    raw, adj = split_and_dividend_series()
+    env["closes"], env["adj"] = raw, []
+    on_raw = build()
+    assert on_raw["momentum12_1"]["pct"] == pct(e_close(21), 2.0 * e_close(252))      # the split distorts the raw figure
+    assert on_raw["range52w"]["pctBelowHigh"] < -40
+    assert on_raw["momentum12_1"]["source"] == fp.CLOSES_SOURCE and on_raw["dataStatus"]["basis"] == "raw"
+    env["adj"] = [(d, c) for d, c in adj if d < "2026-10-23"]                        # ends a session early: not the same rows
+    assert build()["momentum12_1"] == on_raw["momentum12_1"]
+    env["closes"], env["adj"] = raw, adj
+    on_adj = build()
+    assert on_adj["sigmaDaily"]["pct"] < on_raw["sigmaDaily"]["pct"]                  # no -69 % "return" in the sigma
+
+
+def test_a_failing_adjusted_fetch_degrades_to_the_raw_closes(env, monkeypatch):
+    async def boom(pid):
+        raise RuntimeError("yahoo down")
+
+    monkeypatch.setattr(fp, "_adj_closes", boom)
+    pk = build()
+    assert pk["dataStatus"]["basis"] == "raw" and pk["momentum12_1"]["source"] == fp.CLOSES_SOURCE
+
+
+def first_day_xams_trades_and_xetr_does():
+    day = datetime.date(2026, 1, 1)
+    while day < datetime.date(2027, 12, 31):
+        if calendars.is_session("XAMS", day) and not calendars.is_session("XETR", day):
+            return day
+        day += datetime.timedelta(days=1)
+    raise AssertionError("the calendars have no day where Amsterdam trades and Xetra is shut")
+
+
+def test_stale_gate_follows_each_venues_own_calendar(env):
+    day = first_day_xams_trades_and_xetr_does()                    # e.g. 24 Dec: Euronext trades (early close), Xetra is shut
+    sessions = calendars.sessions_between("XETR", day - datetime.timedelta(days=400), day)
+    assert sessions[-1] < day
+    env["closes"] = [(d.isoformat(), 100.0 + i) for i, d in enumerate(sessions)]
+    rows = [{"id": "SAP", "name": "SAP", "isin": "DE0007164600", "yahoo": "SAP.DE", "venue": "XETR", "kind": "equity",
+             "sector": "Technology", "role": "candidate", "t212": None},
+            {"id": "ASML", "name": "ASML", "isin": "NL0010273215", "yahoo": "ASML.AS", "venue": "XAMS", "kind": "equity",
+             "sector": "Technology", "role": "candidate", "t212": None},
+            {"id": "EUNL", "name": "World ETF", "isin": "IE00B4L5Y983", "yahoo": "EUNL.DE", "venue": "XETR", "kind": "etf",
+             "sector": "ETF", "role": "benchmark", "t212": None}]
+    jsonstore.save(paper_universe.STORE_FILE, {"asOf": "2026-10-21", "source": "test", "entries": rows})
+    sap, asml = run(fp.build("SAP", day)), run(fp.build("ASML", day))
+    assert sap["dataStatus"]["status"] == "ok" and sap["dataStatus"]["expectedSession"] == sessions[-1].isoformat()
+    assert sap["price"]["stale"] is False and not fp.is_stale(sap)
+    assert asml["dataStatus"] == {"status": "stale_data", "lastClose": sessions[-1].isoformat(),
+                                  "expectedSession": day.isoformat(), "venue": "XAMS", "basis": "raw"}
+    assert asml["price"]["stale"] is True and fp.is_stale(asml)
+    assert fp.leaks(asml) == [] and asml["price"]["close"] == sap["price"]["close"]      # same closes, different verdict
+
+
+def test_a_close_one_session_old_is_stale_and_one_older_than_the_as_of_but_current_for_the_venue_is_not(env):
+    env["closes"] = [(d, c) for d, c in series() if d <= "2026-10-22"]                       # Thursday's close on a Friday as-of
+    pk = build()
+    assert pk["dataStatus"]["status"] == "stale_data" and pk["dataStatus"]["expectedSession"] == "2026-10-23"
+    assert pk["price"]["as_of"] == "2026-10-22" and fp.is_stale(pk)
+    assert fp.is_stale({}) is False and fp.is_stale({"dataStatus": "ok"}) is False
+
+
+def test_expected_session_is_the_last_session_that_had_closed_at_the_cutoff():
+    cutoff = fp.cutoff_for(AS_OF).timestamp()
+    assert fp.expected_session("XETR", AS_OF, cutoff) == AS_OF
+    assert fp.expected_session("XAMS", AS_OF, cutoff) == AS_OF
+    assert fp.expected_session("XNYS", AS_OF, cutoff) == datetime.date(2026, 10, 22)        # New York closes after Xetra
+    thanksgiving = datetime.date(2026, 11, 26)                                              # Xetra trades, New York is shut
+    assert fp.expected_session("XETR", thanksgiving, fp.cutoff_for(thanksgiving).timestamp()) == thanksgiving
+    assert fp.expected_session("XNYS", thanksgiving, fp.cutoff_for(thanksgiving).timestamp()) == datetime.date(2026, 11, 25)
+
+
+FEED = {"ecb": {"mro": {"value": 2.65, "date": "2026-09-16", "source": "ECB Data Portal FM"},
+                "dfr": {"value": 2.5, "date": "2026-09-16", "source": "ECB Data Portal FM"},
+                "dfrLastChange": {"value": "2026-09-16", "date": "2026-09-16", "source": "ECB Data Portal FM"},
+                "estr": {"value": 2.44, "date": "2026-10-22", "source": "ECB Data Portal EST"},
+                "aaa10y": {"value": 3.1, "date": "2026-10-30", "source": "ECB Data Portal YC"}},      # dated after the as-of
+        "fred": {"vix": {"value": 18.44, "date": "2026-10-19", "source": "FRED VIXCLS"}, "us10y": "MISSING"}}
+
+
+def test_regime_gains_the_ecb_and_fred_values_known_at_the_as_of(env):
+    env["feed"] = FEED
+    reg = build()["regime"]
+    assert reg["label"] == "neutral" and reg["vix"]["level"] == 19.5                  # the old fields are untouched
+    assert reg["ecb"]["mro"] == {"value": 2.65, "as_of": "2026-09-16", "source": "ECB Data Portal FM"}
+    assert reg["ecb"]["dfrLastChange"]["value"] == "2026-09-16"
+    assert reg["ecb"]["aaa10y"] == fp.MISSING                                          # newer than the as-of: never shown
+    assert reg["ecb"]["as_of"] == "2026-10-22" and "ECB" in reg["ecb"]["source"]
+    assert reg["fred"]["vix"]["value"] == 18.44 and reg["fred"]["us10y"] == fp.MISSING and reg["fred"]["as_of"] == "2026-10-19"
+    assert fp.leaks(build()) == []
+
+
+@pytest.mark.parametrize("feed", [{}, {"ecb": "MISSING", "fred": None}, RuntimeError("feed unreadable"),
+                                  {"ecb": {"mro": {"value": 2.6, "date": "2026-11-02", "source": "x"}}, "fred": {}}])
+def test_regime_feed_fields_are_missing_when_the_reader_returns_nothing_usable(env, feed):
+    env["feed"] = feed
+    reg = build()["regime"]
+    assert reg["ecb"] == fp.MISSING and reg["fred"] == fp.MISSING
+    assert reg["label"] == "neutral"                                                   # the rest of the regime is unaffected
+
+
+def test_the_whole_regime_is_missing_without_vix_index_or_feed_and_vix_falls_back_to_the_stored_feed(env):
+    env["vix"] = RuntimeError("fred down")
+    env["closes"] = series()[I_ASOF - 99: I_ASOF + 6]                       # under 200 sessions: no index leg
+    assert build()["regime"] == fp.MISSING
+    env["feed"] = FEED                                                     # the stored FRED VIX (18.44 on 10-19)
+    reg = build()["regime"]
+    assert reg["vix"]["level"] == 18.44 and reg["vix"]["as_of"] == "2026-10-19" and "point-in-time" in reg["vix"]["source"]
+    assert reg["label"] == "neutral" and reg["index"] == fp.MISSING        # VIX known, index unknown: never "calm"
+    assert reg["ecb"]["mro"]["value"] == 2.65 and reg["as_of"] == "2026-10-22"
+
+
+def test_regulator_events_are_tags_with_a_type_and_a_date_inside_the_window(env):
+    env["reg"] = [{"kind": "short_position", "date": "2026-10-20", "holder": "Some Fund", "url": "https://x.example/a", "pct": 0.7},
+                  {"kind": "directors_dealing", "date": "2026-10-22T08:00:00", "amount": 1_000_000},
+                  {"kind": "short_position", "date": "2026-10-27"},                  # after the as-of
+                  {"kind": "short_position", "date": "2026-08-01"},                  # outside the 30-day window
+                  {"kind": "", "date": "2026-10-21"}, {"kind": "short_position"}, "junk", None]
+    pk = build()
+    sec = pk["regulatorEvents"]
+    assert sec["events"] == [{"kind": "directors_dealing", "date": "2026-10-22"},
+                             {"kind": "short_position", "date": "2026-10-20"}]
+    assert sec["windowDays"] == fp.REG_DAYS and sec["as_of"] == "2026-10-22" and "source" in sec
+    text = fp.canonical(pk).decode()
+    assert "Some Fund" not in text and "x.example" not in text and "1000000" not in text and "holder" not in text
+    assert fp.leaks(pk) == []
+
+
+@pytest.mark.parametrize("rows", [[], None, RuntimeError("store unreadable"), [{"kind": "short_position", "date": "2026-10-27"}]])
+def test_regulator_events_are_missing_when_the_reader_returns_nothing(env, rows):
+    env["reg"] = rows
+    assert build()["regulatorEvents"] == fp.MISSING
+
+
+def test_regulator_events_are_capped_newest_first(env):
+    env["reg"] = [{"kind": "short_position", "date": (datetime.date(2026, 10, 23) - datetime.timedelta(days=n)).isoformat()}
+                  for n in range(8)]
+    ev = build()["regulatorEvents"]["events"]
+    assert len(ev) == fp.REG_MAX_EVENTS and [e["date"] for e in ev] == sorted((e["date"] for e in ev), reverse=True)
+    assert ev[0]["date"] == "2026-10-23"
+
+
+def test_the_schema_version_is_bumped_and_stamped_on_every_packet(env):
+    assert fp.SCHEMA_VERSION == 2
+    assert build()["schemaVersion"] == 2
+
+
+def test_a_full_packet_with_the_new_sections_still_fits_the_budget_without_trimming_news(env):
+    env["news"] = [item("H" * 190 + str(i), 1 + i, f"d{i % 3}.com") for i in range(8)]
+    env["feed"] = FEED
+    env["reg"] = [{"kind": "short_position", "date": "2026-10-20"}, {"kind": "directors_dealing", "date": "2026-10-22"}]
+    env["closes"], env["adj"] = split_and_dividend_series()
+    pk = build()
+    assert len(pk["news"]["items"]) == fp.MAX_HEADLINES and len(fp.canonical(pk)) <= fp.PACKET_MAX_CHARS

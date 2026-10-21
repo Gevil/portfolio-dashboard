@@ -30,7 +30,7 @@ from app.api import jsonstore, market_light, notify, ops_watch, price_alerts, ru
 from app.api import approvals, jobs, ta_pipeline, triage
 from app.api import policy, tax as tax_mod
 from app.api import paper_buckets, paper_eval, paper_exec, paper_ledger, paper_pm, paper_trader
-from app.api import claude_client, forecast_routes, forecast_worker, paper_universe, universe_news
+from app.api import claude_client, data_feeds, forecast_routes, forecast_worker, paper_universe, universe_news
 
 # Background workers absorbed from retired sidecar containers/timers.
 # Every module here implements start()/async stop()/status(). One that is
@@ -39,7 +39,7 @@ from app.api import claude_client, forecast_routes, forecast_worker, paper_unive
 BACKGROUND_MODULES = [notify, kb_sync, news_alerts, jobs, digest, scoreboard_mod,
                       edgar, macro, shortvolume, filings, fundamentals,
                       rule_eval, market_light, triage, ops_watch, price_alerts,
-                      policy, paper_trader, forecast_worker, universe_news]
+                      policy, paper_trader, forecast_worker, universe_news, data_feeds]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,7 +136,7 @@ async def lifespan(app: FastAPI):
         await kb_sync.close()
     except Exception:
         log.debug("kb_sync client close failed", exc_info=True)
-    for mod in (shortvolume, filings, fundamentals, paper_trader, universe_news):
+    for mod in (shortvolume, filings, fundamentals, paper_trader, universe_news, data_feeds):
         try:
             await mod.close()
         except Exception:

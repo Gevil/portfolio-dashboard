@@ -69,7 +69,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(paper_universe, "SEED_FILE", tmp_path / "no-seed.json")
 
     st = {"now": NOW0, "sleeps": [], "lane": [], "claude": [], "claude_ok": True,
-          "lane_fn": None, "claude_fn": None, "build_error": {}}
+          "lane_fn": None, "claude_fn": None, "build_error": {}, "stale": set()}
 
     def default_lane(pid, direction, n):
         if direction == "outperform":
@@ -102,7 +102,11 @@ def env(monkeypatch, tmp_path):
     async def build(pid, as_of, ctx=None):
         if pid in st["build_error"]:
             raise packets.PacketError(st["build_error"][pid])
-        return fake_packet(pid, as_of)
+        pk = fake_packet(pid, as_of)
+        if pid in st["stale"]:
+            pk["dataStatus"] = {"status": packets.STALE_STATUS, "lastClose": "2026-10-21", "expectedSession": "2026-10-23",
+                                "venue": "XETR", "basis": "adjusted"}
+        return pk
 
     async def context(as_of):
         return {}
@@ -302,6 +306,25 @@ def test_a_packet_that_cannot_be_built_is_reported_and_the_rest_still_runs(env):
     res = go(IDS, arms=("B",))
     assert list(res["packetFailed"]) == ["S02"] and not res["complete"]
     assert not rows(id="S02") and len(rows("aggregate", arm="B")) == 10
+
+
+def test_a_stale_packet_is_left_out_not_forecast_and_leaves_one_status_row_per_horizon(env):
+    env["stale"] = {"S02"}
+    res = go(IDS, arms=("Q", "B"))
+    assert list(res["stale"]) == ["S02"] and "2026-10-21" in res["stale"]["S02"] and "2026-10-23" in res["stale"]["S02"]
+    assert res["packetFailed"] == {} and res["complete"]                 # a stale name never blocks the cohort
+    assert not [c for c in env["lane"] if c["id"] == "S02"] and env["claude"] == []     # no lane call, no fallback
+    assert not rows("sample", id="S02") and not rows("aggregate", arm="Q", id="S02")
+    marks = rows("aggregate", id="S02")
+    assert sorted(r["horizon"] for r in marks) == [5, 20]
+    assert all(r["p"] is None and r["arm"] == "B" and r["source"] == F.NONE and r["status"] == "stale_data"
+               and r["error"] == "stale_data" and r["role"] == F.STALE_ROLE for r in marks)
+    assert F.STALE_ROLE not in F.GRADED_ROLES
+    assert set(F.latest(IDS, 5)) == set(IDS) - {"S02"}                   # nothing is fabricated for it
+    assert len(rows("aggregate", arm="B")) == 5 * 2 + 2
+    size = len(F.read_log())
+    again = go(IDS, arms=("Q", "B"))                                     # the frozen packet decides again: no new rows
+    assert list(again["stale"]) == ["S02"] and len(F.read_log()) == size
 
 
 def test_unknown_ids_and_bad_arms_or_horizons(env):

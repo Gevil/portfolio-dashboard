@@ -55,6 +55,7 @@ QUOTE_STALE_S = prices.STALE_CLOSED_S         # newest bar older than this: stal
 MAX_CACHE_ENTRIES = 1000
 
 _closes_cache: dict[tuple[str, str], tuple] = {}   # (id, period) -> (rows, ts)
+_adj_cache: dict[tuple[str, str], tuple] = {}      # (id, period) -> (rows, ts)
 _quote_cache: dict[str, tuple] = {}                # id -> (quote, ts)
 _load_cache: dict = {"sig": None, "doc": None}
 
@@ -207,6 +208,38 @@ async def daily_closes(pid: str, period: str = "2y") -> list[tuple[str, float]]:
     if rows:
         _closes_cache[key] = (list(rows), _now())
         prices._prune_cache(_closes_cache, MAX_CACHE_ENTRIES)
+        return list(rows)
+    return list(cached[0]) if cached else []
+
+
+async def adj_closes(pid: str, period: str = "2y") -> list[tuple[str, float]]:
+    """[(exchange-local ISO date, Adj Close)] oldest first: Yahoo's split- and dividend-adjusted close of
+    the same daily rows `daily_closes` returns raw. For returns, momentum and ranges ONLY (price and
+    valuation stay raw). Ratios between two dates are total-return ratios up to the latest of them, so a
+    point-in-time cut of this series is leak-free; the level is not comparable with the raw close. Rows
+    whose adjusted value is missing are dropped (never filled from the raw close). Cached 6 h per
+    (id, period); a failed fetch returns the last cached value or []. Never raises; unknown ids and
+    periods -> []."""
+    key = ((pid or "").strip().upper() if isinstance(pid, str) else "", period)
+    if period not in prices.DAILY_CLOSES_PERIODS:
+        return []
+    sym = _symbol(key[0])
+    if not sym:
+        return []
+    cached = _adj_cache.get(key)
+    if cached and _now() - cached[1] < CLOSES_TTL_S:
+        return list(cached[0])
+    try:
+        raw = await prices._yf(sym, prices._yf_daily_adj_blocking, sym, period)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("paper_universe adj_closes %s failed: %s", key[0], e)
+        raw = None
+    rows = [(d, a) for d, _c, a in raw or [] if a is not None]
+    if rows:
+        _adj_cache[key] = (list(rows), _now())
+        prices._prune_cache(_adj_cache, MAX_CACHE_ENTRIES)
         return list(rows)
     return list(cached[0]) if cached else []
 

@@ -329,3 +329,110 @@ def test_claude_finding_alerts_dedupes_and_resolves_in_run_pass(claude):
     assert run_pass(claude, HOUR)["fired"] == []
     claude["c"]["status"]["lastError"] = None
     assert run_pass(claude, 2 * HOUR)["resolved"] == ["claude-auth"]
+
+
+# ------------------------------------------------------------ data-quality findings
+
+@pytest.fixture
+def earn(ow, monkeypatch):
+    from app.api import paper_universe, universe_news
+    ids = [f"E{i:02d}" for i in range(20)]
+    rows = [{"id": i, "role": "candidate", "kind": "equity"} for i in ids]
+    rows += [{"id": "ETF1", "role": "candidate", "kind": "etf"}, {"id": "EUNL", "role": "benchmark", "kind": "etf"},
+             {"id": "BENCHEQ", "role": "benchmark", "kind": "equity"}]
+    ow["findings"] = []
+    ow["ids"] = ids
+    ow["obs"] = {i: {"date": "2099-01-01", "fetchedAt": T0 - 100} for i in ids}
+    monkeypatch.setattr(universe_news, "enabled", lambda: True)
+    monkeypatch.setattr(paper_universe, "entries", lambda: rows)
+    monkeypatch.setattr(universe_news, "next_earnings", lambda pid, cutoff: ow["obs"].get(pid))
+    return ow
+
+
+def ekeys():
+    return [f["key"] for f in ops_watch.earnings_findings(T0)]
+
+
+def test_earnings_null_rate_fires_above_25_percent_of_equity_candidates_only(earn):
+    for pid in earn["ids"][:5]:                      # 5 of 20 = exactly 25 %: not above
+        earn["obs"][pid] = {"date": None, "fetchedAt": T0 - 100}
+    assert ekeys() == []
+    earn["obs"][earn["ids"][5]] = {"date": None, "fetchedAt": T0 - 100}    # 6 of 20 = 30 %
+    (f,) = ops_watch.earnings_findings(T0)
+    assert f["key"] == "earnings-null-rate" and "6 of 20" in f["body"] and "30 %" in f["body"]
+
+
+def test_etfs_and_benchmarks_are_not_in_the_earnings_denominator(earn):
+    earn["obs"]["ETF1"] = {"date": None, "fetchedAt": T0 - 100}
+    earn["obs"]["BENCHEQ"] = None
+    assert ekeys() == []
+
+
+def test_a_passed_date_and_a_never_observed_name_count_as_lacking_but_today_does_not(earn):
+    import datetime
+    from app.api import universe_news
+    today = datetime.datetime.fromtimestamp(T0, universe_news._BERLIN).date().isoformat()
+    earn["obs"][earn["ids"][0]] = {"date": today, "fetchedAt": T0 - 100}                  # reports today: present
+    for pid in earn["ids"][1:4]:
+        earn["obs"][pid] = {"date": "2000-01-01", "fetchedAt": T0 - 100}                  # passed: lacking
+    for pid in earn["ids"][4:7]:
+        del earn["obs"][pid]                                                              # never observed: lacking
+    assert ekeys() == ["earnings-null-rate"]                                              # 6 of 20
+    earn["obs"][earn["ids"][4]] = {"date": "2099-01-01", "fetchedAt": T0 - 100}           # back to 5 of 20
+    assert ekeys() == []
+
+
+def test_nothing_is_reported_before_any_name_was_ever_observed_or_with_the_worker_off(earn, monkeypatch):
+    from app.api import universe_news
+    earn["obs"].clear()
+    assert ekeys() == []
+    earn["obs"].update({i: {"date": None, "fetchedAt": T0 - 100} for i in earn["ids"]})
+    assert ekeys() == ["earnings-null-rate"]
+    monkeypatch.setattr(universe_news, "enabled", lambda: False)
+    assert ekeys() == []
+
+
+def test_the_earnings_finding_alerts_dedupes_and_resolves_in_run_pass(earn):
+    for pid in earn["ids"][:8]:
+        earn["obs"][pid] = {"date": None, "fetchedAt": T0 - 100}
+    assert run_pass(earn, 0)["fired"] == ["earnings-null-rate"]
+    assert run_pass(earn, HOUR)["fired"] == []
+    for pid in earn["ids"][:8]:                                    # the carry-forward / calendar recovered
+        earn["obs"][pid] = {"date": "2099-01-01", "fetchedAt": T0 + HOUR}
+    assert run_pass(earn, 2 * HOUR)["resolved"] == ["earnings-null-rate"]
+
+
+@pytest.fixture
+def stale(ow, monkeypatch):
+    from app.api import forecast_worker, forecasts
+    ow["findings"] = []
+    ow["cohorts"] = {}
+    monkeypatch.setattr(forecast_worker, "enabled", lambda: True)
+    monkeypatch.setattr(forecasts, "read_cohorts", lambda: dict(ow["cohorts"]))
+    return ow
+
+
+def cohort(cid, as_of, n, stale_n):
+    return {"id": cid, "asOf": as_of, "ids": [f"S{i:02d}" for i in range(n)],
+            "result": {"stale": {f"S{i:02d}": "x" for i in range(stale_n)}, "complete": True}}
+
+
+def test_stale_packet_finding_fires_above_10_percent_of_the_newest_cohort_and_clears_with_the_next(stale):
+    stale["cohorts"] = {"w1": cohort("w1", "2026-10-16", 50, 40),     # an old bad cohort is history
+                        "w2": cohort("w2", "2026-10-23", 50, 5)}      # exactly 10 %: not above
+    assert ops_watch.stale_packet_findings(T0) == []
+    stale["cohorts"]["w2"] = cohort("w2", "2026-10-23", 50, 6)
+    (f,) = ops_watch.stale_packet_findings(T0)
+    assert f["key"] == "forecast-stale-packets" and "w2" in f["body"] and "6 of 50" in f["body"]
+    assert run_pass(stale, 0)["fired"] == ["forecast-stale-packets"]
+    stale["cohorts"]["d3"] = cohort("d3", "2026-10-26", 50, 0)        # the next cohort is clean
+    assert run_pass(stale, HOUR)["resolved"] == ["forecast-stale-packets"]
+
+
+def test_stale_packet_finding_ignores_cohorts_without_a_result_and_a_disabled_forecaster(stale, monkeypatch):
+    from app.api import forecast_worker
+    stale["cohorts"] = {"w1": {"id": "w1", "asOf": "2026-10-23", "ids": ["S00"], "status": "running"}}
+    assert ops_watch.stale_packet_findings(T0) == []
+    stale["cohorts"] = {"w1": cohort("w1", "2026-10-23", 10, 10)}
+    monkeypatch.setattr(forecast_worker, "enabled", lambda: False)
+    assert ops_watch.stale_packet_findings(T0) == []

@@ -107,6 +107,7 @@ def env(monkeypatch, tmp_path):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("UNIVERSE_NEWS_ENABLED", "1")
     monkeypatch.setenv("EVENT_CARDS_ENABLED", "0")
+    monkeypatch.setenv("UNIVERSE_NEWS_YAHOO", "1")
     store = tmp_path / "universe.json"
     jsonstore.save(store, {"asOf": "2026-10-21", "source": "test", "entries": ROWS})
     monkeypatch.setattr(paper_universe, "STORE_FILE", store)
@@ -641,6 +642,49 @@ def test_earnings_are_checked_daily_and_each_success_is_a_point_in_time_observat
     assert len(env.cal_calls) >= 4
 
 
+def earnings_step_at(env, when):
+    env.clock["now"] = when
+    return run(un._earnings_step(rows_by_id(), when, 1e9))
+
+
+def test_an_empty_calendar_carries_the_last_future_date_until_it_passes(env):
+    env.calendar["SAP.DE"] = ("2026-10-23",)
+    earnings_step_at(env, NOW)
+    env.calendar["SAP.DE"] = (None,)                                      # yahoo drops the date
+    day2 = berlin(2026, 10, 22, 9)
+    earnings_step_at(env, day2)
+    assert un.next_earnings("SAP", day2 + 1) == {"date": "2026-10-23", "fetchedAt": day2, "source": "carried"}
+    assert un.next_earnings("SAP", NOW + 1) == {"date": "2026-10-23", "fetchedAt": NOW}     # the first sighting is untouched
+    day3 = berlin(2026, 10, 23, 9)                                        # the day of the report is not "passed" yet
+    earnings_step_at(env, day3)
+    assert un.next_earnings("SAP", day3 + 1) == {"date": "2026-10-23", "fetchedAt": day3, "source": "carried"}
+    day4 = berlin(2026, 10, 24, 9)                                        # passed: the calendar is honestly empty
+    earnings_step_at(env, day4)
+    assert un.next_earnings("SAP", day4 + 1) == {"date": None, "fetchedAt": day4}
+    assert [r["source"] for r in un.read_jsonl(un.EARNINGS_FILE) if r["id"] == "SAP"] == [
+        "yfinance.calendar", "carried", "carried", "yfinance.calendar"]
+
+
+def test_a_newer_calendar_date_replaces_the_carried_one_and_a_failed_fetch_records_nothing(env):
+    env.calendar["SAP.DE"] = ("2026-10-30",)
+    earnings_step_at(env, NOW)
+    env.calendar["SAP.DE"] = RuntimeError("down")                         # a failure is not an empty calendar
+    day2 = berlin(2026, 10, 22, 9)
+    earnings_step_at(env, day2)
+    assert [r["date"] for r in un.read_jsonl(un.EARNINGS_FILE) if r["id"] == "SAP"] == ["2026-10-30"]
+    env.calendar["SAP.DE"] = ("2026-11-04",)                              # the company moved the date
+    day3 = berlin(2026, 10, 23, 9)
+    earnings_step_at(env, day3)
+    assert un.next_earnings("SAP", day3 + 1) == {"date": "2026-11-04", "fetchedAt": day3}
+
+
+def test_a_name_that_never_had_a_date_is_not_given_one(env):
+    earnings_step_at(env, NOW)
+    earnings_step_at(env, berlin(2026, 10, 22, 9))
+    assert {r["source"] for r in un.read_jsonl(un.EARNINGS_FILE)} == {"yfinance.calendar"}
+    assert un.carried_earnings("ASML", "2026-10-22") is None
+
+
 def test_yf_calendar_parsing_takes_the_earliest_date_on_or_after_today(monkeypatch):
     import datetime as dt
     cals = {"A": {"Earnings Date": [dt.date(2026, 10, 10), dt.date(2026, 11, 7), dt.date(2026, 11, 5)]},
@@ -679,6 +723,17 @@ def test_a_disabled_worker_does_not_start_and_status_reports_sources(env, monkey
     st = un.status()
     assert set(st["sources"]) == set(un.SOURCES) and st["interval_s"] == un.WATCH_INTERVAL_S
     assert st["interval_s"] >= un.POLL_S + un.PASS_BUDGET_S and st["eventCards"]["queued"] == 0
+
+
+def test_yahoo_news_is_disabled_by_default_and_reported_as_disabled_not_failing(env, monkeypatch):
+    monkeypatch.delenv("UNIVERSE_NEWS_YAHOO")
+    assert all(s != "yfinance" for s, _, _ in un.calls_for(row("SAP")))
+    run(un.fetch_name(row("SAP")))
+    h = un.health()["yfinance"]
+    assert h["disabled"] is True and h["fail"] == 0 and h["lastError"] is None
+    assert un.status()["sources"]["yfinance"]["disabled"] is True
+    monkeypatch.setenv("UNIVERSE_NEWS_YAHOO", "1")
+    assert un.calls_for(row("SAP"))[0][0] == "yfinance" and "disabled" not in un.health()["yfinance"]
 
 
 def test_ops_watch_flags_the_worker_only_while_it_is_enabled(monkeypatch):

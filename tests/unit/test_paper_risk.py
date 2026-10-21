@@ -11,7 +11,8 @@ UNIVERSE = {i: {"t212": f"{i}_EQ"} for i in IDS}
 KINDS = {"A": "equity", "B": "equity", "E": "etf"}
 LIMITS = {"maxWeightPct": {"equity": 40, "etf": 100}, "minCashPct": 2,
           "maxTurnoverPctPerDay": 100, "maxOrdersPerDay": 6, "minTradeEur": 25,
-          "rebalanceBandPct": 3, "maxSpreadOrStaleS": 900, "limitSlippageBps": 30}
+          "rebalanceBandPct": 3, "maxSpreadOrStaleS": 900, "limitSlippageBps": 30,
+          "adjustFraction": 1.0}
 
 
 def quote(price=100.0, age=10, stale=False):
@@ -359,3 +360,63 @@ def test_exempt_caps_skips_the_open_limits_entirely():
                    limits={"maxWeightPct": {"equity": 100, "etf": 100}})
     assert set(res["targetsApplied"]) == {"A", "B", "C", "D"}
     assert all(v > 0 for v in res["targetsApplied"].values())
+
+
+# ---- partial adjustment (adjustFraction) -----------------------------------
+
+def pa(**kw):
+    lim = {"adjustFraction": 0.15, **kw.pop("limits", {})}
+    return run(limits=lim, **kw)
+
+
+def test_partial_adjustment_converges_gradually_over_repeated_calls():
+    qty, cash, seen = 0.0, 1000.0, []
+    for _ in range(15):
+        res = pa(targets={"A": 40}, cash_pct=None, holdings={"A": qty}, cash_eur=cash)
+        seen.append(qty * 100 / 10)
+        for i in res["intents"]:
+            qty += i.quantity
+            cash -= i.value_eur
+    assert seen[1] == pytest.approx(6.0) and seen[1] < 40
+    assert all(b >= a for a, b in zip(seen, seen[1:]))
+    assert 37 <= seen[-1] <= 40 and res["targetsApplied"] == {"A": 40}
+
+
+def test_minimum_step_prevents_paralysis_in_a_small_bucket():
+    res = pa(targets={"A": 40}, holdings={"A": 3.6}, cash_eur=640.0)     # diff 4 > band; 15 % of it is EUR 6
+    i = by_id(res)["A"]
+    assert i.side == "buy" and i.value_eur == pytest.approx(25.0)
+    assert res["targetsEffective"]["A"] == pytest.approx(38.5)
+
+
+def test_a_new_position_starts_at_least_at_min_position():
+    res = pa(targets={"A": 10}, limits={"minPositionEur": 50, "adjustFraction": 0.1})
+    assert by_id(res)["A"].value_eur >= 50 - 1e-6
+    assert res["targetsEffective"]["A"] == pytest.approx(5.0)
+
+
+def test_the_band_applies_to_the_original_difference():
+    res = pa(targets={"A": 40}, holdings={"A": 3.8}, cash_eur=620.0)     # diff 2 <= band 3
+    assert reasons(res) == {"A": "within_band"} and res["intents"] == []
+    res = pa(targets={"A": 40}, holdings={"A": 3.65}, cash_eur=635.0)    # diff 3.5 > band: trades despite a tiny 15 %
+    assert by_id(res)["A"].value_eur == pytest.approx(25.0)
+
+
+def test_exit_rule_sells_out_when_the_remainder_would_be_dust():
+    lim = {"minPositionEur": 50}
+    res = pa(targets={"A": 0}, holdings={"A": 1.0}, cash_eur=900.0, limits=lim)      # 10 % -> 7.5 % = EUR 75
+    assert by_id(res)["A"].quantity == pytest.approx(0.25)
+    res = pa(targets={"A": 0}, holdings={"A": 0.6}, cash_eur=940.0, limits=lim)      # 6 % -> 3.5 % = EUR 35 < 50
+    assert by_id(res)["A"].quantity == 0.6 and res["targetsEffective"]["A"] == 0.0
+
+
+def test_flat_everything_ignores_the_fraction():
+    res = pa(targets={"A": 0}, cash_pct=100, holdings={"A": 1.0}, cash_eur=900.0,
+             limits={"minPositionEur": 50})
+    assert by_id(res)["A"].quantity == 1.0
+
+
+def test_seed_exempt_caps_ignores_the_fraction():
+    res = pa(targets={"A": 40}, exempt_caps=True)
+    assert by_id(res)["A"].value_eur == pytest.approx(400.0)
+    assert res["targetsEffective"]["A"] == pytest.approx(40.0)

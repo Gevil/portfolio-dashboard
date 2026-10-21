@@ -34,7 +34,7 @@ TUE_EVENING = at(2026, 10, 27, 18, 30)
 
 def summary(complete=True, **over):
     out = {"cohort": "x", "samples": {"asked": 1, "valid": 1, "invalid": 0, "laneErrors": 0}, "pending": [], "pendingD": [],
-           "invalidPool": [], "packetFailed": {}, "complete": complete,
+           "invalidPool": [], "packetFailed": {}, "stale": {}, "complete": complete,
            "fallback": {"opus": [], "sonnet": [], "hold": []}, "d": {"done": [], "failed": []}}
     out.update(over)
     return out
@@ -197,7 +197,16 @@ def test_the_job_runs_the_cohort_with_its_frozen_record_and_marks_it_done(env):
     saved = F.read_cohorts()["w2026-10-23"]
     assert saved["status"] == "done" and saved["result"]["complete"] is True and saved["attempts"] == 0
     assert saved["result"]["fallback"] == {"opus": 0, "sonnet": 0, "hold": 0}
-    assert W._job["task"] is None and W._job["lastResult"] == {"cohort": "w2026-10-23", "status": "done", "complete": True}
+    assert W._job["task"] is None and W._job["lastResult"] == {"cohort": "w2026-10-23", "status": "done", "complete": True, "stale": 0}
+
+
+def test_stale_names_are_counted_in_the_cohort_result_and_the_status_and_do_not_block_done(env):
+    env["result"] = lambda: summary(True, stale={"S02": "last close 2026-10-21 is older than ...", "S03": "x"})
+    asyncio.run(W._job_main(weekly_record("running")))
+    saved = F.read_cohorts()["w2026-10-23"]
+    assert saved["status"] == "done" and sorted(saved["result"]["stale"]) == ["S02", "S03"]
+    assert W._job["lastResult"]["stale"] == 2
+    assert W.status()["staleData"] == {"w2026-10-23": 2}
 
 
 def test_an_incomplete_run_stays_running_until_its_deadline_then_is_partial(env):

@@ -31,6 +31,7 @@ DEFAULT_LIMITS = {
     "maxOrdersPerDay": 6,
     "minTradeEur": 25,
     "rebalanceBandPct": 3,
+    "adjustFraction": 0.15,
     "maxSpreadOrStaleS": 900,
     "limitSlippageBps": 30,
 }
@@ -194,6 +195,12 @@ def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
         result["targetsApplied"] = {k: round(v, 6) for k, v in clean.items()}
 
     # -- 3. per-id pre-trade checks and raw trades
+    frac = _num(lim.get("adjustFraction"))
+    frac = frac if frac is not None and 0 < frac <= 1 else 1.0
+    flatten = bool(clean) and cash_pct is not None and _num(cash_pct) == 100.0 \
+        and all(w <= 0 for w in clean.values())   # flat-at-close / go-to-cash: full exit
+    effective: dict[str, float] = {}
+    result["targetsEffective"] = effective
     sells: list[tuple] = []   # (id, qty, price, actual, target)
     buys: list[tuple] = []    # (id, value_eur, price, actual, target)
     for id_ in sorted(clean):
@@ -221,7 +228,18 @@ def plan_orders(*, targets: dict[str, float], cash_pct: float | None,
         diff = target - actual
         if not exempt_caps and abs(diff) <= band:
             skipped.append({"id": id_, "reason": "within_band"})
+            effective[id_] = round(actual, 6)
             continue
+        if not exempt_caps and not flatten:
+            min_pos = _num(lim.get("minPositionEur")) or 0.0
+            min_step = max(min_trade, min_pos if qty_held <= 0 else 0.0) / equity * 100.0
+            step = min(abs(diff), max(frac * abs(diff), min_step))
+            target = actual + (step if diff > 0 else -step)
+            if clean[id_] <= 0 and qty_held > 0 and min_pos > 0 \
+                    and target / 100.0 * equity < min_pos - 1e-9:
+                target = 0.0                       # the remainder would be dust: sell out fully
+            diff = target - actual
+        effective[id_] = round(target, 6)
         value = abs(diff) / 100.0 * equity
         if diff < 0:
             value = min(value, qty_held * price)

@@ -883,7 +883,7 @@ def test_a_resumed_kill_switch_re_arms_from_the_resume_instead_of_halting_again(
 def held_book(env, mode="demo"):
     """Season + a tracked NVDA position of 5 bought for 500 (cash 500)."""
     env.cfg["mode"] = mode
-    env.cfg["limits"] = {"maxTurnoverPctPerDay": 100}
+    env.cfg["limits"] = {"maxTurnoverPctPerDay": 100, "adjustFraction": 1.0}
     paper_ledger.write_season({"book": "practice", "strategyVersion": "s1",
                                "inceptionDate": "2026-10-01", "startedAt": 1.0,
                                "baselineWeights": {"ASML": 60.0, "NVDA": 40.0}})
@@ -1007,6 +1007,7 @@ def test_an_auth_error_while_placing_halts_the_bucket_and_pushes(env):
 
 def seed_book(env, mode="demo", weights=None):
     env.cfg["mode"] = mode
+    env.cfg["limits"] = {"adjustFraction": 1.0}
     paper_ledger.write_season({"book": "practice", "strategyVersion": "s1",
                                "inceptionDate": "2026-10-19", "startedAt": 1.0,
                                "baselineWeights": weights or {"ASML": 60.0, "NVDA": 40.0}})

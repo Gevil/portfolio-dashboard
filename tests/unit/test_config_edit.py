@@ -463,6 +463,8 @@ def test_a_bad_universe_source_is_rejected(value):
     ({"maxSectorPct": 0}, r"maxSectorPct must be in \[1, 100\]"),
     ({"maxSectorPct": 150}, r"maxSectorPct must be in \[1, 100\]"),
     ({"minPositionEur": -1}, r"minPositionEur must be in \[0, 100000\]"),
+    ({"adjustFraction": 0}, r"adjustFraction must be in \(0, 1\]"),
+    ({"adjustFraction": 1.5}, r"adjustFraction must be in \(0, 1\]"),
 ])
 def test_open_universe_limits_are_range_checked(limits, text):
     bad({"paperTrading": {"limits": limits}}, text)

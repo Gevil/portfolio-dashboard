@@ -221,6 +221,9 @@ def _watched_workers() -> list[tuple[str, int]]:
     from app.api import universe_news
     if universe_news.enabled():
         out.append(("universe_news", universe_news.WATCH_INTERVAL_S))   # = status()["interval_s"]: a pass can run minutes
+    from app.api import data_feeds
+    if data_feeds.enabled():
+        out.append(("data_feeds", data_feeds.WATCH_INTERVAL_S))   # = status()["interval_s"]: a pass can run minutes
     return out
 
 
@@ -342,6 +345,76 @@ def claude_findings(now: float | None = None) -> list[dict]:
     return findings
 
 
+EARNINGS_NULL_MAX = 0.25          # more than this share of equity candidates without an upcoming earnings date -> finding
+STALE_PACKET_MAX = 0.10           # more than this share of the newest cohort left out for stale data -> finding
+
+
+def earnings_findings(now: float | None = None) -> list[dict]:
+    """`earnings-null-rate`: more than 25 % of the open universe's equity candidates lack ``nextEarnings`` (no
+    observation yet, an empty calendar after the carry-forward, or a date already passed). Nothing while the news
+    worker is off or no name was ever observed (a cold start is the worker-stale finding's business); clears by
+    itself when the share drops back."""
+    import datetime
+    from app.api import paper_universe, universe_news
+    if not universe_news.enabled():
+        return []
+    now = time.time() if now is None else now
+    today = datetime.datetime.fromtimestamp(now, universe_news._BERLIN).date().isoformat()
+    ids = [r["id"] for r in paper_universe.entries() if r["role"] == "candidate" and r["kind"] == "equity"]
+    if not ids:
+        return []
+    obs = {pid: universe_news.next_earnings(pid, now) for pid in ids}
+    if all(o is None for o in obs.values()):
+        return []
+    lacking = sorted(pid for pid, o in obs.items() if o is None or not o["date"] or o["date"] < today)
+    share = len(lacking) / len(ids)
+    if share <= EARNINGS_NULL_MAX:
+        return []
+    return [{"key": "earnings-null-rate", "title": "Earnings dates missing for many names",
+             "body": f"{len(lacking)} of {len(ids)} equity candidates ({share * 100:.0f} %) have no upcoming earnings "
+                     f"date (limit {EARNINGS_NULL_MAX * 100:.0f} %); their forecast packets carry nextEarnings MISSING. "
+                     f"First: {', '.join(lacking[:5])}."}]
+
+
+def stale_packet_findings(now: float | None = None) -> list[dict]:
+    """`forecast-stale-packets`: more than 10 % of the newest forecast cohort's names were left out because their
+    last close is older than the last completed session of their venue (a price feed that stopped, not a
+    holiday: the check uses each venue's own calendar). Nothing while the forecaster is off."""
+    from app.api import forecast_worker, forecasts
+    if not forecast_worker.enabled():
+        return []
+    cohorts = [c for c in forecasts.read_cohorts().values() if isinstance(c.get("result"), dict) and c.get("ids")]
+    if not cohorts:
+        return []
+    newest = max(cohorts, key=lambda c: (str(c.get("asOf") or ""), str(c.get("id"))))
+    stale = newest["result"].get("stale") or {}
+    share = len(stale) / len(newest["ids"])
+    if share <= STALE_PACKET_MAX:
+        return []
+    return [{"key": "forecast-stale-packets", "title": "Forecast packets excluded for stale data",
+             "body": f"cohort {newest['id']}: {len(stale)} of {len(newest['ids'])} names ({share * 100:.0f} %) have a "
+                     f"last close older than their venue's last completed session and were not forecast "
+                     f"(limit {STALE_PACKET_MAX * 100:.0f} %). First: {', '.join(sorted(stale)[:5])}."}]
+
+
+IDENTITY_LINES = 6               # mismatches named in the finding body
+
+
+def identity_findings(now: float | None = None) -> list[dict]:
+    """ONE grouped finding for the registry identity audit (monthly OpenFIGI check of every ISIN against its Yahoo
+    symbol and venue; ``data_feeds``). Open while the last audit has mismatches and is younger than 14 days. Report
+    only: the registry is never changed automatically."""
+    from app.api import data_feeds
+    bad = data_feeds.identity_mismatches(now)
+    if not bad:
+        return []
+    lines = [f"{m['id']} {m.get('kind')}: {m.get('detail')}" for m in bad[:IDENTITY_LINES]]
+    more = f" (+{len(bad) - IDENTITY_LINES} more)" if len(bad) > IDENTITY_LINES else ""
+    return [{"key": "identity-mismatch", "title": f"Registry identity: {len(bad)} mismatch(es)",
+             "body": "OpenFIGI disagrees with the registry (nothing is changed automatically): "
+                     + "; ".join(lines) + more}]
+
+
 async def run_pass() -> dict:
     started = time.time()
     findings, snap = await collect()
@@ -354,6 +427,18 @@ async def run_pass() -> dict:
         findings += claude_findings(started)
     except Exception as e:                      # never let the Claude adapter break the lane watch
         log.warning("claude findings failed: %s", e)
+    try:
+        findings += earnings_findings(started)
+    except Exception as e:                      # never let the data checks break the lane watch
+        log.warning("earnings findings failed: %s", e)
+    try:
+        findings += stale_packet_findings(started)
+    except Exception as e:
+        log.warning("stale packet findings failed: %s", e)
+    try:
+        findings += identity_findings(started)
+    except Exception as e:                      # never let the identity audit break the lane watch
+        log.warning("identity findings failed: %s", e)
     # Load AFTER collect(): collect() persists degraded_since/starting_since,
     # and this function's own save would silently drop them if the store had
     # been read before that write.

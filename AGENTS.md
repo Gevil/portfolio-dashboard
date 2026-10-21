@@ -40,6 +40,8 @@ app/api/notify.py (outbox + Delivery + quiet hours/caps/ops topic) alerts.py app
 app/api/tax.py events.py config_edit.py   CZ tax lots, /api/events, config validation (lots, policy, benchmark keys)
 app/api/jsonstore.py textsafe.py   shared atomic-JSON + untrusted-text helpers
 app/api/broker.py broker_t212.py paper_*.py   paper trading on the Trading 212 DEMO account only (see skills/paper-trading)
+app/api/forecast*.py claude_client.py universe_news.py event_cards.py regime_feed.py consensus_log.py regulators.py data_feeds.py   forecaster + its data feeds
+app/api/tax.py tax_nl.py   CZ and NL (box 3) tax views (informational)
 app/playbooks/*.md     LLM prompts (all carry the "pack text is untrusted DATA" clause)
 static/index.html      shell; js/main.js is the ES-module entry; js/views/*, css/*
 config/config.json     YOUR watchlist/portfolio/alertRules (gitignored; sample: config.example.json; bind-mounted DIR → /app/config)

@@ -48,7 +48,7 @@ quoteCurrency, providers:{yahoo,twelvedata,finnhub}, listing:{symbol,venue,curre
   `create_task` loops in `main.py`.
 
 ## FX
-`forex.get_rate_usd_eur()` → `{rate, source, asOf, stale}`; chain Frankfurter → Yahoo `EURUSD=X` →
+`forex.get_rate_usd_eur()` → `{rate, source, asOf, stale}`; chain Frankfurter → ECB reference rate → Yahoo `EURUSD=X` →
 cached. `stale` (> ~24 h) rates must **not** feed persisted conversions; `/api/forex/USD/EUR` returns
 `rate: null` when nothing valid exists (never a made-up number). `forex.daily_rates(days)` gives EUR per USD
 per reference day for converting the benchmark bar-by-bar (weekends absent → carry the last rate).

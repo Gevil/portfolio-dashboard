@@ -137,11 +137,11 @@ async def _job_main(rec: dict) -> None:
                                   as_of=datetime.date.fromisoformat(rec["asOf"]), deadline=rec["deadline"],
                                   priority=rec.get("priority") or (), progress=_job["progress"])
         rec["attempts"] = 0
-        rec["result"] = {k: res[k] for k in ("samples", "pending", "pendingD", "invalidPool", "packetFailed", "complete")}
+        rec["result"] = {k: res[k] for k in ("samples", "pending", "pendingD", "invalidPool", "packetFailed", "stale", "complete")}
         rec["result"]["fallback"] = {k: len(v) for k, v in res["fallback"].items()}
         rec["result"]["d"] = {k: len(v) for k, v in res["d"].items()}
         rec["status"] = "done" if res["complete"] else ("partial" if _now() >= rec["deadline"] else "running")
-        _job["lastResult"] = {"cohort": rec["id"], "status": rec["status"], "complete": res["complete"]}
+        _job["lastResult"] = {"cohort": rec["id"], "status": rec["status"], "complete": res["complete"], "stale": len(res["stale"])}
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -350,4 +350,6 @@ def status() -> dict:
             "job": {"running": job_running(), "cohort": _job["cohort"], "kind": _job["kind"],
                     "startedAt": _job["startedAt"], "progress": dict(_job["progress"]), "last": _job["lastResult"]},
             "cohorts": {c: v.get("status") for c, v in sorted(cohorts.items())[-8:]},
+            "staleData": {c: len(v["result"]["stale"]) for c, v in sorted(cohorts.items())[-8:]
+                          if isinstance(v.get("result"), dict) and v["result"].get("stale")},
             "labels": _labels["last"]}

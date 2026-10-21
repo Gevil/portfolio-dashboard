@@ -61,6 +61,7 @@ _PAPER_LIMIT_RANGES = {
     "maxPositions": (1.0, 100.0),
     "maxSectorPct": (1.0, 100.0),
     "minPositionEur": (0.0, 100000.0),
+    "adjustFraction": (0.0, 1.0),
 }
 
 
@@ -496,9 +497,10 @@ def _paper_limits(raw) -> dict:
     for key, (lo, hi) in _PAPER_LIMIT_RANGES.items():
         if key in raw:
             v = _number(raw[key], f"paperTrading.limits.{key}")
-            if not lo <= v <= hi:
+            if not lo <= v <= hi or (key == "adjustFraction" and v <= 0):
                 raise ConfigInvalid(
-                    f"paperTrading.limits.{key} must be in [{lo:g}, {hi:g}]")
+                    f"paperTrading.limits.{key} must be in "
+                    + (f"(0, {hi:g}]" if key == "adjustFraction" else f"[{lo:g}, {hi:g}]"))
             out[key] = v
     return out
 

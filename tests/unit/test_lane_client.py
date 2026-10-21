@@ -34,7 +34,7 @@ def env(monkeypatch, tmp_path):
     lc.reset_probe_cache()
     monkeypatch.setattr(lc, "BUDGET_FILE", str(tmp_path / "lane_budget.json"))
     for k in ("AUTONOMOUS_TURN_BUDGET", "DIGEST_TURN_RESERVE", "TRIAGE_TURN_CAP",
-              "LANE_PREFERENCE"):
+              "TRADING_TURN_CAP", "LANE_PREFERENCE"):
         monkeypatch.delenv(k, raising=False)
     state = {"lanes": [V, B, A],               # conf order: exllama BEFORE ninfer
              "probe": {"ninfer-nvfp4": ("ok", "http://a"),
@@ -274,11 +274,15 @@ def test_default_allowances(env):
     st = lc.budget_state()
     assert st["cap"] == 30 and st["left"] == 30
     assert st["digest_reserve"] == 16 and st["triage_cap"] == 10
+    assert st["trading_cap"] == 3
     assert st["purposes"]["digest"]["left"] == 30
     assert st["purposes"]["triage"]["left"] == 10
-    assert st["purposes"]["other"]["allowance"] == 4
+    assert st["purposes"]["trading"]["allowance"] == 3
+    assert st["purposes"]["trading"]["left"] == 3
+    assert st["purposes"]["other"]["allowance"] == 1      # 30 - 16 - 10 - 3
     assert lc.budget_state("triage")["left"] == 10
-    assert lc.budget_state("approval")["left"] == 4
+    assert lc.budget_state("trading")["left"] == 3
+    assert lc.budget_state("approval")["left"] == 1
 
 
 def test_digest_reserve_is_untouchable_by_others(env):
@@ -286,10 +290,13 @@ def test_digest_reserve_is_untouchable_by_others(env):
         assert lc._charge("triage") is not None
     assert lc._charge("triage") is None
     assert lc.can_start("triage", 1) is False
-    assert lc.can_start("approval", 4) is True
-    assert lc.can_start("approval", 5) is False            # other allowance = 4
-    for _ in range(4):
-        assert lc._charge("approval") is not None
+    for _ in range(3):                                     # trading hits its own cap
+        assert lc._charge("trading") is not None
+    assert lc._charge("trading") is None
+    assert lc.can_start("trading", 1) is False
+    assert lc.can_start("approval", 1) is True
+    assert lc.can_start("approval", 2) is False            # other allowance = 1
+    assert lc._charge("approval") is not None
     assert lc._charge("other") is None
     # 14 used; the digest still has all 16 of its reserve
     st = lc.budget_state("digest")
@@ -298,13 +305,48 @@ def test_digest_reserve_is_untouchable_by_others(env):
     assert lc.can_start("digest", 17) is False
 
 
+def test_trading_turns_are_attributed_and_refundable(env):
+    charge = lc._charge("trading")
+    st = lc.budget_state("trading")
+    assert st["used"] == 1 and st["left"] == 2
+    assert st["purposes"]["trading"]["used"] == 1
+    assert st["purposes"]["other"]["used"] == 0
+    lc._refund(charge)
+    st = lc.budget_state("trading")
+    assert st["used"] == 0 and st["left"] == 3
+
+
+def test_trading_does_not_eat_digest_or_triage_allowance(env):
+    for _ in range(3):
+        assert lc._charge("trading") is not None
+    assert lc.budget_state("triage")["left"] == 10
+    assert lc.budget_state("digest")["left"] == 27         # 30 - 3 used; reserve 16 intact
+    assert lc.can_start("digest", 16) is True
+
+
 def test_env_overrides(env, monkeypatch):
+    monkeypatch.setenv("AUTONOMOUS_TURN_BUDGET", "10")
+    monkeypatch.setenv("DIGEST_TURN_RESERVE", "5")
+    monkeypatch.setenv("TRIAGE_TURN_CAP", "2")
+    monkeypatch.setenv("TRADING_TURN_CAP", "2")
+    st = lc.budget_state()
+    assert (st["cap"], st["digest_reserve"], st["triage_cap"], st["trading_cap"]) == (10, 5, 2, 2)
+    assert st["purposes"]["other"]["allowance"] == 1
+
+
+def test_trading_cap_is_clamped_first_and_other_never_goes_negative(env, monkeypatch):
     monkeypatch.setenv("AUTONOMOUS_TURN_BUDGET", "10")
     monkeypatch.setenv("DIGEST_TURN_RESERVE", "6")
     monkeypatch.setenv("TRIAGE_TURN_CAP", "2")
+    monkeypatch.setenv("TRADING_TURN_CAP", "9")            # only 2 turns are left after digest + triage
     st = lc.budget_state()
-    assert (st["cap"], st["digest_reserve"], st["triage_cap"]) == (10, 6, 2)
-    assert st["purposes"]["other"]["allowance"] == 2
+    assert st["trading_cap"] == 2 and st["purposes"]["trading"]["allowance"] == 2
+    assert st["purposes"]["other"]["allowance"] == 0
+    monkeypatch.setenv("TRIAGE_TURN_CAP", "9")             # triage clamps to 4; trading gets nothing
+    st = lc.budget_state()
+    assert (st["triage_cap"], st["trading_cap"]) == (4, 0)
+    assert st["purposes"]["other"]["allowance"] == 0
+    assert lc.can_start("trading", 1) is False
 
 
 def test_old_budget_file_is_tolerated(env, tmp_path):
@@ -473,3 +515,84 @@ def test_inline_think_block_is_not_the_answer():
     data = {"choices": [{"message": {"content": None,
                                      "reasoning_content": "secret"}}]}
     assert lc._content(data) == ""
+
+
+# ---- intraday / forecast purposes: own allowances outside the autonomous total ----
+
+def test_intraday_and_forecast_have_their_own_allowances_outside_the_total(env):
+    st = lc.budget_state()
+    assert st["cap"] == 30 and st["intraday_cap"] == 200 and st["forecast_cap"] == 1000
+    assert st["purposes"]["intraday"] == {"used": 0, "allowance": 200, "left": 200}
+    assert st["purposes"]["forecast"] == {"used": 0, "allowance": 1000, "left": 1000}
+    for _ in range(5):
+        assert lc._charge("intraday") is not None
+        assert lc._charge("forecast") is not None
+    st = lc.budget_state()
+    assert st["used"] == 0 and st["left"] == 30                   # the autonomous total is untouched
+    assert st["purposes"]["triage"]["left"] == 10 and st["digest_reserve"] == 16   # ... and the reserve
+    assert (st["purposes"]["intraday"]["used"], st["purposes"]["forecast"]["used"]) == (5, 5)
+    assert lc.can_start("trading", 3) is True
+
+
+def test_the_own_caps_come_from_the_environment_and_stop_only_that_purpose(env, monkeypatch):
+    monkeypatch.setenv("INTRADAY_TURN_CAP", "2")
+    monkeypatch.setenv("FORECAST_TURN_CAP", "0")
+    assert lc._charge("intraday") is not None and lc._charge("intraday") is not None
+    assert lc._charge("intraday") is None and lc.can_start("intraday") is False
+    assert lc._charge("forecast") is None and lc.can_start("forecast") is False
+    assert lc._charge("digest") is not None                       # the shared pool is unaffected
+    assert lc.budget_state("intraday")["left"] == 0
+
+
+def test_a_forecast_reservation_does_not_shrink_the_shared_pool(env):
+    with lc.reservation("forecast", 50):
+        st = lc.budget_state()
+        assert st["held"] == 0 and st["left"] == 30
+        assert lc.can_start("digest", 16) is True
+        assert st["purposes"]["forecast"]["left"] == 950
+        assert lc._charge("forecast") is not None
+        assert lc.budget_state()["purposes"]["forecast"]["used"] == 1
+    assert lc.budget_state()["purposes"]["forecast"]["left"] == 999
+    with pytest.raises(lc.BudgetError):
+        with lc.reservation("intraday", 201):
+            pass
+
+
+def test_refunding_an_independent_turn_never_touches_the_shared_total(env):
+    shared = lc._charge("digest")
+    token = lc._charge("intraday")
+    other = lc._charge("forecast")
+    assert lc.budget_state()["used"] == 1
+    lc._refund(token)
+    lc._refund(other)
+    st = lc.budget_state()
+    assert st["used"] == 1 and st["purposes"]["intraday"]["used"] == 0
+    assert st["purposes"]["forecast"]["used"] == 0
+    lc._refund(shared)
+    assert lc.budget_state()["used"] == 0
+
+
+# ---- events purpose: the event-card extractor's own allowance, default 2000 ----
+
+def test_events_has_its_own_allowance_outside_the_total_and_apart_from_forecast(env, monkeypatch):
+    monkeypatch.delenv("EVENTS_TURN_CAP", raising=False)
+    st = lc.budget_state()
+    assert st["events_cap"] == 2000
+    assert st["purposes"]["events"] == {"used": 0, "allowance": 2000, "left": 2000}
+    for _ in range(7):
+        assert lc._charge("events") is not None
+    st = lc.budget_state()
+    assert st["used"] == 0 and st["left"] == 30                   # the autonomous total is untouched
+    assert st["purposes"]["events"]["used"] == 7
+    assert st["purposes"]["forecast"]["used"] == 0                # a separate allowance, not 'forecast'
+    assert lc.budget_state("events")["left"] == 1993
+
+
+def test_the_events_cap_comes_from_the_environment_and_stops_only_events(env, monkeypatch):
+    monkeypatch.setenv("EVENTS_TURN_CAP", "1")
+    assert lc._charge("events") is not None
+    assert lc._charge("events") is None and lc.can_start("events") is False
+    assert lc.can_start("forecast") is True and lc._charge("digest") is not None
+    token = lc._charge("forecast")
+    lc._refund(token)
+    assert lc.budget_state()["used"] == 1                         # only the digest turn counts

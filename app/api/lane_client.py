@@ -32,8 +32,9 @@ lane+model. If the pinned lane dies mid-job the pin falls back ONCE to the next
 preferred lane and records that (``Pin.fallbacks``).
 
 The daily budget for autonomous (model-initiated) turns is per purpose:
-``digest`` has a reserve nobody else may eat into, ``triage`` is capped, the
-rest (approvals/other) gets what remains. ``reservation()`` holds a whole job's
+``digest`` has a reserve nobody else may eat into, ``triage`` and ``trading``
+(the paper PM) are capped, the rest (approvals/other) gets what remains.
+``reservation()`` holds a whole job's
 turns BEFORE the job starts; check-and-charge is one synchronous step (no
 ``await`` between the check and the charge) and a turn that never reached the
 model (lane down, timeout, HTTP >= 500) is refunded.
@@ -94,11 +95,19 @@ DEFAULT_PREFERENCE = "ninfer-nvfp4,exllama"
 DEFAULT_TURN_BUDGET = 30
 DEFAULT_DIGEST_RESERVE = 16
 DEFAULT_TRIAGE_CAP = 10
+DEFAULT_TRADING_CAP = 3
+# Own allowances OUTSIDE the autonomous total (they never count against
+# AUTONOMOUS_TURN_BUDGET and never eat the digest reserve): the intraday paper
+# agent, the forecaster experiment and the universe event-card extractor.
+DEFAULT_INTRADAY_CAP = 200
+DEFAULT_FORECAST_CAP = 1000
+DEFAULT_EVENTS_CAP = 2000
+INDEPENDENT_GROUPS = ("intraday", "forecast", "events")
 # A server that rejects an optional request field is remembered this long, so
 # every call does not pay a 400 round trip.
 REJECT_TTL_S = 3600.0
 OPTIONAL_FIELDS = ("response_format", "chat_template_kwargs")
-PURPOSES = ("digest", "triage", "approval", "other")
+PURPOSES = ("digest", "triage", "trading", "intraday", "forecast", "events", "approval", "other")
 BUDGET_FILE = os.path.join(os.getenv("HISTORY_DIR", "/app/data"),
                            "lane_budget.json")
 
@@ -641,13 +650,20 @@ def _limits() -> dict:
     reserve = min(cap, _env_int("DIGEST_TURN_RESERVE", DEFAULT_DIGEST_RESERVE))
     triage = min(cap - reserve, _env_int("TRIAGE_TURN_CAP",
                                          DEFAULT_TRIAGE_CAP))
+    trading = min(cap - reserve - triage,
+                  _env_int("TRADING_TURN_CAP", DEFAULT_TRADING_CAP))
     return {"cap": cap, "digest": reserve, "triage": triage,
-            "other": cap - reserve - triage}
+            "trading": trading, "other": cap - reserve - triage - trading,
+            "intraday": _env_int("INTRADAY_TURN_CAP", DEFAULT_INTRADAY_CAP),
+            "forecast": _env_int("FORECAST_TURN_CAP", DEFAULT_FORECAST_CAP),
+            "events": _env_int("EVENTS_TURN_CAP", DEFAULT_EVENTS_CAP)}
 
 
 def _group(purpose: str | None) -> str:
-    """digest / triage / other (approvals and unlabelled calls share 'other')."""
-    return purpose if purpose in ("digest", "triage") else "other"
+    """digest / triage / trading / intraday / forecast / events / other (approvals and
+    unlabelled calls share 'other')."""
+    return (purpose if purpose in ("digest", "triage", "trading", "intraday", "forecast", "events")
+            else "other")
 
 
 def _budget_default() -> dict:
@@ -696,8 +712,11 @@ _RES: contextvars.ContextVar[Reservation | None] = contextvars.ContextVar(
 
 
 def _held(group: str | None = None) -> int:
+    """Turns held by reservations: of one group, or (no group) of the groups
+    that count against the autonomous total."""
     return sum(r.turns_left for r in _reservations
-               if group is None or _group(r.purpose) == group)
+               if (_group(r.purpose) == group if group is not None
+                   else _group(r.purpose) not in INDEPENDENT_GROUPS))
 
 
 def _used(b: dict, group: str) -> int:
@@ -715,6 +734,8 @@ def _room(b: dict, group: str, turns: int) -> bool:
     * triage and 'other' also stay inside their own allowance.
     """
     lim = _limits()
+    if group in INDEPENDENT_GROUPS:
+        return _used(b, group) + _held(group) + turns <= lim[group]
     total_left = lim["cap"] - b["used"] - _held()
     if turns > total_left:
         return False
@@ -728,6 +749,8 @@ def _room(b: dict, group: str, turns: int) -> bool:
 
 def _left(b: dict, group: str) -> int:
     lim = _limits()
+    if group in INDEPENDENT_GROUPS:
+        return max(0, lim[group] - _used(b, group) - _held(group))
     for t in range(max(0, lim["cap"] - b["used"] - _held()), 0, -1):
         if _room(b, group, t):
             return t
@@ -744,13 +767,17 @@ def budget_state(purpose: str | None = None) -> dict:
         b = _load_budget()
         lim = _limits()
         groups = {g: {"used": _used(b, g), "allowance": lim[g],
-                      "left": _left(b, g)} for g in ("digest", "triage", "other")}
+                      "left": _left(b, g)}
+                  for g in ("digest", "triage", "trading", "intraday", "forecast", "events", "other")}
         total_left = max(0, lim["cap"] - b["used"] - _held())
         out = {"day": b["day"], "used": b["used"], "cap": lim["cap"],
                "left": groups[_group(purpose)]["left"] if purpose
                else total_left,
                "held": _held(), "digest_reserve": lim["digest"],
-               "triage_cap": lim["triage"], "purposes": groups}
+               "triage_cap": lim["triage"], "trading_cap": lim["trading"],
+               "intraday_cap": lim["intraday"], "forecast_cap": lim["forecast"],
+               "events_cap": lim["events"],
+               "purposes": groups}
         if purpose:
             out["purpose"] = purpose
         return out
@@ -804,8 +831,9 @@ def _charge(purpose: str | None):
             res.turns_left -= 1
         elif not _room(b, group, 1):
             return None
-        b["used"] += 1
         key = purpose if purpose in PURPOSES else "other"
+        if _group(key) not in INDEPENDENT_GROUPS:
+            b["used"] += 1
         b["purposes"][key] += 1
         _save_budget(b)
         return (b["day"], key, res)
@@ -818,7 +846,8 @@ def _refund(charge) -> None:
         b = _load_budget()
         if b["day"] != day:
             return                       # the ledger rolled over meanwhile
-        b["used"] = max(0, b["used"] - 1)
+        if _group(key) not in INDEPENDENT_GROUPS:
+            b["used"] = max(0, b["used"] - 1)
         b["purposes"][key] = max(0, b["purposes"][key] - 1)
         if res is not None and not res.released:
             res.turns_left += 1
@@ -1108,7 +1137,7 @@ def chat(messages: list, *, max_tokens: int = 4096, temperature=None,
     ``model`` overrides the lane's configured model id (empty = use it).
     ``autonomous=True`` is for model-initiated work: it waits for the single
     autonomous slot, charges the daily budget (``purpose`` picks the allowance:
-    digest / triage / approval / other; inside :func:`reservation` the job's
+    digest / triage / trading / approval / other; inside :func:`reservation` the job's
     held turns are used first) and refuses with ``{"error": "budget"}`` when
     spent. ``enable_thinking=False`` suppresses the lane's hidden reasoning for
     this request only (machine-consumed calls; leave it None for interactive

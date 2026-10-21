@@ -120,6 +120,47 @@
     }
   },
   "taxResidency": null,
+  "paperTrading": {
+    "mode": "off",
+    "strategyVersion": "s1",
+    "budgetEur": 1000,
+    "universe": {
+      "ASML": {
+        "t212": "ASMLa_EQ"
+      },
+      "NVDA": {
+        "t212": "NVDd_EQ"
+      },
+      "SXR8": {
+        "t212": "SXR8d_EQ"
+      }
+    },
+    "limits": {
+      "maxWeightPct": {
+        "equity": 40,
+        "etf": 100
+      },
+      "minCashPct": 2,
+      "maxTurnoverPctPerDay": 30,
+      "maxOrdersPerDay": 6,
+      "minTradeEur": 25,
+      "rebalanceBandPct": 3,
+      "maxSpreadOrStaleS": 900,
+      "limitSlippageBps": 30,
+      "killSwitch": {
+        "drawdownPct": 15,
+        "vsBaselinePct": 10,
+        "dailyLossPct": 5
+      }
+    },
+    "schedule": {
+      "decideAfter": "digest",
+      "venues": [
+        "XETR",
+        "XAMS"
+      ]
+    }
+  },
   "alertRules": {
     "version": 2,
     "default": {

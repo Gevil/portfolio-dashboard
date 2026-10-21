@@ -212,6 +212,15 @@ def _watched_workers() -> list[tuple[str, int]]:
         out.append(("news_alerts", news_alerts.NEWS_INTERVAL_S))
     if os.getenv("EDGAR_ENABLED", "0") == "1":
         out.append(("edgar", edgar.POLL_INTERVAL_S))
+    from app.api import paper_trader
+    if paper_trader.enabled():
+        out.append(("paper_trader", paper_trader.IDLE_PASS_S))   # = status()["interval_s"]
+    from app.api import forecast_worker
+    if forecast_worker.enabled():
+        out.append(("forecast_worker", forecast_worker.POLL_S))
+    from app.api import universe_news
+    if universe_news.enabled():
+        out.append(("universe_news", universe_news.WATCH_INTERVAL_S))   # = status()["interval_s"]: a pass can run minutes
     return out
 
 
@@ -241,10 +250,110 @@ def stale_worker_findings(now: float | None = None) -> list[dict]:
     return findings
 
 
+PAPER_HALT_GRACE_S = 4 * 3600     # halted this long -> the owner has not noticed
+PAPER_MISMATCH_CODES = ("ledger_mismatch", "untracked_position")
+PAPER_INVALID_RUN = 3             # consecutive scheduled decisions
+
+
+def _paper_bucket_findings(bucket: str, now: float) -> list[dict]:
+    """The three paper findings of ONE bucket. The daily bucket keeps the
+    pre-phase-5 keys and titles; the others add ``:<bucket>`` / ``(<bucket>)``."""
+    from app.api import paper_ledger, paper_pm
+    sfx = "" if bucket == "daily" else f":{bucket}"
+    tag = "" if bucket == "daily" else f" ({bucket})"
+    findings: list[dict] = []
+    halt = paper_ledger.read_halt(bucket)
+    at = halt.get("at")
+    if halt.get("halted") and isinstance(at, (int, float)) and now - at > PAPER_HALT_GRACE_S:
+        findings.append({
+            "key": f"paper-halted{sfx}", "title": f"Paper trading halted{tag}",
+            "body": f"halted {int((now - at) // 3600)} h ago by {halt.get('by') or 'unknown'}; "
+                    "resume it from the Agent card or leave it off on purpose."})
+    snaps = sorted((r for r in paper_ledger.read_snapshots(bucket) if r.get("date")),
+                   key=lambda r: r["date"])[-2:]
+    if len(snaps) == 2 and all(
+            set(PAPER_MISMATCH_CODES) & set(s.get("warnings") or []) for s in snaps):
+        findings.append({
+            "key": f"paper-ledger-mismatch{sfx}", "title": f"Paper ledger mismatch{tag}",
+            "body": f"ledger_mismatch/untracked_position on the snapshots of "
+                    f"{snaps[0]['date']} and {snaps[1]['date']}: the demo account and "
+                    "the order ledger disagree (nothing is traded to fix it)."})
+    sched = [r for r in paper_pm.read_decisions(bucket)
+             if r.get("trigger") == "schedule" and not r.get("deferred")]
+    last = sched[-PAPER_INVALID_RUN:]
+    if len(last) == PAPER_INVALID_RUN and all(not r.get("valid") for r in last):
+        findings.append({
+            "key": f"paper-decisions-invalid{sfx}", "title": f"Paper decisions invalid{tag}",
+            "body": f"the last {PAPER_INVALID_RUN} scheduled decisions "
+                    f"({last[0].get('date')} .. {last[-1].get('date')}) were unusable: "
+                    "check the PM playbook and the lane's output."})
+    return findings
+
+
+def paper_findings(now: float | None = None) -> list[dict]:
+    """Paper-trading findings per enabled bucket, same shape as the others
+    (deduped and re-alerted by ``run_pass``). Nothing when the paper worker is off."""
+    from app.api import paper_eval, paper_trader
+    if not paper_trader.enabled():
+        return []
+    now = time.time() if now is None else now
+    findings: list[dict] = []
+    for bucket in paper_eval.enabled_buckets():
+        findings += _paper_bucket_findings(bucket, now)
+    return findings
+
+
+CLAUDE_TOKEN_LIFE_DAYS = 350      # setup-tokens live one year; warn 15 days ahead
+_CLAUDE_FIX = ("run `claude setup-token`, replace CLAUDE_CODE_OAUTH_TOKEN with the new token, "
+               "then restart the pod.")
+
+
+def claude_findings(now: float | None = None) -> list[dict]:
+    """Claude subscription adapter health (nothing when it is switched off). Never carries token bytes."""
+    import datetime
+    from app.api import claude_client
+    if not claude_client.enabled():
+        return []
+    now = time.time() if now is None else now
+    st = claude_client.status()
+    findings: list[dict] = []
+    last = st.get("lastError") or {}
+    if last.get("error") == "auth":
+        findings.append({
+            "key": "claude-auth", "title": "Claude authentication failing",
+            "body": "the last Claude call ended in an auth error (token expired or revoked): " + _CLAUDE_FIX})
+    if st.get("tokenPresent") and st.get("tokenFormatOk") is False:
+        findings.append({
+            "key": "claude-token-format", "title": "Claude token has the wrong format",
+            "body": "CLAUDE_CODE_OAUTH_TOKEN is not a setup-token (expected sk-ant-oat...), so no Claude "
+                    "call is made: " + _CLAUDE_FIX})
+    seen = st.get("tokenFirstSeen")
+    if seen:
+        try:
+            first = datetime.date.fromisoformat(str(seen))
+        except ValueError:
+            first = None
+        today = datetime.datetime.fromtimestamp(now).date()
+        if first and first + datetime.timedelta(days=CLAUDE_TOKEN_LIFE_DAYS) <= today:
+            findings.append({
+                "key": "claude-token-expiring", "title": "Claude token expires soon",
+                "body": f"the current token was first seen on {seen} and setup-tokens live one year: "
+                        + _CLAUDE_FIX})
+    return findings
+
+
 async def run_pass() -> dict:
     started = time.time()
     findings, snap = await collect()
     findings += stale_worker_findings(started)
+    try:
+        findings += paper_findings(started)
+    except Exception as e:                      # never let paper state break the lane watch
+        log.warning("paper findings failed: %s", e)
+    try:
+        findings += claude_findings(started)
+    except Exception as e:                      # never let the Claude adapter break the lane watch
+        log.warning("claude findings failed: %s", e)
     # Load AFTER collect(): collect() persists degraded_since/starting_since,
     # and this function's own save would silently drop them if the store had
     # been read before that write.

@@ -75,7 +75,7 @@ CAPS_FILE = os.path.join(DATA_DIR, "notify_caps.json")
 CAP_WINDOW_S = 24 * 3600
 DEFAULT_QUIET_HOURS = "22-7"
 DEFAULT_SOURCE_CAPS = ("ops_watch=3,ops=3,triage=6,news=6,analysis=4,price=8,"
-                       "insider=6,policy=3,market_light=2")
+                       "insider=6,policy=3,market_light=2,paper=4")
 OPS_SOURCES = ("ops_watch", "ops")
 OPS_MAX_PRIORITY = 3
 QUIET_BYPASS_SOURCES = ("price", "policy")     # ... at priority 5 only

@@ -351,3 +351,218 @@ def test_new_keys_are_validated_against_the_watchlist_of_the_same_update():
     with pytest.raises(config_edit.ConfigInvalid, match="NVDA is not on"):
         apply({"watchlist": wl, "portfolio": {"ASML": {"shares": 1}},
                "exposureCurrency": {"NVDA": "USD"}})
+
+
+# -------------------------------------------------------- paperTrading
+
+def test_seed_paper_trading_block_round_trips_unchanged():
+    cfg, _ = apply({"chatModel": "lane"})
+    assert cfg["paperTrading"] == SEED["paperTrading"]
+
+
+def test_good_paper_trading_block_is_normalised():
+    cfg, _ = apply({"paperTrading": {
+        "mode": " Shadow ", "strategyVersion": " s2 ", "budgetEur": 500,
+        "universe": {"asml": {"t212": " ASMLa_EQ "}, "NVDA": {"t212": "NVDd_EQ"}},
+        "limits": {"maxWeightPct": {"EQUITY": 40, "etf": 100}, "minCashPct": 2,
+                   "maxOrdersPerDay": 6,
+                   "killSwitch": {"drawdownPct": 15, "dailyLossPct": 5}},
+        "schedule": {"decideAfter": "digest", "venues": ["XETR"]}}})
+    pt = cfg["paperTrading"]
+    assert pt["mode"] == "shadow" and pt["strategyVersion"] == "s2"
+    assert pt["budgetEur"] == 500.0
+    assert pt["universe"] == {"ASML": {"t212": "ASMLa_EQ"},
+                              "NVDA": {"t212": "NVDd_EQ"}}
+    assert pt["limits"]["maxWeightPct"] == {"equity": 40.0, "etf": 100.0}
+    assert pt["limits"]["killSwitch"] == {"drawdownPct": 15.0, "dailyLossPct": 5.0}
+    assert pt["schedule"] == {"decideAfter": "digest", "venues": ["XETR"]}
+
+
+def test_paper_trading_null_removes_the_block():
+    cfg, _ = apply({"paperTrading": None})
+    assert "paperTrading" not in cfg
+
+
+@pytest.mark.parametrize("mode,text", [
+    ("bogus", "mode must be one of"),
+    (5, "mode must be a string"),
+])
+def test_bad_paper_trading_mode_is_rejected(mode, text):
+    bad({"paperTrading": {"mode": mode}}, text)
+
+
+@pytest.mark.parametrize("mode", ["live-approve", "live-auto", "LIVE-AUTO"])
+def test_live_paper_trading_modes_are_rejected_in_phase_1(mode):
+    bad({"paperTrading": {"mode": mode}}, "not available yet")
+
+
+def test_paper_trading_universe_must_reference_a_holding():
+    bad({"paperTrading": {"universe": {"GSPC": {"t212": "X"}}}},
+        "only holdings can be traded")
+    bad({"paperTrading": {"universe": {"TSLA": {"t212": "X"}}}},
+        "not on the watchlist")
+
+
+@pytest.mark.parametrize("body,text", [
+    ({"universe": {}}, "non-empty"),
+    ({"universe": {"ASML": {}}}, r"\.t212 must be a non-empty string"),
+    ({"universe": {"ASML": {"t212": "  "}}}, r"\.t212 must be a non-empty string"),
+    ({"universe": {"ASML": "ASMLa_EQ"}}, r"must be an object \{t212: ticker\}"),
+    ({"strategyVersion": ""}, "strategyVersion must be a non-empty string"),
+    ({"strategyVersion": "x" * 33}, "strategyVersion must be <= 32"),
+    ({"budgetEur": 5}, r"budgetEur must be in \[10, 100000\]"),
+    ({"budgetEur": 200000}, r"budgetEur must be in \[10, 100000\]"),
+    ("nope", "paperTrading must be an object"),
+])
+def test_bad_paper_trading_fields_are_rejected(body, text):
+    bad({"paperTrading": body}, text)
+
+
+@pytest.mark.parametrize("limits,text", [
+    ({"bogusKey": 1}, "unknown key"),
+    ({"minCashPct": 150}, r"minCashPct must be in \[0, 100\]"),
+    ({"minCashPct": -1}, r"minCashPct must be in \[0, 100\]"),
+    ({"maxOrdersPerDay": 0}, r"maxOrdersPerDay must be in \[1, 100\]"),
+    ({"maxSpreadOrStaleS": 0}, r"maxSpreadOrStaleS must be in"),
+    ({"maxWeightPct": {}}, "maxWeightPct must be a non-empty object"),
+    ({"maxWeightPct": {"bond": 40}}, "unknown kind"),
+    ({"maxWeightPct": {"equity": 0}}, r"in \(0, 100\]"),
+    ({"maxWeightPct": {"equity": 150}}, r"in \(0, 100\]"),
+    ({"killSwitch": {"drawdownPct": 15, "junk": 1}}, "unknown key"),
+    ({"killSwitch": {"drawdownPct": 0}}, r"in \(0, 100\]"),
+    ({"killSwitch": {}}, "killSwitch must be a non-empty object"),
+    ("nope", "paperTrading.limits must be an object"),
+])
+def test_bad_paper_trading_limits_are_rejected(limits, text):
+    bad({"paperTrading": {"limits": limits}}, text)
+
+
+# -------------------------------------------------- open universe (phase 6)
+
+def test_universe_source_is_normalised_and_does_not_need_the_watchlist():
+    cfg, _ = apply({"paperTrading": {"universeSource": " Paper_Universe ", "mode": "shadow",
+                                     "limits": {"maxPositions": 10, "maxSectorPct": 40,
+                                                "minPositionEur": 50,
+                                                "maxWeightPct": {"equity": 20, "etf": 40}}}})
+    pt = cfg["paperTrading"]
+    assert pt["universeSource"] == "paper_universe" and "universe" not in pt   # nothing watchlist-bound required
+    assert pt["limits"] == {"maxPositions": 10.0, "maxSectorPct": 40.0, "minPositionEur": 50.0,
+                            "maxWeightPct": {"equity": 20.0, "etf": 40.0}}
+    cfg, _ = apply({"paperTrading": {"universeSource": "watchlist"}})
+    assert cfg["paperTrading"]["universeSource"] == "watchlist"
+
+
+@pytest.mark.parametrize("value", ["", "yahoo", None, 3, ["paper_universe"]])
+def test_a_bad_universe_source_is_rejected(value):
+    bad({"paperTrading": {"universeSource": value}}, "universeSource must be one of")
+
+
+@pytest.mark.parametrize("limits,text", [
+    ({"maxPositions": 0}, r"maxPositions must be in \[1, 100\]"),
+    ({"maxPositions": 101}, r"maxPositions must be in \[1, 100\]"),
+    ({"maxSectorPct": 0}, r"maxSectorPct must be in \[1, 100\]"),
+    ({"maxSectorPct": 150}, r"maxSectorPct must be in \[1, 100\]"),
+    ({"minPositionEur": -1}, r"minPositionEur must be in \[0, 100000\]"),
+])
+def test_open_universe_limits_are_range_checked(limits, text):
+    bad({"paperTrading": {"limits": limits}}, text)
+
+
+def test_good_cost_model_is_normalised_and_partial_keys_are_kept():
+    cfg, _ = apply({"paperTrading": {"costModel": {"spreadBps": 5, "commissionEur": "1.5"}}})
+    assert cfg["paperTrading"]["costModel"] == {"spreadBps": 5.0, "commissionEur": 1.5}
+    cfg, _ = apply({"paperTrading": {"costModel": {"spreadBps": 500, "commissionEur": 50, "fxBps": 500}}})
+    assert cfg["paperTrading"]["costModel"] == {"spreadBps": 500.0, "commissionEur": 50.0, "fxBps": 500.0}
+    cfg, _ = apply({"paperTrading": {"costModel": {"spreadBps": 0, "commissionEur": 0, "fxBps": 0}}})
+    assert cfg["paperTrading"]["costModel"]["spreadBps"] == 0.0
+
+
+@pytest.mark.parametrize("cost,text", [
+    ({"spreadBps": -1}, r"spreadBps must be in \[0, 500\]"),
+    ({"spreadBps": 501}, r"spreadBps must be in \[0, 500\]"),
+    ({"commissionEur": -0.01}, r"commissionEur must be in \[0, 50\]"),
+    ({"commissionEur": 50.5}, r"commissionEur must be in \[0, 50\]"),
+    ({"fxBps": 501}, r"fxBps must be in \[0, 500\]"),
+    ({"fxBps": -5}, r"fxBps must be in \[0, 500\]"),
+    ({"slippageBps": 1}, "unknown key"),
+    ({"spreadBps": True}, "must be a number"),
+    ({"spreadBps": "wide"}, "must be a number"),
+    ([10, 0, 0], "costModel must be an object"),
+])
+def test_bad_cost_model_is_rejected(cost, text):
+    bad({"paperTrading": {"costModel": cost}}, text)
+
+
+# ------------------------------------------------- paperTrading.buckets (phase 5)
+
+GOOD_INTRADAY = {"enabled": True, "mode": "off", "strategyVersion": "i1", "budgetEur": 1000,
+                 "intervalMin": 60, "flatAtClose": False,
+                 "limits": {"maxOrdersPerDay": 12, "killSwitch": {"dailyLossPct": 3}}}
+
+
+def test_a_good_intraday_bucket_is_normalised():
+    cfg, _ = apply({"paperTrading": {"buckets": {"intraday": {
+        **GOOD_INTRADAY, "mode": " Shadow ", "strategyVersion": " i2 ", "budgetEur": "500",
+        "intervalMin": 30.0, "flatAtClose": True,
+        "limits": {"maxWeightPct": {"EQUITY": 40}, "minTradeEur": "25"}}}}})
+    b = cfg["paperTrading"]["buckets"]["intraday"]
+    assert b == {"enabled": True, "mode": "shadow", "strategyVersion": "i2", "budgetEur": 500.0,
+                 "intervalMin": 30, "flatAtClose": True,
+                 "limits": {"maxWeightPct": {"equity": 40.0}, "minTradeEur": 25.0}}
+    assert isinstance(b["intervalMin"], int)
+
+
+def test_all_bucket_keys_are_optional_and_an_empty_block_is_valid():
+    cfg, _ = apply({"paperTrading": {"buckets": {}}})
+    assert cfg["paperTrading"]["buckets"] == {}
+    cfg, _ = apply({"paperTrading": {"buckets": {"intraday": {}}}})
+    assert cfg["paperTrading"]["buckets"] == {"intraday": {}}
+
+
+def test_the_daily_keys_survive_next_to_the_buckets():
+    cfg, _ = apply({"paperTrading": {"mode": "shadow", "budgetEur": 800,
+                                     "buckets": {"intraday": GOOD_INTRADAY}}})
+    pt = cfg["paperTrading"]
+    assert pt["mode"] == "shadow" and pt["budgetEur"] == 800.0 and "intraday" in pt["buckets"]
+
+
+@pytest.mark.parametrize("buckets,text", [
+    ("nope", "paperTrading.buckets must be an object"),
+    ([GOOD_INTRADAY], "paperTrading.buckets must be an object"),
+    ({"daily": {"enabled": True}}, r"unknown bucket\(s\) daily"),
+    ({"weekly": {}}, r"unknown bucket\(s\) weekly .*only intraday"),
+    ({"intraday": GOOD_INTRADAY, "swing": {}}, r"unknown bucket\(s\) swing"),
+    ({"intraday": "on"}, "buckets.intraday must be an object"),
+    ({"intraday": {"universe": {"ASML": {"t212": "X"}}}}, "unknown key.*universe.*shared"),
+    ({"intraday": {"schedule": {}}}, r"unknown key\(s\) schedule"),
+    ({"intraday": {"enabled": "yes"}}, "enabled must be true or false"),
+    ({"intraday": {"enabled": 1}}, "enabled must be true or false"),
+    ({"intraday": {"flatAtClose": "no"}}, "flatAtClose must be true or false"),
+    ({"intraday": {"mode": 3}}, "mode must be a string"),
+    ({"intraday": {"mode": "paper"}}, "mode must be one of off, shadow, demo"),
+    ({"intraday": {"mode": "live-auto"}}, "not available yet"),
+    ({"intraday": {"strategyVersion": ""}}, "strategyVersion must be a non-empty string"),
+    ({"intraday": {"strategyVersion": "x" * 33}}, "<= 32 characters"),
+    ({"intraday": {"budgetEur": 5}}, r"budgetEur must be in \[10, 100000\]"),
+    ({"intraday": {"budgetEur": True}}, "budgetEur must be a number"),
+    ({"intraday": {"intervalMin": 45}}, "intervalMin must be one of 15, 30, 60, 120"),
+    ({"intraday": {"intervalMin": "soon"}}, "intervalMin must be a number"),
+    ({"intraday": {"limits": "wide"}}, "paperTrading.limits must be an object"),
+    ({"intraday": {"limits": {"maxOrdersPerDay": 0}}}, r"maxOrdersPerDay must be in \[1, 100\]"),
+    ({"intraday": {"limits": {"bogus": 1}}}, r"limits: unknown key\(s\) bogus"),
+])
+def test_bad_bucket_blocks_are_rejected(buckets, text):
+    bad({"paperTrading": {"buckets": buckets}}, text)
+
+
+@pytest.mark.parametrize("interval", [15, 30, 60, 120])
+def test_the_allowed_intervals(interval):
+    cfg, _ = apply({"paperTrading": {"buckets": {"intraday": {"intervalMin": interval}}}})
+    assert cfg["paperTrading"]["buckets"]["intraday"]["intervalMin"] == interval
+
+
+def test_a_rejected_bucket_edit_leaves_the_config_untouched():
+    cfg = copy.deepcopy(SEED)
+    with pytest.raises(config_edit.ConfigInvalid):
+        config_edit.apply_update(cfg, {"paperTrading": {"buckets": {"intraday": {"intervalMin": 7}}}})
+    assert cfg["paperTrading"] == SEED["paperTrading"]

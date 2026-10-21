@@ -35,6 +35,28 @@ _SIDES = ("buy", "sell")
 _TARGET_SUM_TOL = 0.5
 _WEIGHT_SUM_MAX = 100.5
 _RESIDENCIES = ("CZ",)
+_PAPER_MODES = ("off", "shadow", "demo")
+_PAPER_LIVE_MODES = ("live-approve", "live-auto")
+_PAPER_WEIGHT_KINDS = ("equity", "etf", "index")
+_PAPER_UNIVERSE_SOURCES = ("watchlist", "paper_universe")
+_PAPER_KILL_SWITCH_KEYS = ("drawdownPct", "vsBaselinePct", "dailyLossPct")
+# costModel key -> max (all >= 0)
+_PAPER_COST_MODEL_MAX = {"spreadBps": 500.0, "commissionEur": 50.0,
+                         "fxBps": 500.0}
+# key -> (min, max) inclusive
+_PAPER_LIMIT_RANGES = {
+    "minCashPct": (0.0, 100.0),
+    "maxTurnoverPctPerDay": (0.0, 200.0),
+    "maxOrdersPerDay": (1.0, 100.0),
+    "minTradeEur": (0.0, 100000.0),
+    "rebalanceBandPct": (0.0, 100.0),
+    "maxSpreadOrStaleS": (1.0, 86400.0),
+    "limitSlippageBps": (0.0, 1000.0),
+    # open universe (universeSource "paper_universe")
+    "maxPositions": (1.0, 100.0),
+    "maxSectorPct": (1.0, 100.0),
+    "minPositionEur": (0.0, 100000.0),
+}
 
 
 class ConfigInvalid(ValueError):
@@ -359,6 +381,231 @@ def _tax_residency(value):
     raise ConfigInvalid("taxResidency must be 'CZ' or null")
 
 
+def _paper_max_weight_pct(raw) -> dict:
+    if not isinstance(raw, dict) or not raw:
+        raise ConfigInvalid("paperTrading.limits.maxWeightPct must be a "
+                            "non-empty object {kind: percent}")
+    out = {}
+    for key, pct in raw.items():
+        k = str(key).strip().lower()
+        if k not in _PAPER_WEIGHT_KINDS:
+            raise ConfigInvalid(
+                f"paperTrading.limits.maxWeightPct.{key}: unknown kind "
+                f"(expected {', '.join(_PAPER_WEIGHT_KINDS)})")
+        v = _number(pct, f"paperTrading.limits.maxWeightPct.{k}")
+        if not 0 < v <= 100:
+            raise ConfigInvalid(
+                f"paperTrading.limits.maxWeightPct.{k} must be in (0, 100]")
+        out[k] = v
+    return out
+
+
+def _paper_kill_switch(raw) -> dict:
+    if not isinstance(raw, dict) or not raw:
+        raise ConfigInvalid("paperTrading.limits.killSwitch must be a "
+                            "non-empty object")
+    unknown = set(raw) - set(_PAPER_KILL_SWITCH_KEYS)
+    if unknown:
+        raise ConfigInvalid("paperTrading.limits.killSwitch: unknown key(s) "
+                            + ", ".join(sorted(map(str, unknown))))
+    out = {}
+    for key in _PAPER_KILL_SWITCH_KEYS:
+        if key in raw:
+            v = _number(raw[key], f"paperTrading.limits.killSwitch.{key}")
+            if not 0 < v <= 100:
+                raise ConfigInvalid(
+                    f"paperTrading.limits.killSwitch.{key} must be in "
+                    "(0, 100]")
+            out[key] = v
+    return out
+
+
+def _paper_limits(raw) -> dict:
+    if not isinstance(raw, dict):
+        raise ConfigInvalid("paperTrading.limits must be an object")
+    unknown = (set(raw) - set(_PAPER_LIMIT_RANGES)
+              - {"maxWeightPct", "killSwitch"})
+    if unknown:
+        raise ConfigInvalid("paperTrading.limits: unknown key(s) "
+                            + ", ".join(sorted(map(str, unknown))))
+    out = {}
+    if "maxWeightPct" in raw:
+        out["maxWeightPct"] = _paper_max_weight_pct(raw["maxWeightPct"])
+    if "killSwitch" in raw:
+        out["killSwitch"] = _paper_kill_switch(raw["killSwitch"])
+    for key, (lo, hi) in _PAPER_LIMIT_RANGES.items():
+        if key in raw:
+            v = _number(raw[key], f"paperTrading.limits.{key}")
+            if not lo <= v <= hi:
+                raise ConfigInvalid(
+                    f"paperTrading.limits.{key} must be in [{lo:g}, {hi:g}]")
+            out[key] = v
+    return out
+
+
+def _paper_universe(raw, roles: dict) -> dict:
+    if not isinstance(raw, dict) or not raw:
+        raise ConfigInvalid("paperTrading.universe must be a non-empty "
+                            "object {id: {t212: ticker}}")
+    out = {}
+    for key, spec in raw.items():
+        pid = _known_id(key, roles, "paperTrading.universe")
+        if roles[pid] != "holding":
+            raise ConfigInvalid(f"paperTrading.universe.{pid}: only "
+                                "holdings can be traded")
+        if not isinstance(spec, dict):
+            raise ConfigInvalid(f"paperTrading.universe.{pid} must be an "
+                                "object {t212: ticker}")
+        t212 = spec.get("t212")
+        if not isinstance(t212, str) or not t212.strip():
+            raise ConfigInvalid(f"paperTrading.universe.{pid}.t212 must be "
+                                "a non-empty string")
+        out[pid] = {"t212": t212.strip()}
+    return out
+
+
+def _paper_cost_model(raw) -> dict:
+    if not isinstance(raw, dict):
+        raise ConfigInvalid("paperTrading.costModel must be an object")
+    unknown = set(raw) - set(_PAPER_COST_MODEL_MAX)
+    if unknown:
+        raise ConfigInvalid("paperTrading.costModel: unknown key(s) "
+                            + ", ".join(sorted(map(str, unknown))))
+    out = {}
+    for key, hi in _PAPER_COST_MODEL_MAX.items():
+        if key in raw:
+            v = _number(raw[key], f"paperTrading.costModel.{key}")
+            if not 0 <= v <= hi:
+                raise ConfigInvalid(
+                    f"paperTrading.costModel.{key} must be in [0, {hi:g}]")
+            out[key] = v
+    return out
+
+
+_PAPER_BUCKET_IDS = ("intraday",)
+_PAPER_BUCKET_KEYS = ("enabled", "mode", "strategyVersion", "budgetEur",
+                      "intervalMin", "flatAtClose", "limits")
+_PAPER_INTERVALS = (15, 30, 60, 120)
+
+
+def _paper_bucket(bid: str, raw) -> dict:
+    ctx = f"paperTrading.buckets.{bid}"
+    if not isinstance(raw, dict):
+        raise ConfigInvalid(f"{ctx} must be an object")
+    unknown = set(raw) - set(_PAPER_BUCKET_KEYS)
+    if unknown:
+        hint = (" (the universe is shared with the daily bucket)"
+                if "universe" in unknown else "")
+        raise ConfigInvalid(f"{ctx}: unknown key(s) "
+                            + ", ".join(sorted(map(str, unknown))) + hint)
+    out = {}
+    for key in ("enabled", "flatAtClose"):
+        if key in raw:
+            if not isinstance(raw[key], bool):
+                raise ConfigInvalid(f"{ctx}.{key} must be true or false")
+            out[key] = raw[key]
+    if "mode" in raw:
+        mode = raw["mode"]
+        if not isinstance(mode, str):
+            raise ConfigInvalid(f"{ctx}.mode must be a string")
+        m = mode.strip().lower()
+        if m in _PAPER_LIVE_MODES:
+            raise ConfigInvalid(f"{ctx}.mode {m!r} is not available yet "
+                                "(live trading is a later phase)")
+        if m not in _PAPER_MODES:
+            raise ConfigInvalid(f"{ctx}.mode must be one of "
+                                + ", ".join(_PAPER_MODES))
+        out["mode"] = m
+    if "strategyVersion" in raw:
+        sv = raw["strategyVersion"]
+        if not isinstance(sv, str) or not sv.strip():
+            raise ConfigInvalid(f"{ctx}.strategyVersion must be a non-empty string")
+        sv = sv.strip()
+        if len(sv) > 32:
+            raise ConfigInvalid(f"{ctx}.strategyVersion must be <= 32 characters")
+        out["strategyVersion"] = sv
+    if "budgetEur" in raw:
+        v = _number(raw["budgetEur"], f"{ctx}.budgetEur")
+        if not 10 <= v <= 100000:
+            raise ConfigInvalid(f"{ctx}.budgetEur must be in [10, 100000]")
+        out["budgetEur"] = v
+    if "intervalMin" in raw:
+        v = _number(raw["intervalMin"], f"{ctx}.intervalMin")
+        if v not in _PAPER_INTERVALS:
+            raise ConfigInvalid(f"{ctx}.intervalMin must be one of "
+                                + ", ".join(map(str, _PAPER_INTERVALS)))
+        out["intervalMin"] = int(v)
+    if "limits" in raw:
+        out["limits"] = _paper_limits(raw["limits"])
+    return out
+
+
+def _paper_buckets(raw) -> dict:
+    if not isinstance(raw, dict):
+        raise ConfigInvalid("paperTrading.buckets must be an object")
+    unknown = [str(k) for k in raw if k not in _PAPER_BUCKET_IDS]
+    if unknown:
+        raise ConfigInvalid("paperTrading.buckets: unknown bucket(s) "
+                            + ", ".join(sorted(unknown))
+                            + f" (only {', '.join(_PAPER_BUCKET_IDS)} is allowed)")
+    return {bid: _paper_bucket(bid, spec) for bid, spec in raw.items()}
+
+
+def _paper_trading(raw, roles: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise ConfigInvalid("paperTrading must be an object")
+    out = {}
+    if "mode" in raw:
+        mode = raw["mode"]
+        if not isinstance(mode, str):
+            raise ConfigInvalid("paperTrading.mode must be a string")
+        m = mode.strip().lower()
+        if m in _PAPER_LIVE_MODES:
+            raise ConfigInvalid(
+                f"paperTrading.mode {m!r} is not available yet (live "
+                "trading is a later phase)")
+        if m not in _PAPER_MODES:
+            raise ConfigInvalid("paperTrading.mode must be one of "
+                                + ", ".join(_PAPER_MODES))
+        out["mode"] = m
+    if "strategyVersion" in raw:
+        sv = raw["strategyVersion"]
+        if not isinstance(sv, str) or not sv.strip():
+            raise ConfigInvalid(
+                "paperTrading.strategyVersion must be a non-empty string")
+        sv = sv.strip()
+        if len(sv) > 32:
+            raise ConfigInvalid(
+                "paperTrading.strategyVersion must be <= 32 characters")
+        out["strategyVersion"] = sv
+    if "budgetEur" in raw:
+        v = _number(raw["budgetEur"], "paperTrading.budgetEur")
+        if not 10 <= v <= 100000:
+            raise ConfigInvalid("paperTrading.budgetEur must be in "
+                                "[10, 100000]")
+        out["budgetEur"] = v
+    if "universeSource" in raw:
+        src = raw["universeSource"]
+        if not isinstance(src, str) or src.strip().lower() not in _PAPER_UNIVERSE_SOURCES:
+            raise ConfigInvalid("paperTrading.universeSource must be one of "
+                                + ", ".join(_PAPER_UNIVERSE_SOURCES))
+        out["universeSource"] = src.strip().lower()
+    if "universe" in raw:
+        out["universe"] = _paper_universe(raw["universe"], roles)
+    if "limits" in raw:
+        out["limits"] = _paper_limits(raw["limits"])
+    if "costModel" in raw:
+        out["costModel"] = _paper_cost_model(raw["costModel"])
+    if "buckets" in raw:
+        out["buckets"] = _paper_buckets(raw["buckets"])
+    if "schedule" in raw:
+        sched = raw["schedule"]
+        if not isinstance(sched, dict):
+            raise ConfigInvalid("paperTrading.schedule must be an object")
+        out["schedule"] = sched
+    return out
+
+
 def _set_optional(cfg: dict, body: dict, key: str, check, roles: dict) -> None:
     """Apply ``body[key]`` through ``check``; null/"" removes the stored key
     (reader default). An absent key leaves the stored value untouched."""
@@ -407,6 +654,7 @@ def apply_update(cfg: dict, body: dict) -> list[str]:
     _set_optional(cfg, body, "exposureCurrency", _exposure_currency, roles)
     _set_optional(cfg, body, "lookThrough", _look_through, roles)
     _set_optional(cfg, body, "investmentPolicy", _investment_policy, roles)
+    _set_optional(cfg, body, "paperTrading", _paper_trading, roles)
     if "taxResidency" in body:
         cfg["taxResidency"] = _tax_residency(body["taxResidency"])
 

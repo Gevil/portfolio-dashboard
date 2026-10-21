@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import asyncio
@@ -28,6 +29,8 @@ from app.api import (evidence, filings, fundamentals, lane_client, rule_eval,
 from app.api import jsonstore, market_light, notify, ops_watch, price_alerts, runlog
 from app.api import approvals, jobs, ta_pipeline, triage
 from app.api import policy, tax as tax_mod
+from app.api import paper_buckets, paper_eval, paper_exec, paper_ledger, paper_pm, paper_trader
+from app.api import claude_client, forecast_routes, forecast_worker, paper_universe, universe_news
 
 # Background workers absorbed from retired sidecar containers/timers.
 # Every module here implements start()/async stop()/status(). One that is
@@ -36,7 +39,7 @@ from app.api import policy, tax as tax_mod
 BACKGROUND_MODULES = [notify, kb_sync, news_alerts, jobs, digest, scoreboard_mod,
                       edgar, macro, shortvolume, filings, fundamentals,
                       rule_eval, market_light, triage, ops_watch, price_alerts,
-                      policy]
+                      policy, paper_trader, forecast_worker, universe_news]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,7 +136,7 @@ async def lifespan(app: FastAPI):
         await kb_sync.close()
     except Exception:
         log.debug("kb_sync client close failed", exc_info=True)
-    for mod in (shortvolume, filings, fundamentals):
+    for mod in (shortvolume, filings, fundamentals, paper_trader, universe_news):
         try:
             await mod.close()
         except Exception:
@@ -251,6 +254,27 @@ async def basic_auth_gate(request: Request, call_next):
         return await call_next(request)
     return Response(status_code=401,
                     headers={"WWW-Authenticate": 'Basic realm="stock"'})
+
+
+def _paper_post_rejected(method: str, path: str, content_type: str | None) -> bool:
+    """True for a mutating ``/api/paper/*`` request whose body is not declared
+    ``application/json``. Browsers replay cached Basic credentials, so a
+    cross-site ``<form enctype="text/plain">`` POST could otherwise switch the
+    trading mode or place demo orders (CSRF); a form cannot set this media type
+    without a CORS preflight, which this app never grants."""
+    if method not in ("POST", "PUT", "PATCH", "DELETE") or not path.startswith("/api/paper/"):
+        return False
+    media = (content_type or "").split(";", 1)[0].strip().lower()
+    return media != "application/json"
+
+
+@app.middleware("http")
+async def paper_json_only(request: Request, call_next):
+    if _paper_post_rejected(request.method, request.url.path,
+                            request.headers.get("content-type")):
+        return JSONResponse({"error": "Content-Type must be application/json"},
+                            status_code=415)
+    return await call_next(request)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -415,10 +439,98 @@ async def post_alert_rules(request: Request):
     return JSONResponse(clean)
 
 
+_BOOKS = ("real", "practice", "live")
+
+
+def _book_or_400(book: str):
+    """(book, None) when valid, else (book, a 400 JSONResponse)."""
+    b = (book or "real").strip().lower()
+    if b not in _BOOKS:
+        return b, JSONResponse({"error": "unknown book"}, status_code=400)
+    return b, None
+
+
+_PAPER_ERRORS = (paper_eval.PaperConflict, paper_eval.PaperBadRequest,
+                 paper_eval.PaperDisabled, paper_eval.PaperUnavailable,
+                 paper_buckets.BadBucket)
+
+
+def _paper_error(e: Exception):
+    if isinstance(e, paper_eval.PaperDisabled):
+        return JSONResponse({"error": "paper_disabled"}, status_code=503)
+    if isinstance(e, paper_eval.PaperUnavailable):
+        return JSONResponse({"error": str(e) or "broker_unreachable"}, status_code=503)
+    if isinstance(e, paper_eval.PaperConflict):
+        return JSONResponse({"error": str(e)}, status_code=409)
+    if isinstance(e, (paper_eval.PaperBadRequest, paper_buckets.BadBucket)):
+        return JSONResponse({"error": str(e)}, status_code=400)
+    raise e
+
+
+def _paper_book_error(book):
+    """400 unless ``book`` is exactly ``"practice"`` (every /api/paper/* route:
+    there is no other account to act on)."""
+    if book == "practice":
+        return None
+    return JSONResponse({"error": "book must be 'practice'"}, status_code=400)
+
+
+def _bucket_or_400(bucket):
+    """(bucket id, None) for a valid ``bucket`` (absent/empty = daily), else
+    (None, a 400 response). Phase 5 §5: every paper / practice route takes it."""
+    try:
+        return paper_buckets.validate(bucket), None
+    except paper_buckets.BadBucket as e:
+        return None, JSONResponse({"error": str(e)}, status_code=400)
+
+
+async def _paper_body(request: Request):
+    """(body, None), or (None, a 400 response) for a missing/non-object body."""
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "body must be an object"}, status_code=400)
+    return body, None
+
+
+async def _paper_post(request: Request):
+    """(body, bucket, None) for a POST whose ``book`` is practice and whose
+    ``bucket`` is valid, else (None, None, the 400 response)."""
+    body, bad = await _paper_body(request)
+    if bad:
+        return None, None, bad
+    bad = _paper_book_error(body.get("book"))
+    if bad:
+        return None, None, bad
+    bucket, bad = _bucket_or_400(body.get("bucket"))
+    if bad:
+        return None, None, bad
+    return body, bucket, None
+
+
 @app.get("/api/portfolio")
-async def get_portfolio():
-    """EUR-native positions, totals, benchmark and warnings."""
-    return JSONResponse(await portfolio_mod.snapshot())
+async def get_portfolio(book: str = Query("real"), bucket: str | None = None):
+    """EUR-native positions, totals, benchmark and warnings.
+
+    ``book=practice`` serves the Trading 212 demo bucket (``paper_eval``) of
+    ``bucket`` (daily by default); ``real`` (default/absent) is the original,
+    byte-identical payload (``bucket`` is validated but unused there)."""
+    b, err = _book_or_400(book)
+    if err:
+        return err
+    bkt, err = _bucket_or_400(bucket)
+    if err:
+        return err
+    if b == "real":
+        return JSONResponse(await portfolio_mod.snapshot())
+    if b == "live":
+        return JSONResponse({"error": "live book not available"}, status_code=400)
+    try:
+        return JSONResponse(await paper_eval.portfolio_snapshot(bkt))
+    except (paper_eval.PaperDisabled, paper_eval.PaperUnavailable) as e:
+        return _paper_error(e)
 
 
 def _bad_range(rng: str):
@@ -432,32 +544,378 @@ def _bad_range(rng: str):
 
 
 @app.get("/api/portfolio/history")
-async def get_portfolio_history(range: str = Query("3M")):
+async def get_portfolio_history(range: str = Query("3M"), book: str = Query("real"),
+                                bucket: str | None = None):
+    b, err = _book_or_400(book)
+    if err:
+        return err
+    bkt, err = _bucket_or_400(bucket)
+    if err:
+        return err
     rng = range.upper()
-    return _bad_range(rng) or JSONResponse(await portfolio_mod.history(rng))
+    if b == "real":
+        return _bad_range(rng) or JSONResponse(await portfolio_mod.history(rng))
+    if b == "live":
+        return JSONResponse({"error": "live book not available"}, status_code=400)
+    bad = _bad_range(rng)
+    if bad:
+        return bad
+    try:
+        return JSONResponse(await paper_eval.history(rng, bkt))
+    except (paper_eval.PaperDisabled, paper_eval.PaperUnavailable) as e:
+        return _paper_error(e)
 
 
 @app.get("/api/portfolio/performance")
-async def get_portfolio_performance(range: str = Query("3M")):
+async def get_portfolio_performance(range: str = Query("3M"), book: str = Query("real"),
+                                    bucket: str | None = None):
     """TWR, XIRR and the excess over the performance benchmark."""
+    b, err = _book_or_400(book)
+    if err:
+        return err
+    bkt, err = _bucket_or_400(bucket)
+    if err:
+        return err
     rng = range.upper()
-    return _bad_range(rng) or JSONResponse(
-        await portfolio_mod.performance_summary(rng))
+    if b == "real":
+        return _bad_range(rng) or JSONResponse(
+            await portfolio_mod.performance_summary(rng))
+    if b == "live":
+        return JSONResponse({"error": "live book not available"}, status_code=400)
+    bad = _bad_range(rng)
+    if bad:
+        return bad
+    try:
+        return JSONResponse(await paper_eval.performance_summary(rng, bkt))
+    except (paper_eval.PaperDisabled, paper_eval.PaperUnavailable) as e:
+        return _paper_error(e)
 
 
 @app.get("/api/portfolio/attribution")
-async def get_portfolio_attribution(range: str = Query("3M")):
+async def get_portfolio_attribution(range: str = Query("3M"), book: str = Query("real"),
+                                    bucket: str | None = None):
     """Per-holding EUR return split into local, FX and cross terms."""
+    b, err = _book_or_400(book)
+    if err:
+        return err
+    _bkt, err = _bucket_or_400(bucket)
+    if err:
+        return err
+    if b != "real":
+        return JSONResponse({"error": "not available for this book"}, status_code=400)
     rng = range.upper()
     return _bad_range(rng) or JSONResponse(
         await portfolio_mod.attribution(rng))
 
 
 @app.get("/api/portfolio/risk")
-async def get_portfolio_risk():
+async def get_portfolio_risk(book: str = Query("real"), bucket: str | None = None):
     """Exposures (direct / look-through / currency), volatility, beta,
     drawdown, correlation and concentration."""
+    b, err = _book_or_400(book)
+    if err:
+        return err
+    _bkt, err = _bucket_or_400(bucket)
+    if err:
+        return err
+    if b != "real":
+        return JSONResponse({"error": "not available for this book"}, status_code=400)
     return JSONResponse(await risk_mod.risk())
+
+
+def _paper_status_payload(bucket: str = paper_buckets.DAILY) -> dict:
+    out = paper_eval.status(bucket)
+    out.update(paper_exec.status_extra(bucket))
+    out["worker"] = paper_trader.status()
+    out["claude"] = claude_client.status()
+    out["forecaster"] = forecast_worker.status()
+    return out
+
+
+app.include_router(forecast_routes.router)
+
+
+@app.get("/api/paper/status")
+async def paper_status(book: str | None = None, bucket: str | None = None):
+    """Mode, broker reachability, bucket/season state, halt, open intents,
+    last reconcile, per-venue trading window and the worker's own status of
+    ``bucket`` (daily by default), plus ``buckets`` {id: enabled, mode, halted,
+    budgetEur, strategyVersion, season, decision, openIntents, nextSlot};
+    always 200 (``enabled: false`` with a ``reason`` when gated). ``book``
+    is optional here, but anything other than ``practice`` is a 400."""
+    if book is not None:
+        bad = _paper_book_error(book)
+        if bad:
+            return bad
+    bkt, bad = _bucket_or_400(bucket)
+    if bad:
+        return bad
+    return JSONResponse(_paper_status_payload(bkt))
+
+
+@app.post("/api/paper/season")
+async def paper_start_season(request: Request):
+    """Start a season for ``bucket``: freeze the real portfolio's weights
+    (restricted to the universe, renormalised to 100) as of today. 409 while a
+    season exists unless ``{"reset": true}`` AND the bucket holds no positions,
+    and when the enabled buckets' budgets exceed the demo account's total value."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    book = str(body.get("book") or "practice")
+    bkt, bad = _bucket_or_400(body.get("bucket"))
+    if bad:
+        return bad
+    reset = bool(body.get("reset", False))
+    try:
+        row = await paper_eval.create_season(book=book, reset=reset, bucket=bkt)
+        return JSONResponse(row)
+    except paper_eval.PaperConflict as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    except paper_eval.PaperBadRequest as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except (paper_eval.PaperDisabled, paper_eval.PaperUnavailable) as e:
+        return _paper_error(e)
+
+
+@app.post("/api/paper/new-season")
+async def paper_new_season(request: Request):
+    """``{book, bucket?, strategyVersion?}`` -> the new season row. The owner's
+    move to ``s2`` / ``i2``: the bucket must be empty (409), the old season is kept
+    in ``previous`` and ``strategyVersion`` is written to the bucket's config."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    bad = _paper_book_error(body.get("book"))
+    if bad:
+        return bad
+    bkt, bad = _bucket_or_400(body.get("bucket"))
+    if bad:
+        return bad
+    try:
+        row = await paper_exec.new_season(book="practice", bucket=bkt,
+                                          strategy_version=body.get("strategyVersion"))
+        return JSONResponse(row)
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
+    except (config_store.ConfigWriteError, config_store.ConfigUnreadable) as e:
+        log.warning("new season config not saved: %s", e)
+        return JSONResponse({"error": "config could not be written"}, status_code=503)
+
+
+@app.get("/api/paper/orders")
+async def paper_orders(book: str = Query(""), limit: int = Query(50),
+                       bucket: str | None = None):
+    """The bucket's order-intent rows, newest first, plus its halt row."""
+    bad = _paper_book_error(book)
+    if bad:
+        return bad
+    bkt, bad = _bucket_or_400(bucket)
+    if bad:
+        return bad
+    if not paper_eval.enabled():
+        return _paper_error(paper_eval.PaperDisabled())
+    rows = paper_ledger.bucket_rows(paper_ledger.read_orders(), bkt)
+    return JSONResponse({"items": rows[::-1][:max(1, min(int(limit), 500))],
+                         "halt": paper_ledger.read_halt(bkt)})
+
+
+@app.get("/api/paper/decisions")
+async def paper_decisions(book: str = Query(""), limit: int = Query(20),
+                          bucket: str | None = None):
+    """The bucket's stored decisions, newest first, today's row (decided or
+    deferred) and the bucket's lane budget."""
+    bad = _paper_book_error(book)
+    if bad:
+        return bad
+    bkt, bad = _bucket_or_400(bucket)
+    if bad:
+        return bad
+    if not paper_eval.enabled():
+        return _paper_error(paper_eval.PaperDisabled())
+    rows = paper_pm.read_decisions(bkt)
+    return JSONResponse({"items": rows[::-1][:max(1, min(int(limit), 200))],
+                         "today": paper_pm.today_row(bucket=bkt),
+                         "budget": lane_client.budget_state(paper_pm.PURPOSES[bkt])})
+
+
+@app.get("/api/paper/briefs")
+async def paper_briefs(book: str = Query(""), limit: int = Query(20),
+                       bucket: str | None = None):
+    """The bucket's daily briefings (the manager's note built after the close
+    from stored data), newest first."""
+    bad = _paper_book_error(book)
+    if bad:
+        return bad
+    bkt, bad = _bucket_or_400(bucket)
+    if bad:
+        return bad
+    if not paper_eval.enabled():
+        return _paper_error(paper_eval.PaperDisabled())
+    rows = paper_ledger.read_briefs(bkt)
+    return JSONResponse({"items": rows[::-1][:max(1, min(int(limit), 200))],
+                         "bucket": bkt})
+
+
+_NEWS_ID = re.compile(r"[A-Za-z0-9._-]+")
+
+
+@app.get("/api/paper/news")
+async def paper_news(book: str = Query(""), id: str = Query(""), limit: int = Query(50)):
+    """The universe news store (``data/universe_news``), newest ingested first, optionally one registry id, with the
+    per-source health. Rows as stored (the URL included: this is the owner's own view, never a model's)."""
+    bad = _paper_book_error(book)
+    if bad:
+        return bad
+    pid = id.strip().upper()
+    if pid and not _NEWS_ID.fullmatch(pid):
+        return JSONResponse({"error": "invalid id"}, status_code=400)
+    if pid and paper_universe.get(pid) is None:
+        return JSONResponse({"error": "unknown id"}, status_code=404)
+    n = max(1, min(int(limit), 200))
+    items = await asyncio.to_thread(universe_news.recent, pid or None, n)
+    return JSONResponse({"book": "practice", "id": pid or None, "items": items,
+                         "enabled": universe_news.enabled(), "sources": universe_news.health(),
+                         "worker": universe_news.status()})
+
+
+@app.get("/api/paper/grading")
+async def paper_grading(book: str = Query(""), bucket: str | None = None):
+    """The bucket's decisions graded at the 5 / 20 (daily) or 1 / 5 (intraday)
+    session horizons (hit rate, Wilson interval, mean outcome, rank IC, pending count)."""
+    bad = _paper_book_error(book)
+    if bad:
+        return bad
+    bkt, bad = _bucket_or_400(bucket)
+    if bad:
+        return bad
+    try:
+        return JSONResponse(await paper_eval.grading(bkt))
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
+
+
+@app.get("/api/paper/compare")
+async def paper_compare(book: str = Query(""), bucket: str | None = None):
+    """Daily vs intraday vs buy & hold on equal terms: {asOf, from, buckets,
+    buyHold, decisions, turnoverPct, costDragPct}. Covers every bucket;
+    ``bucket`` is validated for uniformity."""
+    bad = _paper_book_error(book)
+    if bad:
+        return bad
+    _bkt, bad = _bucket_or_400(bucket)
+    if bad:
+        return bad
+    try:
+        return JSONResponse(await paper_eval.compare())
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
+
+
+@app.post("/api/paper/decide")
+async def paper_decide(request: Request):
+    """{book, bucket?} -> the stored decision row. 409 when a gate is closed (mode
+    off, halted, no season, not a session day, budget, ...): nothing was asked of
+    the lane. A lane error is a stored row with ``deferred`` set (200)."""
+    body, bkt, bad = await _paper_post(request)
+    if bad:
+        return bad
+    try:
+        res = await paper_pm.decide(trigger="manual", bucket=bkt)
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
+    if "decisionId" not in res:
+        return JSONResponse({"error": f"decision not started: {res.get('deferred')}"},
+                            status_code=409)
+    return JSONResponse(res)
+
+
+async def _paper_trade(request: Request, action):
+    """Shared body of /rebalance and /seed: ``book`` must be practice, ``bucket``
+    valid and ``dryRun`` a bool (absent = a dry run, so an incomplete client
+    never trades by accident)."""
+    body, bkt, bad = await _paper_post(request)
+    if bad:
+        return bad
+    dry_run = body.get("dryRun", True)
+    if not isinstance(dry_run, bool):
+        return JSONResponse({"error": "dryRun must be a boolean"}, status_code=400)
+    try:
+        return JSONResponse(await action(body, dry_run, bkt))
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
+
+
+@app.post("/api/paper/rebalance")
+async def paper_rebalance(request: Request):
+    """{book, bucket?, targets: {id: pct}, cashPct?, dryRun} -> {plan, rows}. Needs a
+    season (409); a real run needs the bucket's mode shadow|demo and no halt (409)."""
+    async def action(body: dict, dry_run: bool, bucket: str):
+        return await paper_exec.rebalance(targets=body.get("targets"),
+                                          cash_pct=body.get("cashPct"), dry_run=dry_run,
+                                          bucket=bucket)
+    return await _paper_trade(request, action)
+
+
+@app.post("/api/paper/seed")
+async def paper_seed(request: Request):
+    """{book, bucket?, dryRun} -> {plan, rows}: rebalance to the bucket season's
+    baseline weights with the caps exempt; 409 unless the bucket is empty."""
+    async def action(body: dict, dry_run: bool, bucket: str):
+        return await paper_exec.seed(dry_run=dry_run, bucket=bucket)
+    return await _paper_trade(request, action)
+
+
+@app.post("/api/paper/mode")
+async def paper_mode(request: Request):
+    """{book, bucket?, mode: off|shadow|demo} -> the status payload (of that bucket)."""
+    body, bkt, bad = await _paper_post(request)
+    if bad:
+        return bad
+    try:
+        await paper_exec.set_mode(body.get("mode"), bucket=bkt)
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
+    except (config_store.ConfigWriteError, config_store.ConfigUnreadable) as e:
+        log.error("paper mode not saved: %s", e)
+        return JSONResponse({"error": "config could not be written"}, status_code=503)
+    return JSONResponse(_paper_status_payload(bkt))
+
+
+@app.post("/api/paper/halt")
+async def paper_halt(request: Request):
+    """{book, bucket?, reason?} -> the bucket's halt row (idempotent while halted).
+    Cancels the bucket's open orders and pushes once. Works even when trading is
+    gated off."""
+    body, bkt, bad = await _paper_post(request)
+    if bad:
+        return bad
+    reason = body.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return JSONResponse({"error": "reason must be a string"}, status_code=400)
+    try:
+        return JSONResponse(await paper_exec.halt(reason, bucket=bkt))
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
+
+
+@app.post("/api/paper/resume")
+async def paper_resume(request: Request):
+    """{book, bucket?} -> the bucket's halt row. Only the owner resumes; nothing
+    else clears a halt."""
+    body, bkt, bad = await _paper_post(request)
+    if bad:
+        return bad
+    try:
+        return JSONResponse(await paper_exec.resume(bucket=bkt))
+    except _PAPER_ERRORS as e:
+        return _paper_error(e)
 
 
 @app.get("/api/policy")

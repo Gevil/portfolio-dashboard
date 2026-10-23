@@ -1516,10 +1516,19 @@ def test_an_auth_error_halts_only_the_enabled_buckets(env):
     assert env.alert.calls[0]["title"] == "Paper trading halted"
 
 
-def test_consecutive_errors_halt_the_buckets_in_demo(env):
+def test_consecutive_errors_halt_only_demo_buckets_with_something_at_risk(env):
     enable_intraday(env, mode="demo")
     env.cfg["mode"] = "shadow"
-    open_row_and_failing_listing(env, "timeout")
+    open_row_and_failing_listing(env, "timeout")                  # the open order is the DAILY bucket's
+    for _ in range(3):
+        run(pex.run_pass())
+    # intraday is in demo but all cash: a broker hiccup cannot lose money, so no halt (2026-10-21 incident)
+    assert halt_of("intraday")["halted"] is False and halt_of("daily")["halted"] is False
+    assert pex.worker_state()["consecutiveErrors"] == 0 and pex.worker_state()["lastError"] == "timeout"
+    rows = paper_ledger.read_orders()
+    rows.append({**ledger_row(state="submitted", broker_id="B2"), "bucket": "intraday",
+                 "intentId": "x-intraday-1"})
+    paper_ledger.save_orders(rows)
     for _ in range(3):
         run(pex.run_pass())
     assert halt_of("intraday")["halted"] is True and halt_of("daily")["halted"] is False

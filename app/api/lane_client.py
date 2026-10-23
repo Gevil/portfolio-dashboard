@@ -1,7 +1,7 @@
 """GPU-lane abstraction: find the lane to use and talk OpenAI-completions to it.
 
-Every LLM call used to be pinned to one engine (opentrade/Open WebUI -> the
-ninfer lane), so the whole AI path went dark whenever a different lane held the
+Every LLM call used to be pinned to one engine (opentrade/Open WebUI -> a single
+fixed lane), so the whole AI path went dark whenever a different lane held the
 GPU. Instead, the host's ``lanes.conf`` (bind-mounted read-only at
 ``/app/lanes.conf``) is the single source of truth: each line carries a 6th
 field, the engine-reported OpenAI model id. A lane is usable only when
@@ -9,14 +9,14 @@ field, the engine-reported OpenAI model id. A lane is usable only when
   1. its ``health_url`` answers 200, AND
   2. ``GET {base}/v1/models`` lists exactly that model id.
 
-Lanes with an empty/absent 6th field are never eligible (vllm today). The file
+Lanes with an empty/absent 6th field are never eligible. The file
 is re-read behind a short TTL cache because a ``lanes-switch`` does NOT restart
 this pod. The engine base URL is derived from the health URL's port and
 reached through ``host.containers.internal`` (the lanes run on the host, not on
 the ``aistock`` network).
 
 Which eligible lane wins is an explicit policy, not file order:
-``LANE_PREFERENCE`` (comma list, default ``ninfer-nvfp4,exllama``) is tried
+``LANE_PREFERENCE`` (comma list, default ``infernix,basalt,strata``) is tried
 first, in that order; eligible lanes it does not name follow in lanes.conf
 order. Probe results are cached for a few seconds (positive and negative, never
 two concurrent probes of one lane), and a lane that failed its last probe is
@@ -90,7 +90,7 @@ PROBE_DOWN_TTL_S = float(os.getenv("LANE_PROBE_DOWN_TTL_S", "10"))
 # quickly — but not on every call (the lane chip and every chat turn probe).
 CONF_TTL_S = 2.0
 # Preferred lane order (names as in lanes.conf); read at call time.
-DEFAULT_PREFERENCE = "ninfer-nvfp4,exllama"
+DEFAULT_PREFERENCE = "infernix,basalt,strata"
 # Budget: total / digest reserve / triage cap per local day (env at call time).
 DEFAULT_TURN_BUDGET = 30
 DEFAULT_DIGEST_RESERVE = 16

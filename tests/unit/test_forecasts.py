@@ -43,9 +43,9 @@ def fake_packet(pid, as_of):
             "builtAt": "2026-10-23T17:00:00+00:00", "momentum12_1": sec(3.0 * i), "week1": sec(-1.0 * i)}
 
 
-def lane_reply(obj, model="qwen3.8-27b"):
+def lane_reply(obj, model="qwen3.8-flash-next-nvfp4-dense8"):
     return {"content": obj if isinstance(obj, str) else json.dumps(obj), "finish_reason": "stop",
-            "lane": "ninfer-nvfp4", "model": model, "usage": {}}
+            "lane": "infernix", "model": model, "usage": {}}
 
 
 def packet_of(user):

@@ -742,6 +742,13 @@ def next_earnings(pid: str, cutoff: float) -> dict | None:
     return out
 
 
+def last_known_earnings(pid: str, cutoff: float) -> str | None:
+    """The latest earnings date (ISO) any observation fetched at or before ``cutoff`` ever carried, past or future;
+    None when no observation had a date."""
+    days = [o[1] for o in _cached_rows(EARNINGS_FILE, _index_earnings).get(pid, []) if o[0] <= cutoff and o[1]]
+    return max(days) if days else None
+
+
 def carried_earnings(pid: str, today_iso: str) -> str | None:
     """The date to carry forward when the calendar has none today: the date of the newest observation that had one,
     while it is today or later (it passes the day after). None when no such observation exists or it has passed."""

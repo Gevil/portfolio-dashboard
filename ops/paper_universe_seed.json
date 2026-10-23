@@ -284,7 +284,7 @@
   {
    "id": "FRE",
    "name": "Fresenius",
-   "isin": "DE0005785604",
+   "isin": "DE000FRE5EN2",
    "yahoo": "FRE.DE",
    "venue": "XETR",
    "kind": "equity",
@@ -441,7 +441,7 @@
   {
    "id": "QIA",
    "name": "Qiagen",
-   "isin": "NL0012169213",
+   "isin": "NL0015002SN0",
    "yahoo": "QIA.DE",
    "venue": "XETR",
    "kind": "equity",

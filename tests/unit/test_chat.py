@@ -153,8 +153,8 @@ def test_relay_maps_error_classes_to_human_text(monkeypatch):
     assert out[0] == {"error": chat.ERROR_TEXT["lane_down"]}
     out = frames(run_relay(monkeypatch, [{"error": "http", "status": 502}]))
     assert out[0] == {"error": "AI request failed (HTTP 502)."}
-    out = frames(run_relay(monkeypatch, [{"error": "model_missing", "lane": "exllama"}]))
-    assert "exllama" in out[0]["error"]
+    out = frames(run_relay(monkeypatch, [{"error": "model_missing", "lane": "basalt"}]))
+    assert "basalt" in out[0]["error"]
 
 
 def test_relay_reports_an_empty_reply(monkeypatch):

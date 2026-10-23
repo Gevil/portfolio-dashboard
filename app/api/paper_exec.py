@@ -692,22 +692,32 @@ async def _step(name: str, coro, errs: list):
 
 async def _register_errors(brk, errs: list, demo_buckets: list) -> None:
     """Error accounting for a pass. The consecutive-error trigger counts and
-    halts only while a bucket is in demo mode (and halts those buckets).
-    ``auth`` halts every enabled bucket in any mode: every error reaching here
-    came from a reconcile / cancel of non-terminal rows or from a demo-mode
-    evaluation, never from plain status polling (the idle path makes no call)."""
+    halts only demo buckets that have something at risk (ledger positions or
+    orders in flight): a broker hiccup while a bucket is all cash cannot lose
+    money, and halting it would only skip decisions until the owner resumes
+    (2026-10-21: three demo timeouts after the close halted two empty buckets
+    for two days). ``auth`` halts every enabled bucket in any mode: every error
+    reaching here came from a reconcile / cancel of non-terminal rows or from a
+    demo-mode evaluation, never from plain status polling."""
     if not errs:
         _state["consecutiveErrors"] = 0
         return
-    if demo_buckets:
-        _state["consecutiveErrors"] += 1
     _state["lastError"] = errs[-1]
     if "auth" in errs:
         await _halt_buckets_locked(brk, paper_eval.enabled_buckets(),
                                    "Trading 212 authentication failed", "errors")
-    elif demo_buckets and _state["consecutiveErrors"] >= MAX_CONSECUTIVE_ERRORS:
+        return
+    rows = paper_ledger.read_orders()
+    exposed = [b for b in demo_buckets
+               if paper_ledger.bucket_holds_positions(rows, b)
+               or paper_ledger.non_terminal(paper_ledger.bucket_rows(rows, b))]
+    if not exposed:
+        _state["consecutiveErrors"] = 0          # nothing at risk: recorded in lastError, never a halt
+        return
+    _state["consecutiveErrors"] += 1
+    if _state["consecutiveErrors"] >= MAX_CONSECUTIVE_ERRORS:
         await _halt_buckets_locked(
-            brk, demo_buckets,
+            brk, exposed,
             f"{_state['consecutiveErrors']} consecutive broker/reconcile errors "
             f"(last: {errs[-1]})", "errors")
 

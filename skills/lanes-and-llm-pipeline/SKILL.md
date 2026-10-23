@@ -1,6 +1,6 @@
 ---
 name: lanes-and-llm-pipeline
-description: How the dashboard picks GPU lanes (ninfer-nvfp4 primary, exllamav3 fallback), spends the daily LLM turn budget, runs the analysis spine/digest/chat/triage, grades advice in the scoreboard, and keeps prompts safe. Use before touching lane_client, ta_pipeline, digest, jobs, scoreboard, evidence, reports, chat or app/playbooks.
+description: How the dashboard picks GPU lanes (infernix primary, basalt/strata fallbacks), spends the daily LLM turn budget, runs the analysis spine/digest/chat/triage, grades advice in the scoreboard, and keeps prompts safe. Use before touching lane_client, ta_pipeline, digest, jobs, scoreboard, evidence, reports, chat or app/playbooks.
 ---
 
 # Lanes and the LLM pipeline
@@ -8,9 +8,9 @@ description: How the dashboard picks GPU lanes (ninfer-nvfp4 primary, exllamav3 
 ## Lanes (shared GPU — be frugal)
 Source of truth: host `~/.local/bin/gpu-lanes/lanes.conf` (mounted dir `/app/lanes`, **never** a single-file
 mount — `lanes-enrich.json` is replaced by rename every ~45 s). A lane is usable only if `/health` is 200
-**and** `/v1/models` lists exactly its configured `model_id`. Lanes without a model id (vllm) are never used.
-- Order: `LANE_PREFERENCE` (default `ninfer-nvfp4,exllama`), then the remaining eligible lanes in file order.
-  Primary = `qwen3.8-27b` on `:8002`; fallback = `Qwen3.8-Flash-Next-exl3` (TabbyAPI) on `:8003`.
+**and** `/v1/models` lists exactly its configured `model_id`. Lanes without a model id are never used.
+- Order: `LANE_PREFERENCE` (default `infernix,basalt,strata`), then the remaining eligible lanes in file order.
+  Primary = `qwen3.8-flash-next-nvfp4-dense8` (Infernix) on `:8002`; fallbacks = `swift-1.5-iq3_xxs` (basalt or strata, mutually exclusive) on `:8004`.
 - Only one heavy lane holds the GPU at a time (host `lanes-switch`). The dashboard never starts/stops lanes.
   Down lane ≠ bug: AI features degrade to `lane_down` envelopes and workers defer.
 - Probes are cached for seconds (positive and negative) so a blackholed lane does not cost 35 s per call.

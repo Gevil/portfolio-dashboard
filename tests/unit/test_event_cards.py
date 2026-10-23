@@ -44,7 +44,7 @@ class Lane:
         if isinstance(a, Exception):
             raise a
         if isinstance(a, str):
-            return {"content": a, "finish_reason": "stop", "lane": "ninfer-nvfp4", "model": "qwen3.8-27b", "usage": {}}
+            return {"content": a, "finish_reason": "stop", "lane": "infernix", "model": "qwen3.8-flash-next-nvfp4-dense8", "usage": {}}
         return a
 
 
@@ -129,7 +129,7 @@ def test_a_card_is_logged_with_provenance_and_the_call_is_a_local_json_events_tu
     assert set(card) == {"id", "titleHash", "publishedAt", "newsIngestedAt", "domain", "type", "direction", "magnitude",
                          "novelty", "horizon_days", "confidence", "model", "lane", "promptHash", "ingestedAt"}
     assert (card["id"], card["type"], card["direction"], card["magnitude"]) == ("SAP", "guidance", 1, 2)
-    assert (card["model"], card["lane"]) == ("qwen3.8-27b", "ninfer-nvfp4")
+    assert (card["model"], card["lane"]) == ("qwen3.8-flash-next-nvfp4-dense8", "infernix")
     assert card["promptHash"] == ec.prompt_hash() and len(card["promptHash"]) == 16
     assert card["ingestedAt"] == un.iso(NOW) and card["newsIngestedAt"] == un.iso(NOW - 60)
     assert card["titleHash"] == un.title_hash("SAP lifts its 2026 outlook")

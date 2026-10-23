@@ -30,7 +30,7 @@ import math
 import time
 
 from app.api import (calendars, digest, evidence, events, indicators, jsonstore,
-                     lane_client, live_ws, macro, market_light, paper_buckets, paper_eval,
+                     claude_client, lane_client, live_ws, macro, market_light, paper_buckets, paper_eval,
                      paper_exec, paper_ledger, paper_risk, paper_universe, price_alerts, prices,
                      registry, scoreboard, ta_pipeline, textsafe)
 
@@ -56,6 +56,9 @@ OPEN_PACK_MAX_CHARS = 16000   # holdings + 15 candidates with compact summaries
 MIN_TURNS = 2
 MAX_TOKENS = 1500
 TIMEOUT_S = 480.0
+CLAUDE_TIMEOUT_S = 240
+FALLBACK_ERRORS = ("lane_down", "model_missing", "timeout")      # never "budget"
+FALLBACK_MODELS = {paper_buckets.DAILY: "opus", paper_buckets.INTRADAY: "sonnet"}
 PACK_MAX_CHARS = 12000
 EXCERPT_CHARS = 400
 FEEDBACK_ROWS = 5
@@ -1092,6 +1095,39 @@ async def _chat(messages: list[dict], purpose: str = "trading") -> dict:
     return res if isinstance(res, dict) else {"error": "bad_reply"}
 
 
+def _fallback_eligible(res: dict, purpose: str) -> bool:
+    """A lane that cannot answer (never a spent budget) and a usable Claude adapter."""
+    return res.get("error") in FALLBACK_ERRORS and claude_client.available(purpose)
+
+
+def _claude_input(messages: list[dict]) -> tuple[str, str]:
+    """The playbook + pack as (system, user); a repair turn folds the previous reply and the
+    correction into the user text (the adapter takes one system and one user string)."""
+    system = str(messages[0]["content"])
+    user = str(messages[1]["content"])
+    if len(messages) > 2:
+        user += ("\n\n[Your previous reply]\n" + str(messages[2]["content"])
+                 + "\n\n" + str(messages[3]["content"]))
+    return system, user
+
+
+async def _claude_chat(messages: list[dict], alias: str, purpose: str) -> dict:
+    """ONE blind Claude call in the lane's reply shape (``lane`` = ``claude``) or an error envelope."""
+    system, user = _claude_input(messages)
+    try:
+        res = await claude_client.complete(system, user, model=alias, max_tokens=MAX_TOKENS,
+                                           timeout_s=CLAUDE_TIMEOUT_S, purpose=purpose)
+    except Exception as e:                       # the adapter returns envelopes; belt and braces
+        log.warning("paper_pm: claude call raised %s", type(e).__name__)
+        return {"error": f"exception:{type(e).__name__}"}
+    if not isinstance(res, dict):
+        return {"error": "bad_reply"}
+    if res.get("error"):
+        return {"error": str(res["error"])}
+    return {"content": res.get("content"), "model": res.get("model"), "lane": "claude",
+            "usage": res.get("usage")}
+
+
 def _add_usage(total: dict, usage) -> None:
     if isinstance(usage, dict):
         for k, v in usage.items():
@@ -1220,15 +1256,32 @@ async def _decide_locked(trigger: str, now: float, bucket: str = DAILY, slot: st
     save = (lambda r: _append_row(r)) if bucket == DAILY else (lambda r: _append_row(r, bucket))
 
     res = await (_chat(messages) if purpose == "trading" else _chat(messages, purpose))
+    fb = None                                   # {"alias", "reason"} once the Claude fallback took over
+    if _fallback_eligible(res, purpose):
+        fb = {"alias": FALLBACK_MODELS[bucket], "reason": str(res.get("error"))}
+        res = await _claude_chat(messages, fb["alias"], purpose)
+        if res.get("error"):
+            row["fallbackReason"] = fb["reason"]
+            row["deferred"] = (f"lane: {textsafe.clean_text(fb['reason'], 60)}; "
+                               f"claude: {textsafe.clean_text(str(res.get('error')), 60)}")
+            save(row)
+            return row
     attempts = 0
     out, errs, warns, content = None, [], [], None
     while True:
         attempts += 1
         if res.get("error"):
-            row["deferred"] = _deferred_reason(res)
+            if fb:
+                row["fallbackReason"] = fb["reason"]
+                row["deferred"] = (f"lane: {textsafe.clean_text(fb['reason'], 60)}; "
+                                   f"claude: {textsafe.clean_text(str(res.get('error')), 60)}")
+            else:
+                row["deferred"] = _deferred_reason(res)
             save(row)
             return row
         row["lane"], row["model"] = res.get("lane"), res.get("model")
+        if fb:
+            row["source"], row["role"], row["fallbackReason"] = fb["alias"], "fallback", fb["reason"]
         _add_usage(row["usage"], res.get("usage"))
         content = res.get("content")
         out, errs, warns = _parse_and_validate(content, ids=ids, strategy_version=sv)
@@ -1236,7 +1289,10 @@ async def _decide_locked(trigger: str, now: float, bucket: str = DAILY, slot: st
             break
         row["repaired"] = True
         repair = _repair_messages(messages, content, errs)
-        res = await (_chat(repair) if purpose == "trading" else _chat(repair, purpose))
+        if fb:
+            res = await _claude_chat(repair, fb["alias"], purpose)
+        else:
+            res = await (_chat(repair) if purpose == "trading" else _chat(repair, purpose))
     row["rawExcerpt"] = textsafe.clean_text(content, RAW_EXCERPT_CHARS)
     row["warnings"] = warns
     if out is None:

@@ -28,6 +28,7 @@ import os
 import pathlib
 import re
 import time
+import unicodedata
 from zoneinfo import ZoneInfo
 
 from app.api import calendars, consensus_log, jsonstore, paper_universe, regime_feed, regulators, runlog, textsafe
@@ -59,6 +60,7 @@ FAILS_BEFORE_BACKOFF = 3
 FIGI_URL = "https://api.openfigi.com/v3/mapping"
 FIGI_BATCH = 10                        # keyless limit: 10 jobs per request, 25 requests per minute
 EXCH_CODE = {"XETR": "GY", "XAMS": "NA", "XPAR": "FP", "XBRU": "BB", "XMIL": "IM"}
+GERMAN_CODES = ("GY", "GR", "GF", "GT", "GD", "GM", "GS", "GI")     # OpenFIGI's German venues; XETR is one of them
 SUFFIX_VENUE = {"DE": "XETR", "AS": "XAMS", "PA": "XPAR", "BR": "XBRU", "MI": "XMIL"}
 
 _task: asyncio.Task | None = None
@@ -204,6 +206,37 @@ def _norm_ticker(t) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(t or "").upper())
 
 
+_ID_LEGAL = {"ag", "se", "nv", "sa", "plc", "inc", "corp", "co", "holding", "holdings", "reg", "kgaa", "ltd", "de",
+             "the", "of", "and"}
+_EXONYMS = {"munich": "muenchener", "inditex": "industria diseno textil"}     # registry name -> OpenFIGI spelling
+
+
+def _id_tokens(name) -> list[str]:
+    text = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().casefold()
+    toks = [t for t in re.findall(r"[a-z0-9]+", text) if t not in _ID_LEGAL]
+    return [w for t in toks for w in _EXONYMS.get(t, t).split()]
+
+
+def _translit(t: str) -> str:
+    return t.replace("ue", "u").replace("oe", "o").replace("ae", "a")
+
+
+def identity_names_match(registry_name, figi_name) -> bool:
+    """Registry name vs an OpenFIGI name after dropping legal forms: a shared significant token (>= 3 chars, also
+    after ue/oe/ae transliteration), or one side is the acronym of the other's initials (BMW), or the generic
+    ``regime_feed.names_match`` (prefix truncation). Nothing to compare counts as a match."""
+    a, b = _id_tokens(registry_name), _id_tokens(figi_name)
+    if not a or not b:
+        return True
+    ta, tb = {_translit(t) for t in a if len(t) >= 3}, {_translit(t) for t in b if len(t) >= 3}
+    if ta & tb:
+        return True
+    for short, long_ in ((a, b), (b, a)):
+        if len(short) == 1 and len(short[0]) >= 2 and len(long_) >= 2 and short[0] == "".join(t[0] for t in long_):
+            return True
+    return regime_feed.names_match(registry_name, figi_name)
+
+
 def compare_identity(row: dict, listings: list[dict]) -> list[dict]:
     """Mismatches between a registry row and the OpenFIGI listings of its ISIN on the registry's exchange:
     ``[{"kind": venue | listing | ticker | name, "detail"}]``, empty when everything agrees. ``venue`` = the Yahoo
@@ -218,14 +251,18 @@ def compare_identity(row: dict, listings: list[dict]) -> list[dict]:
     if implied and implied != row.get("venue"):
         out.append({"kind": "venue", "detail": f"yahoo {yahoo} is a {implied} symbol, registry venue {row.get('venue')}"})
     if not listings:
+        if row.get("t212"):
+            # OpenFIGI misses some venue listings (InPost on Euronext Amsterdam, 2026-10-23); the broker mapped this
+            # ISIN to an EUR instrument on the venue, which is the identity that matters for trading.
+            return out
         out.append({"kind": "listing", "detail": f"OpenFIGI has no {EXCH_CODE.get(row.get('venue'), '?')} listing "
-                                                 f"for {row.get('isin')}"})
+                                                 f"for {row.get('isin')} and Trading 212 has no instrument for it"})
         return out
     tickers = {_norm_ticker(l.get("ticker")) for l in listings} - {""}
     if tickers and _norm_ticker(base) not in tickers:
         out.append({"kind": "ticker", "detail": f"yahoo {yahoo} vs OpenFIGI {', '.join(sorted(tickers))[:60]}"})
     names = [l.get("name") for l in listings if l.get("name")]
-    if names and not any(regime_feed.names_match(row.get("name"), n) for n in names):
+    if names and not any(identity_names_match(row.get("name"), n) for n in names):
         out.append({"kind": "name", "detail": f"registry '{textsafe.clean_text(row.get('name'), 40)}' vs OpenFIGI "
                                               f"'{textsafe.clean_text(names[0], 40)}'"})
     return out
@@ -234,6 +271,23 @@ def compare_identity(row: dict, listings: list[dict]) -> list[dict]:
 def _figi_listing(d: dict) -> dict:
     return {"ticker": textsafe.clean_text(d.get("ticker"), 24), "name": textsafe.clean_text(d.get("name"), 80),
             "exchCode": textsafe.clean_text(d.get("exchCode"), 8)}
+
+
+async def _german_listings(isin: str) -> list[dict]:
+    """XETR rows whose ISIN has no listing under the primary code (GY): ask OpenFIGI for the ISIN on every exchange and
+    keep the German venues (GR, GF, ...). Empty when it knows none."""
+    raw = await regime_feed.fetch_bytes("openfigi", FIGI_URL, method="POST",
+                                        json_body=[{"idType": "ID_ISIN", "idValue": isin}],
+                                        headers={"Content-Type": "application/json"})
+    try:
+        answer = json.loads(regime_feed.decode_text(raw))
+    except ValueError:
+        raise FeedError("parse", "OpenFIGI answer is not JSON")
+    item = answer[0] if isinstance(answer, list) and len(answer) == 1 else None
+    if not isinstance(item, dict):
+        raise FeedError("parse", "OpenFIGI answer does not match the request")
+    found = [_figi_listing(d) for d in item.get("data") or [] if isinstance(d, dict)]
+    return [l for l in found if l["exchCode"] in GERMAN_CODES]
 
 
 async def run_identity(now: float, rows: list[dict]) -> dict:
@@ -259,6 +313,8 @@ async def run_identity(now: float, rows: list[dict]) -> dict:
                 continue
             checked += 1
             listings = [_figi_listing(d) for d in item.get("data") or [] if isinstance(d, dict)]
+            if not listings and r["venue"] == "XETR":
+                listings = await _german_listings(r["isin"])
             for m in compare_identity(r, listings):
                 mismatches.append({"id": r["id"], "isin": r["isin"], "yahoo": r["yahoo"], "venue": r["venue"], **m})
     doc = {"at": now, "month": berlin(now).strftime("%Y-%m"), "checked": checked, "errors": errors,

@@ -43,7 +43,7 @@ def test_norm_rating(text, expected):
 
 def report(**over):
     d = {"final_trade_decision": "**Rating**: Hold\n\nNarrative.",
-         "lane": "ninfer-nvfp4", "model": "qwen3.8-27b",
+         "lane": "infernix", "model": "qwen3.8-flash-next-nvfp4-dense8",
          "price_at_analysis": {"price": 100.0, "currency": "EUR", "as_of": 1790000000},
          "decision_v2": {"decision_type": "buy", "score": 66, "action": "buy",
                          "confidence": "medium", "scale_tier": "buy",
@@ -63,7 +63,7 @@ def test_decision_v2_wins_over_contradicting_text():
     assert p["target"] == 120.0 and p["missing"] == ["news"]
     assert p["gaps"] == ["news"]                       # the bare MISSING marker is not a gap
     assert "http" not in p["excerpt"] and "x.example" not in p["excerpt"]
-    assert p["lane"] == "ninfer-nvfp4" and p["report_price"] == 100.0
+    assert p["lane"] == "infernix" and p["report_price"] == 100.0
 
 
 def test_invalid_decision_type_falls_back_to_text_never_other_silently():

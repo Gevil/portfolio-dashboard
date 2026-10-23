@@ -19,12 +19,13 @@ This file is the map. **Procedures live in `skills/`** — read the matching ski
   derives `shares` and the FIFO `investedAmount`; TWR/XIRR/attribution/risk use them.
 - **Sessions**: `app/api/calendars.py` (`exchange_calendars`, per MIC) owns holidays, early closes and
   `prevClose` dates; `.DE` listings are XETR. Never hand-roll weekday/holiday arithmetic.
-- **LLM lanes** (shared with the owner's other GPU work — be frugal): primary `ninfer-nvfp4`
-  (`qwen3.8-27b`), fallback `exllama` (`Qwen3.8-Flash-Next-exl3`). Autonomous budget 30 turns/day
+- **LLM lanes** (shared with the owner's other GPU work — be frugal): primary `infernix`
+  (`qwen3.8-flash-next-nvfp4-dense8`), fallbacks `basalt` / `strata` (`swift-1.5-iq3_xxs`). Autonomous budget 30 turns/day
   (digest reserve 16, triage cap 10, trading cap 3 for the paper-trading agent, other = the rest). The paper
   forecaster (`forecast`, default 1000/day), intraday agent (`intraday`, 200/day) and news event cards (`events`,
   2000/day) have their own allowances outside that total: the owner allows heavy GPU use for them (lane permitting);
-  Claude subscription (Opus/Sonnet 5.5) is the forecaster's fallback.
+  Claude subscription (Opus/Sonnet 5.5) is the forecaster's fallback and the paper PM's: when every lane is down
+  (`lane_down`/`model_missing`/`timeout`, never `budget`) the daily decision makes one blind Opus call, the intraday one Sonnet.
 
 ## Layout
 ```

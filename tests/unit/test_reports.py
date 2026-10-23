@@ -21,7 +21,7 @@ def put(path, data):
 
 NEW = {
     "company_of_interest": "ASML", "trade_date": "2026-10-03", "mode": "standard",
-    "lane": "ninfer-nvfp4", "model": "qwen3.8-27b",
+    "lane": "infernix", "model": "qwen3.8-flash-next-nvfp4-dense8",
     "price_at_analysis": {"price": 1432.5, "currency": "EUR", "as_of": "x"},
     "final_trade_decision": "**Rating**: Hold\n\nNothing decisive.",
     "market_report": "## Market\ntrend up", "news_report": "n", "sentiment_report": "s",
@@ -108,7 +108,7 @@ def test_render_shows_current_pipeline_keys_and_provenance(tree):
     md = out["content"]
     for needle in ("BULL-ARGUMENT", "BEAR-ARGUMENT", "RESEARCH-PLAN-TEXT",
                    "TRADER-PLAN-TEXT", "RISK-ASSESSMENT-TEXT",
-                   "ninfer-nvfp4 / qwen3.8-27b", "1432.5 EUR", "**Rating:** HOLD",
+                   "infernix / qwen3.8-flash-next-nvfp4-dense8", "1432.5 EUR", "**Rating:** HOLD",
                    "partial (MISSING: news)", "evidence section MISSING: news"):
         assert needle in md, needle
     assert "{'grade'" not in md            # no dict repr leaks into the report
@@ -163,7 +163,7 @@ def test_ticker_rows_carry_mode_lane_model_and_markers(tree):
     top = rows[0]
     assert top["id"] == "ASML@2026-10-03" and top["mode"] == "standard"
     assert top["decision"] == "HOLD" and top["score"] == 52 and top["action"] == "hold"
-    assert top["lane"] == "ninfer-nvfp4" and top["model"] == "qwen3.8-27b"
+    assert top["lane"] == "infernix" and top["model"] == "qwen3.8-flash-next-nvfp4-dense8"
     assert rows[1]["mode"] == "quick"
     markers = asyncio.run(reports.get_analysis_markers("ASML"))
     assert {m["date"] for m in markers} == {"2026-10-03", "2026-10-02"}

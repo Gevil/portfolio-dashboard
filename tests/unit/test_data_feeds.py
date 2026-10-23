@@ -682,6 +682,45 @@ def test_each_kind_of_identity_mismatch_is_reported():
     assert data_feeds.compare_identity(sap, [{"ticker": "S.A-P", "name": "SAP SE"}]) == []   # punctuation is not a change
 
 
+@pytest.mark.parametrize("registry,figi", [
+    ("BMW", "BAYERISCHE MOTOREN WERKE AG"), ("Munich Re", "MUENCHENER RUECKVER AG-REG"),
+    ("Inditex", "INDUSTRIA DE DISENO TEXTIL"), ("AMD", "ADVANCED MICRO DEVICES"),
+])
+def test_identity_names_match_acronyms_exonyms_and_transliteration(registry, figi):
+    row = {"id": "X", "name": registry, "yahoo": "X.DE", "venue": "XETR", "isin": "DE0000000000"}
+    assert data_feeds.compare_identity(row, [{"ticker": "X", "name": figi, "exchCode": "GY"}]) == []
+
+
+def test_identity_names_still_fail_for_a_genuinely_different_company():
+    for registry, figi in (("BMW", "DAIMLER TRUCK HOLDING AG"), ("Munich Re", "ALLIANZ SE"), ("AMD", "INTEL CORP")):
+        row = {"id": "X", "name": registry, "yahoo": "X.DE", "venue": "XETR", "isin": "DE0000000000"}
+        kinds = [m["kind"] for m in data_feeds.compare_identity(row, [{"ticker": "X", "name": figi}])]
+        assert kinds == ["name"], registry
+
+
+def test_xetr_listing_on_another_german_code_passes_but_a_wrong_isin_still_fails(env):
+    rows = [{"id": i, "name": n, "isin": isin, "yahoo": f"{i}.DE", "venue": "XETR", "kind": "equity"}
+            for i, n, isin in (("FRE", "Fresenius", "DE0005785604"), ("QIA", "Qiagen", "NL0012169213"),
+                               ("EUNL", "iShares Core MSCI World", "IE00B4L5Y983"),
+                               ("SXR8", "iShares Core S&P 500", "IE00B5BMR087"), ("BAD", "Wrong Co", "XS0000000000"))]
+    figi = {"DE0005785604": ("FRE", "FRESENIUS SE & CO KGAA", "GR"), "NL0012169213": ("QIA", "QIAGEN NV", "GF"),
+            "IE00B4L5Y983": ("EUNL", "ISHARES CORE MSCI WORLD", "GS"),
+            "IE00B5BMR087": ("SXR8", "ISHARES CORE S&P 500", "GD"), "XS0000000000": ("BAD", "WRONG CO", "US")}
+
+    def handler(m, u, p, jobs):
+        out = []
+        for j in jobs:
+            t, name, code = figi[j["idValue"]]
+            out.append({"warning": "No identifier found."} if "exchCode" in j else
+                       {"data": [{"ticker": t, "name": name, "exchCode": code},
+                                 {"ticker": t, "name": name, "exchCode": "UN"}]})
+        return 200, json.dumps(out).encode()
+    env.routes.insert(0, ("openfigi.com", handler))
+    run(data_feeds.run_identity(NOW, rows))
+    doc = jsonstore.load(data_feeds.IDENTITY_FILE)
+    assert [(m["id"], m["kind"]) for m in doc["mismatches"]] == [("BAD", "listing")]
+
+
 def test_audit_batches_ten_isins_per_request_with_the_exchange_code_and_stores_the_result(env):
     many = [{**ROWS[0], "id": f"S{i}", "isin": f"DE{i:010d}", "yahoo": f"S{i}.DE"} for i in range(12)]
     data = {m["isin"]: [{"ticker": m["id"], "name": "SAP SE"}] for m in many}
@@ -862,3 +901,9 @@ def test_us_lead_names_get_their_xetra_quote_refreshed_only_during_the_overlap(e
     assert sorted(asked) == ["AAPL", "MSFT"]
     assert run(data_feeds._step_us_quotes(NOW + 60, NOW + 120, {})) is None                 # spaced 5 minutes
     assert run(data_feeds._step_us_quotes(NOW + data_feeds.US_QUOTES_EVERY_S, NOW + 999, {})) == (2, 2, 0)
+
+
+def test_a_listing_missing_in_openfigi_passes_when_trading_212_mapped_the_isin():
+    row = {"id": "INPST", "isin": "LU2290522684", "yahoo": "INPST.AS", "venue": "XAMS", "name": "InPost"}
+    assert [m["kind"] for m in data_feeds.compare_identity(row, [])] == ["listing"]
+    assert data_feeds.compare_identity({**row, "t212": "INPSTa_EQ"}, []) == []

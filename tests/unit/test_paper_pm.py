@@ -38,7 +38,7 @@ def good(**over):
     return out
 
 
-def reply(obj, lane="ninfer-nvfp4", model="qwen3.8-27b", usage=None):
+def reply(obj, lane="infernix", model="qwen3.8-flash-next-nvfp4-dense8", usage=None):
     text = obj if isinstance(obj, str) else json.dumps(obj)
     return {"content": text, "finish_reason": "stop", "lane": lane, "model": model,
             "usage": usage or {"prompt_tokens": 100, "completion_tokens": 40}}
@@ -212,7 +212,7 @@ def test_a_valid_change_calls_rebalance_as_the_agent_and_stores_the_plan(env):
     assert row["valid"] is True and row["noChange"] is False and row["deferred"] is None
     assert row["decisionId"] == "2026-10-19-s1-1" and row["date"] == "2026-10-19"
     assert row["trigger"] == "schedule" and row["mode"] == "shadow" and row["strategyVersion"] == "s1"
-    assert row["lane"] == "ninfer-nvfp4" and row["model"] == "qwen3.8-27b"
+    assert row["lane"] == "infernix" and row["model"] == "qwen3.8-flash-next-nvfp4-dense8"
     assert row["usage"] == {"prompt_tokens": 100, "completion_tokens": 40}
     assert row["plan"] == env["rebalance_result"]["plan"]
     assert row["rowIds"] == ["2026-10-19-s1-agent-ASML-buy-1"]
@@ -530,7 +530,7 @@ def _pack_patches(monkeypatch, tmp_path, *, light="default", advice="default", e
         return 2.0
 
     rows = {"ASML": {"rating": "BUY", "action": "accumulate", "score": 66, "confidence": 0.7,
-                     "p20": 0.58, "expExcess20Pct": 1.2, "lane": "ninfer-nvfp4", "model": "qwen3.8-27b",
+                     "p20": 0.58, "expExcess20Pct": 1.2, "lane": "infernix", "model": "qwen3.8-flash-next-nvfp4-dense8",
                      "ts": NOW - 3 * 3600, "excerpt": text, "draft": False, "state": "confirmed",
                      "published": {"rating": "BUY"}, "pending": None}}
     earnings = tmp_path / "earnings.json"
@@ -587,7 +587,7 @@ def test_the_pack_carries_the_decision_trend_momentum_sigma_and_earnings(env, mo
     d = asml["decision"]
     assert (d["rating"], d["action"], d["score"], d["confidence"]) == ("BUY", "accumulate", 66, 0.7)
     assert d["p_outperform_20d"] == 0.58 and d["expected_excess_20d_pct"] == 1.2
-    assert d["lane"] == "ninfer-nvfp4" and d["model"] == "qwen3.8-27b" and d["ageHours"] == 3.0
+    assert d["lane"] == "infernix" and d["model"] == "qwen3.8-flash-next-nvfp4-dense8" and d["ageHours"] == 3.0
     assert d["source"] and d["as_of"]
     assert asml["price"]["price"] == 710.0 and asml["price"]["as_of"] and asml["price"]["source"]
     assert asml["trend"]["aboveSma20"] is True and asml["trend"]["aboveSma200"] is True
@@ -765,3 +765,123 @@ def test_the_playbook_carries_the_untrusted_data_clause_and_the_output_contract(
 
 def test_the_system_message_appends_the_standard_clause_too(env):
     assert pm.ta_pipeline.UNTRUSTED_CLAUSE in pm._playbook()
+
+
+# ------------------------------------------------------------------ Claude fallback
+
+class Claude:
+    def __init__(self):
+        self.calls, self.replies, self.is_available = [], [], True
+
+    def available(self, purpose="forecast"):
+        return self.is_available
+
+    async def complete(self, system, user, **kw):
+        self.calls.append((system, user, kw))
+        return self.replies.pop(0)
+
+
+def cl_reply(obj, model="claude-opus-5-5", source="opus"):
+    text = obj if isinstance(obj, str) else json.dumps(obj)
+    return {"content": text, "model": model, "source": source,
+            "usage": {"input_tokens": 50, "output_tokens": 20}, "latencyS": 1.0}
+
+
+@pytest.fixture
+def claude(env, monkeypatch):
+    c = Claude()
+    monkeypatch.setattr(pm.claude_client, "available", c.available)
+    monkeypatch.setattr(pm.claude_client, "complete", c.complete)
+    return c
+
+
+@pytest.mark.parametrize("err", [{"error": "lane_down"}, {"error": "model_missing", "lane": "x"},
+                                 {"error": "timeout"}])
+def test_a_dead_lane_falls_back_to_one_opus_call_and_tags_the_row(env, claude, err):
+    env["lane"].replies = [err]
+    claude.replies = [cl_reply(good())]
+    row = decide()
+    assert len(env["lane"].calls) == 1 and len(claude.calls) == 1
+    system, user, kw = claude.calls[0]
+    assert kw["model"] == "opus" and kw["max_tokens"] == pm.MAX_TOKENS
+    assert kw["timeout_s"] == 240 and kw["purpose"] == "trading"
+    assert pm.ta_pipeline.UNTRUSTED_CLAUSE in system and "<<<PACK" in user
+    assert row["valid"] is True and row["deferred"] is None
+    assert (row["lane"], row["model"], row["source"], row["role"]) == (
+        "claude", "claude-opus-5-5", "opus", "fallback")
+    assert row["fallbackReason"] == err["error"]
+    assert row["usage"] == {"input_tokens": 50, "output_tokens": 20}
+    assert len(env["rebalance"]) == 1
+    assert pm.read_decisions()[-1]["role"] == "fallback"
+
+
+def test_a_spent_budget_never_falls_back(env, claude):
+    env["lane"].replies = [{"error": "budget"}]
+    row = decide()
+    assert row["deferred"] == "budget" and claude.calls == []
+    assert "fallbackReason" not in row and row["lane"] is None
+
+
+def test_other_lane_errors_do_not_fall_back(env, claude):
+    env["lane"].replies = [{"error": "http", "status": 503}]
+    assert decide()["deferred"] == "lane: http" and claude.calls == []
+
+
+def test_an_unavailable_claude_leaves_the_deferral_as_before(env, claude):
+    claude.is_available = False
+    env["lane"].replies = [{"error": "lane_down"}]
+    assert decide()["deferred"] == "lane: lane_down" and claude.calls == []
+
+
+def test_an_exhausted_claude_defers_with_both_reasons(env, claude):
+    env["lane"].replies = [{"error": "lane_down"}]
+    claude.replies = [{"error": "quota", "detail": "cap"}]
+    row = decide()
+    assert row["deferred"] == "lane: lane_down; claude: quota"
+    assert row["fallbackReason"] == "lane_down" and row["output"] is None
+    assert env["rebalance"] == [] and len(claude.calls) == 1
+    assert pm.decided_today("2026-10-19") is False             # a deferral is not a decision
+
+
+def test_invalid_claude_output_gets_one_claude_repair_then_is_stored_invalid(env, claude):
+    env["lane"].replies = [{"error": "lane_down"}]
+    claude.replies = [cl_reply("not json"), cl_reply("still not json")]
+    row = decide()
+    assert len(claude.calls) == 2 and len(env["lane"].calls) == 1
+    assert all(c[2]["model"] == "opus" for c in claude.calls)
+    assert "not json" in claude.calls[1][1] and "could not be used" in claude.calls[1][1]
+    assert row["valid"] is False and row["repaired"] is True and row["error"]
+    assert row["role"] == "fallback" and row["source"] == "opus" and env["rebalance"] == []
+
+
+def test_a_claude_repair_can_recover(env, claude):
+    env["lane"].replies = [{"error": "timeout"}]
+    claude.replies = [cl_reply("nope"), cl_reply(good())]
+    row = decide()
+    assert row["valid"] is True and row["repaired"] is True and len(claude.calls) == 2
+
+
+def test_intraday_falls_back_to_sonnet(env, claude, monkeypatch):
+    env["cfg"]["universeSource"] = "paper_universe"
+    paper_ledger.write_season(dict(SEASON), "intraday")
+    monkeypatch.setattr(pm, "_forecasts_latest", lambda ids, horizon: {"ASML": {"p": 0.6}})
+
+    async def open_pack(cfg, season, now, bucket):
+        return "<<<PACK\n{\"pack\":1}\nPACK>>>", {"bucket": {"equityEur": 1000.0}}
+    monkeypatch.setattr(pm, "build_open_pack", open_pack)
+    env["lane"].replies = [{"error": "lane_down"}]
+    claude.replies = [cl_reply(good(no_change=True, targets={}, cash_pct=None, per_id={}),
+                               model="claude-sonnet-5-5", source="sonnet")]
+    row = run(pm.decide(trigger="manual", bucket="intraday", slot="10:00"))
+    assert claude.calls[0][2]["model"] == "sonnet" and claude.calls[0][2]["purpose"] == "intraday"
+    assert env["lane"].calls[0][1]["purpose"] == "intraday"
+    assert (row["lane"], row["source"], row["role"], row["fallbackReason"]) == (
+        "claude", "sonnet", "fallback", "lane_down")
+    assert row["model"] == "claude-sonnet-5-5" and row["valid"] is True
+
+
+def test_the_lane_budget_is_not_touched_by_the_fallback(env, claude):
+    env["lane"].replies = [{"error": "lane_down"}]
+    claude.replies = [cl_reply(good(no_change=True, targets={}, cash_pct=None))]
+    decide()
+    assert env["budget_calls"] == [("trading", 2)]             # only the gate's check, no extra lane turn

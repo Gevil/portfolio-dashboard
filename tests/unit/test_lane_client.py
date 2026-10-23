@@ -23,9 +23,9 @@ def lane(name, model="m-" + "x", port=8000):
             "min_free_mib": 0, "model_id": model, "container_base": ""}
 
 
-A = lane("ninfer-nvfp4", "qwen3.8-27b", 8002)
-B = lane("exllama", "Qwen3.8-Flash-Next-exl3", 8003)
-V = lane("vllm", "", 8001)                       # no model id: never eligible
+A = lane("infernix", "qwen3.8-flash-next-nvfp4-dense8", 8002)
+B = lane("basalt", "swift-1.5-iq3_xxs", 8003)
+V = lane("retired", "", 8001)                       # no model id: never eligible
 
 
 @pytest.fixture
@@ -36,9 +36,9 @@ def env(monkeypatch, tmp_path):
     for k in ("AUTONOMOUS_TURN_BUDGET", "DIGEST_TURN_RESERVE", "TRIAGE_TURN_CAP",
               "TRADING_TURN_CAP", "LANE_PREFERENCE"):
         monkeypatch.delenv(k, raising=False)
-    state = {"lanes": [V, B, A],               # conf order: exllama BEFORE ninfer
-             "probe": {"ninfer-nvfp4": ("ok", "http://a"),
-                       "exllama": ("ok", "http://b")},
+    state = {"lanes": [V, B, A],               # conf order: basalt BEFORE infernix
+             "probe": {"infernix": ("ok", "http://a"),
+                       "basalt": ("ok", "http://b")},
              "calls": []}
     monkeypatch.setattr(lc, "lanes", lambda: state["lanes"])
 
@@ -56,29 +56,29 @@ def env(monkeypatch, tmp_path):
 
 def test_order_lanes_preference_then_conf_order():
     conf = [V, B, A, lane("extra", "e", 8004)]
-    names = [l["name"] for l in lc.order_lanes(conf, ["ninfer-nvfp4", "exllama"])]
-    assert names == ["ninfer-nvfp4", "exllama", "extra"]      # vllm: no model
+    names = [l["name"] for l in lc.order_lanes(conf, ["infernix", "basalt"])]
+    assert names == ["infernix", "basalt", "extra"]      # retired: no model
     # unlisted lanes follow in conf order; an unknown preference is ignored
     names = [l["name"] for l in lc.order_lanes(conf, ["nope", "extra"])]
-    assert names == ["extra", "exllama", "ninfer-nvfp4"]
+    assert names == ["extra", "basalt", "infernix"]
 
 
 def test_pick_prefers_primary_even_when_conf_lists_fallback_first(env):
     lane_, reason, name, base = asyncio.run(lc._pick_lane())
-    assert (reason, name, base) == ("ok", "ninfer-nvfp4", "http://a")
+    assert (reason, name, base) == ("ok", "infernix", "http://a")
 
 
 def test_pick_falls_back_when_primary_down(env):
-    env["probe"]["ninfer-nvfp4"] = ("down", "")
+    env["probe"]["infernix"] = ("down", "")
     lane_, reason, name, base = asyncio.run(lc._pick_lane())
-    assert (reason, name) == ("ok", "exllama")
+    assert (reason, name) == ("ok", "basalt")
     active = asyncio.run(lc.active_lane())
-    assert active["role"] == "fallback" and active["name"] == "exllama"
+    assert active["role"] == "fallback" and active["name"] == "basalt"
 
 
 def test_pick_reasons(env):
-    env["probe"] = {"ninfer-nvfp4": ("down", ""), "exllama": ("wrong_model", "")}
-    assert asyncio.run(lc._pick_lane())[1:3] == ("model_missing", "exllama")
+    env["probe"] = {"infernix": ("down", ""), "basalt": ("wrong_model", "")}
+    assert asyncio.run(lc._pick_lane())[1:3] == ("model_missing", "basalt")
     lc.reset_probe_cache()
     env["probe"] = {}
     assert asyncio.run(lc._pick_lane())[1] == "lane_down"
@@ -88,18 +88,18 @@ def test_pick_reasons(env):
 
 
 def test_lane_preference_env(env, monkeypatch):
-    monkeypatch.setenv("LANE_PREFERENCE", "exllama,ninfer-nvfp4")
-    assert asyncio.run(lc._pick_lane())[2] == "exllama"
+    monkeypatch.setenv("LANE_PREFERENCE", "basalt,infernix")
+    assert asyncio.run(lc._pick_lane())[2] == "basalt"
 
 
 def test_lane_status_shape(env):
-    env["probe"]["ninfer-nvfp4"] = ("down", "")
+    env["probe"]["infernix"] = ("down", "")
     st = asyncio.run(lc.lane_status())
-    assert st["lane"] == "exllama" and st["serving_model"] is True
-    assert st["model"] == "Qwen3.8-Flash-Next-exl3" and st["role"] == "fallback"
-    assert st["preference"] == ["ninfer-nvfp4", "exllama"]
+    assert st["lane"] == "basalt" and st["serving_model"] is True
+    assert st["model"] == "swift-1.5-iq3_xxs" and st["role"] == "fallback"
+    assert st["preference"] == ["infernix", "basalt", "strata"]
     states = {c["name"]: c["state"] for c in st["candidates"]}
-    assert states == {"ninfer-nvfp4": "down", "exllama": "ok", "vllm": "no_model"}
+    assert states == {"infernix": "down", "basalt": "ok", "retired": "no_model"}
     assert {"day", "used", "cap", "left", "purposes"} <= set(st["budget"])
     env["probe"] = {}
     lc.reset_probe_cache()
@@ -115,7 +115,7 @@ def test_lane_status_serves_cached_probes_and_refreshes_in_the_background(env, m
     async def go():
         first = await lc.lane_status()              # nothing cached yet: probes synchronously
         probed = len(env["calls"])
-        env["probe"]["ninfer-nvfp4"] = ("down", "")  # the primary dies; the cache expires
+        env["probe"]["infernix"] = ("down", "")  # the primary dies; the cache expires
         monkeypatch.setattr(lc, "PROBE_OK_TTL_S", 0.0)
         clock["t"] = 1060.0
         second = await lc.lane_status()
@@ -126,14 +126,14 @@ def test_lane_status_serves_cached_probes_and_refreshes_in_the_background(env, m
         await lc._refresh_task
         return first, second, third, refreshing
     first, second, third, refreshing = asyncio.run(go())
-    assert first["probedAt"] == 1000.0 and first["lane"] == "ninfer-nvfp4"
-    assert second["lane"] == "ninfer-nvfp4" and second["probedAt"] == 1000.0
+    assert first["probedAt"] == 1000.0 and first["lane"] == "infernix"
+    assert second["lane"] == "infernix" and second["probedAt"] == 1000.0
     assert second["refreshing"] is True and refreshing is not None
     assert {c["name"]: c["probedAt"] for c in second["candidates"]} == {
-        "ninfer-nvfp4": 1000.0, "exllama": 1000.0, "vllm": None}
+        "infernix": 1000.0, "basalt": 1000.0, "retired": None}
     # the background probe landed: the next answer shows the lane down, newly stamped
-    assert third["lane"] == "exllama" and third["probedAt"] == 1060.0
-    assert {c["name"]: c["state"] for c in third["candidates"]}["ninfer-nvfp4"] == "down"
+    assert third["lane"] == "basalt" and third["probedAt"] == 1060.0
+    assert {c["name"]: c["state"] for c in third["candidates"]}["infernix"] == "down"
 
 
 def test_stale_lane_status_refresh_is_single_flight(env, monkeypatch):
@@ -148,19 +148,19 @@ def test_stale_lane_status_refresh_is_single_flight(env, monkeypatch):
         assert t1 is t2
         await t1
     asyncio.run(go())
-    assert sorted(env["calls"]) == ["exllama", "ninfer-nvfp4"]    # one probe per lane, not two
+    assert sorted(env["calls"]) == ["basalt", "infernix"]    # one probe per lane, not two
 
 
 def test_failed_call_marks_the_cached_status_down_at_once(env):
     async def go():
         await lc.lane_status()
-        lc._invalidate("ninfer-nvfp4")              # a transport failure on a real call
+        lc._invalidate("infernix")              # a transport failure on a real call
         st = await lc.lane_status()
         await lc._refresh_task
         return st
     st = asyncio.run(go())
-    assert {c["name"]: c["state"] for c in st["candidates"]}["ninfer-nvfp4"] == "down"
-    assert st["lane"] == "exllama"
+    assert {c["name"]: c["state"] for c in st["candidates"]}["infernix"] == "down"
+    assert st["lane"] == "basalt"
 
 
 # --------------------------------------------------------------- probe cache
@@ -170,9 +170,9 @@ def test_probe_cache_positive_and_negative(env):
         for _ in range(3):
             await lc._pick_lane()
     asyncio.run(go())
-    assert env["calls"] == ["ninfer-nvfp4"]               # cached: one probe
+    assert env["calls"] == ["infernix"]               # cached: one probe
     env["calls"].clear()
-    env["probe"]["ninfer-nvfp4"] = ("down", "")
+    env["probe"]["infernix"] = ("down", "")
     lc.reset_probe_cache()
 
     async def go2():
@@ -180,7 +180,7 @@ def test_probe_cache_positive_and_negative(env):
             await lc._pick_lane()
     asyncio.run(go2())
     # primary probed once (negative cache), fallback once (positive cache)
-    assert sorted(env["calls"]) == ["exllama", "ninfer-nvfp4"]
+    assert sorted(env["calls"]) == ["basalt", "infernix"]
 
 
 def test_probe_cache_expires(env, monkeypatch):
@@ -190,20 +190,20 @@ def test_probe_cache_expires(env, monkeypatch):
         await lc._pick_lane()
         await lc._pick_lane()
     asyncio.run(go())
-    assert env["calls"] == ["ninfer-nvfp4", "ninfer-nvfp4"]
+    assert env["calls"] == ["infernix", "infernix"]
 
 
 def test_concurrent_probes_are_single_flight(env):
     async def go():
         return await asyncio.gather(*(lc._pick_lane() for _ in range(8)))
     res = asyncio.run(go())
-    assert env["calls"] == ["ninfer-nvfp4"]               # never hit twice at once
-    assert all(r[2] == "ninfer-nvfp4" for r in res)
+    assert env["calls"] == ["infernix"]               # never hit twice at once
+    assert all(r[2] == "infernix" for r in res)
 
 
 def test_down_lane_gets_the_short_probe_budget(env):
     assert lc._probe_budget(A) == (lc.PROBE_TIMEOUT_S, lc.PROBE_GRACE_S)
-    env["probe"]["ninfer-nvfp4"] = ("down", "")
+    env["probe"]["infernix"] = ("down", "")
     asyncio.run(lc._pick_lane())
     assert lc._probe_budget(A) == (lc.PROBE_DOWN_TIMEOUT_S,)
 
@@ -214,33 +214,33 @@ def test_pin_sticks_to_one_lane_then_falls_back_once(env):
     async def go():
         with lc.pin() as p:
             first = await lc._pick_lane()
-            assert p.lane == "ninfer-nvfp4" and p.model == "qwen3.8-27b"
+            assert p.lane == "infernix" and p.model == "qwen3.8-flash-next-nvfp4-dense8"
             # preference flips mid-job: the pin does not move
-            env["probe"]["exllama"] = ("ok", "http://b")
+            env["probe"]["basalt"] = ("ok", "http://b")
             again = await lc._pick_lane()
             # the pinned lane dies: ONE fallback, recorded
-            env["probe"]["ninfer-nvfp4"] = ("down", "")
+            env["probe"]["infernix"] = ("down", "")
             lc.reset_probe_cache()
             moved = await lc._pick_lane()
-            assert p.fell_back and moved[2] == "exllama"
-            assert p.fallbacks[0]["from"] == "ninfer-nvfp4"
-            assert p.fallbacks[0]["to"] == "exllama"
+            assert p.fell_back and moved[2] == "basalt"
+            assert p.fallbacks[0]["from"] == "infernix"
+            assert p.fallbacks[0]["to"] == "basalt"
             # the fallback dies too: no second fallback, an error envelope
-            env["probe"]["exllama"] = ("down", "")
-            env["probe"]["ninfer-nvfp4"] = ("ok", "http://a")
+            env["probe"]["basalt"] = ("down", "")
+            env["probe"]["infernix"] = ("ok", "http://a")
             lc.reset_probe_cache()
             dead = await lc._pick_lane()
             return first, again, dead, p
     first, again, dead, p = asyncio.run(go())
-    assert first[2] == again[2] == "ninfer-nvfp4"
+    assert first[2] == again[2] == "infernix"
     assert dead[0] is None and dead[1] == "lane_down"
     assert len(p.fallbacks) == 1
 
 
 def test_pinned_call_retries_once_on_the_fallback(env, monkeypatch):
     async def fake_post(l, base, body, timeout):
-        if l["name"] == "ninfer-nvfp4":
-            env["probe"]["ninfer-nvfp4"] = ("down", "")
+        if l["name"] == "infernix":
+            env["probe"]["infernix"] = ("down", "")
             return {"error": "lane_down"}
         return {"content": "ok", "finish_reason": "stop", "lane": l["name"],
                 "model": body["model"], "usage": {}}
@@ -250,10 +250,10 @@ def test_pinned_call_retries_once_on_the_fallback(env, monkeypatch):
         with lc.pin() as p:
             return await lc.chat([{"role": "user", "content": "x"}]), p
     res, p = asyncio.run(go())
-    assert res["content"] == "ok" and res["lane"] == "exllama"
-    assert res["model"] == "Qwen3.8-Flash-Next-exl3"
-    assert p.fell_back and p.model == "Qwen3.8-Flash-Next-exl3"
-    assert res["lane_fallbacks"][0]["to"] == "exllama"
+    assert res["content"] == "ok" and res["lane"] == "basalt"
+    assert res["model"] == "swift-1.5-iq3_xxs"
+    assert p.fell_back and p.model == "swift-1.5-iq3_xxs"
+    assert res["lane_fallbacks"][0]["to"] == "basalt"
 
 
 def test_unpinned_lane_down_is_just_an_envelope(env, monkeypatch):
@@ -474,7 +474,7 @@ def test_400_on_response_format_and_chat_template_kwargs_retries(env, monkeypatc
     res = asyncio.run(call())
     assert res["content"] == "answer"
     assert set(res["dropped_fields"]) == {"response_format", "chat_template_kwargs"}
-    assert res["lane"] == "ninfer-nvfp4"
+    assert res["lane"] == "infernix"
     assert len(seen) == 3
     seen.clear()
     res = asyncio.run(call())                  # remembered: no more 400 round trips

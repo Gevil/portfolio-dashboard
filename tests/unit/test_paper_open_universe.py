@@ -99,8 +99,8 @@ class Lane:
 
 
 def reply(obj):
-    return {"content": json.dumps(obj), "finish_reason": "stop", "lane": "ninfer-nvfp4",
-            "model": "qwen3.8-27b", "usage": {"total_tokens": 10}}
+    return {"content": json.dumps(obj), "finish_reason": "stop", "lane": "infernix",
+            "model": "qwen3.8-flash-next-nvfp4-dense8", "usage": {"total_tokens": 10}}
 
 
 @pytest.fixture

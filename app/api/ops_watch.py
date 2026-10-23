@@ -346,14 +346,16 @@ def claude_findings(now: float | None = None) -> list[dict]:
 
 
 EARNINGS_NULL_MAX = 0.25          # more than this share of equity candidates without an upcoming earnings date -> finding
+EARNINGS_RECENT_DAYS = 60         # a latest known date this recent = "recently reported", not missing
 STALE_PACKET_MAX = 0.10           # more than this share of the newest cohort left out for stale data -> finding
 
 
 def earnings_findings(now: float | None = None) -> list[dict]:
     """`earnings-null-rate`: more than 25 % of the open universe's equity candidates lack ``nextEarnings`` (no
-    observation yet, an empty calendar after the carry-forward, or a date already passed). Nothing while the news
-    worker is off or no name was ever observed (a cold start is the worker-stale finding's business); clears by
-    itself when the share drops back."""
+    observation yet, an empty calendar after the carry-forward, or a date already passed). A name whose latest known
+    date lies within the last 60 days counts as recently reported (the calendar is legitimately empty until the next
+    date is announced). Nothing while the news worker is off or no name was ever observed (a cold start is the
+    worker-stale finding's business); clears by itself when the share drops back."""
     import datetime
     from app.api import paper_universe, universe_news
     if not universe_news.enabled():
@@ -366,7 +368,15 @@ def earnings_findings(now: float | None = None) -> list[dict]:
     obs = {pid: universe_news.next_earnings(pid, now) for pid in ids}
     if all(o is None for o in obs.values()):
         return []
-    lacking = sorted(pid for pid, o in obs.items() if o is None or not o["date"] or o["date"] < today)
+    horizon = (datetime.date.fromisoformat(today) - datetime.timedelta(days=EARNINGS_RECENT_DAYS)).isoformat()
+
+    def missing(pid: str, o) -> bool:
+        if o is not None and o["date"] and o["date"] >= today:
+            return False                                   # a future date is known
+        last = universe_news.last_known_earnings(pid, now)
+        return not (last and last >= horizon)              # none ever, or older than 60 days and nothing ahead
+
+    lacking = sorted(pid for pid, o in obs.items() if missing(pid, o))
     share = len(lacking) / len(ids)
     if share <= EARNINGS_NULL_MAX:
         return []

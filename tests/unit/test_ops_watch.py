@@ -9,7 +9,7 @@ from app.api import notify, ops_watch
 
 T0 = 1_800_000_000.0
 HOUR = 3600.0
-FINDING = {"key": "degraded:ninfer", "title": "GPU lane ninfer degraded",
+FINDING = {"key": "degraded:infernix", "title": "GPU lane infernix degraded",
            "body": "health check failing"}
 
 
@@ -52,11 +52,11 @@ def test_realert_interval_defaults_to_24_hours():
 
 
 def test_persistent_finding_realerts_once_a_day(ow):
-    assert run_pass(ow, 0)["fired"] == ["degraded:ninfer"]
+    assert run_pass(ow, 0)["fired"] == ["degraded:infernix"]
     for hours in (6, 12, 23.9):                 # the old 6 h cadence is gone
         assert run_pass(ow, hours * HOUR)["fired"] == []
     assert len(ow["alerts"]) == 1
-    assert run_pass(ow, 24 * HOUR)["fired"] == ["degraded:ninfer"]
+    assert run_pass(ow, 24 * HOUR)["fired"] == ["degraded:infernix"]
     assert len(ow["alerts"]) == 2
 
 
@@ -72,10 +72,10 @@ def test_cleared_finding_leaves_one_resolved_info_row_and_no_push(ow):
     run_pass(ow, 0)
     ow["findings"] = []
     res = run_pass(ow, HOUR)
-    assert res["resolved"] == ["degraded:ninfer"]
+    assert res["resolved"] == ["degraded:infernix"]
     [row] = ow["stored"]
     assert row["source"] == "ops_watch" and row["ticker"] == "OPS"
-    assert row["title"] == "Resolved: GPU lane ninfer degraded"
+    assert row["title"] == "Resolved: GPU lane infernix degraded"
     assert row["priority"] == 1 and row["severity"] == "info"
     assert len(ow["alerts"]) == 1               # resolved rows are not pushed
     assert ops_watch.status()["open_findings"] == []
@@ -88,7 +88,7 @@ def test_a_finding_that_returns_alerts_immediately(ow):
     ow["findings"] = []
     run_pass(ow, HOUR)
     ow["findings"] = [dict(FINDING)]
-    assert run_pass(ow, 2 * HOUR)["fired"] == ["degraded:ninfer"]
+    assert run_pass(ow, 2 * HOUR)["fired"] == ["degraded:infernix"]
     assert len(ow["alerts"]) == 2
 
 
@@ -117,9 +117,9 @@ def test_unstorable_resolved_row_is_retried(ow):
     ow["findings"] = []
     ow["store_ok"] = False
     assert run_pass(ow, HOUR)["resolved"] == []
-    assert ops_watch.status()["open_findings"] == ["degraded:ninfer"]
+    assert ops_watch.status()["open_findings"] == ["degraded:infernix"]
     ow["store_ok"] = True
-    assert run_pass(ow, 2 * HOUR)["resolved"] == ["degraded:ninfer"]
+    assert run_pass(ow, 2 * HOUR)["resolved"] == ["degraded:infernix"]
     assert ops_watch.status()["open_findings"] == []
 
 
@@ -249,7 +249,7 @@ def test_a_failing_paper_read_does_not_break_the_lane_watch(paper, monkeypatch):
         raise RuntimeError("bad file")
     monkeypatch.setattr(paper_pm, "read_decisions", boom)
     paper["findings"] = [dict(FINDING)]
-    assert run_pass(paper, 0)["fired"] == ["degraded:ninfer"]
+    assert run_pass(paper, 0)["fired"] == ["degraded:infernix"]
 
 
 # --- Claude adapter findings -------------------------------------------------------------------
@@ -346,6 +346,8 @@ def earn(ow, monkeypatch):
     monkeypatch.setattr(universe_news, "enabled", lambda: True)
     monkeypatch.setattr(paper_universe, "entries", lambda: rows)
     monkeypatch.setattr(universe_news, "next_earnings", lambda pid, cutoff: ow["obs"].get(pid))
+    ow["last"] = {}
+    monkeypatch.setattr(universe_news, "last_known_earnings", lambda pid, cutoff: ow["last"].get(pid))
     return ow
 
 
@@ -379,6 +381,41 @@ def test_a_passed_date_and_a_never_observed_name_count_as_lacking_but_today_does
         del earn["obs"][pid]                                                              # never observed: lacking
     assert ekeys() == ["earnings-null-rate"]                                              # 6 of 20
     earn["obs"][earn["ids"][4]] = {"date": "2099-01-01", "fetchedAt": T0 - 100}           # back to 5 of 20
+    assert ekeys() == []
+
+
+def test_a_name_that_reported_within_60_days_is_recently_reported_not_missing(earn):
+    import datetime
+    from app.api import universe_news
+    today = datetime.datetime.fromtimestamp(T0, universe_news._BERLIN).date()
+    ids = earn["ids"]
+    for pid in ids[:8]:                                       # empty calendar now, no future date: 8 of 20 = 40 %
+        earn["obs"][pid] = {"date": None, "fetchedAt": T0 - 100}
+    assert ekeys() == ["earnings-null-rate"]
+    for pid in ids[:6]:
+        earn["last"][pid] = (today - datetime.timedelta(days=60)).isoformat()   # exactly 60 days: still recent
+    assert ekeys() == []                                      # 2 of 20 left
+
+
+def test_a_last_known_date_older_than_60_days_or_none_ever_still_counts(earn):
+    import datetime
+    from app.api import universe_news
+    today = datetime.datetime.fromtimestamp(T0, universe_news._BERLIN).date()
+    ids = earn["ids"]
+    for pid in ids[:8]:
+        earn["obs"][pid] = {"date": None, "fetchedAt": T0 - 100}
+    for pid in ids[:3]:
+        earn["last"][pid] = (today - datetime.timedelta(days=61)).isoformat()   # too old: lacking
+    for pid in ids[3:6]:
+        earn["last"][pid] = (today - datetime.timedelta(days=10)).isoformat()   # recent: not lacking
+    assert ekeys() == []                                      # 3 old + 2 never = 5 of 20 = 25 %: threshold unchanged
+    earn["last"][ids[3]] = (today - datetime.timedelta(days=90)).isoformat()
+    (f,) = ops_watch.earnings_findings(T0)                    # 6 of 20
+    assert "6 of 20" in f["body"] and "30 %" in f["body"]
+
+
+def test_a_future_date_wins_over_an_old_last_known_date(earn):
+    earn["last"][earn["ids"][0]] = "2000-01-01"
     assert ekeys() == []
 
 
